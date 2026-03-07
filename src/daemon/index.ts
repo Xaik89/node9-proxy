@@ -7,6 +7,7 @@ import os from 'os';
 import { execSync } from 'child_process';
 import { randomUUID } from 'crypto';
 import chalk from 'chalk';
+import { getGlobalSettings } from '../core';
 
 export const DAEMON_PORT = 7391;
 export const DAEMON_HOST = '127.0.0.1';
@@ -24,6 +25,38 @@ interface AuditEntry {
 }
 
 export const AUDIT_LOG_FILE = path.join(homeDir, '.node9', 'audit.log');
+const TRUST_FILE = path.join(homeDir, '.node9', 'trust.json');
+
+// ── Atomic File Writer (Fixes Task 0.1) ──────────────────────────────────
+function atomicWriteSync(filePath: string, data: string, options?: fs.WriteFileOptions): void {
+  const dir = path.dirname(filePath);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  const tmpPath = `${filePath}.${randomUUID()}.tmp`;
+  fs.writeFileSync(tmpPath, data, options);
+  fs.renameSync(tmpPath, filePath);
+}
+
+function writeTrustEntry(toolName: string, durationMs: number): void {
+  try {
+    interface TrustFile {
+      entries: { tool: string; expiry: number }[];
+    }
+    let trust: TrustFile = { entries: [] };
+    try {
+      if (fs.existsSync(TRUST_FILE))
+        trust = JSON.parse(fs.readFileSync(TRUST_FILE, 'utf-8')) as TrustFile;
+    } catch {}
+    trust.entries = trust.entries.filter((e) => e.tool !== toolName && e.expiry > Date.now());
+    trust.entries.push({ tool: toolName, expiry: Date.now() + durationMs });
+    atomicWriteSync(TRUST_FILE, JSON.stringify(trust, null, 2));
+  } catch {}
+}
+
+const TRUST_DURATIONS: Record<string, number> = {
+  '30m': 30 * 60_000,
+  '1h': 60 * 60_000,
+  '2h': 2 * 60 * 60_000,
+};
 
 const SECRET_KEY_RE = /password|secret|token|key|apikey|credential|auth/i;
 
@@ -79,28 +112,6 @@ function getOrgName(): string | null {
 // True when the daemon was launched automatically by the hook/smart-runner.
 const autoStarted = process.env.NODE9_AUTO_STARTED === '1';
 
-function readGlobalSettings(): {
-  autoStartDaemon: boolean;
-  slackEnabled: boolean;
-  agentMode: boolean;
-} {
-  try {
-    if (fs.existsSync(GLOBAL_CONFIG_FILE)) {
-      const config = JSON.parse(fs.readFileSync(GLOBAL_CONFIG_FILE, 'utf-8')) as Record<
-        string,
-        unknown
-      >;
-      const s = (config?.settings as Record<string, unknown>) ?? {};
-      return {
-        autoStartDaemon: s.autoStartDaemon !== false,
-        slackEnabled: s.slackEnabled !== false,
-        agentMode: s.agentMode === true,
-      };
-    }
-  } catch {}
-  return { autoStartDaemon: true, slackEnabled: true, agentMode: false };
-}
-
 function hasStoredSlackKey(): boolean {
   return fs.existsSync(CREDENTIALS_FILE);
 }
@@ -114,9 +125,7 @@ function writeGlobalSetting(key: string, value: unknown): void {
   } catch {}
   if (!config.settings || typeof config.settings !== 'object') config.settings = {};
   (config.settings as Record<string, unknown>)[key] = value;
-  const dir = path.dirname(GLOBAL_CONFIG_FILE);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(GLOBAL_CONFIG_FILE, JSON.stringify(config, null, 2), { mode: 0o600 });
+  atomicWriteSync(GLOBAL_CONFIG_FILE, JSON.stringify(config, null, 2), { mode: 0o600 });
 }
 
 type Decision = 'allow' | 'deny' | 'abandoned';
@@ -202,11 +211,9 @@ function readPersistentDecisions(): Record<string, 'allow' | 'deny'> {
 
 function writePersistentDecision(toolName: string, decision: 'allow' | 'deny') {
   try {
-    const dir = path.dirname(DECISIONS_FILE);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     const decisions = readPersistentDecisions();
     decisions[toolName] = decision;
-    fs.writeFileSync(DECISIONS_FILE, JSON.stringify(decisions, null, 2));
+    atomicWriteSync(DECISIONS_FILE, JSON.stringify(decisions, null, 2));
     broadcast('decisions', decisions);
   } catch {}
 }
@@ -216,6 +223,23 @@ export function startDaemon(): void {
   const internalToken = randomUUID();
   const UI_HTML = UI_HTML_TEMPLATE.replace('{{CSRF_TOKEN}}', csrfToken);
   const validToken = (req: http.IncomingMessage) => req.headers['x-node9-token'] === csrfToken;
+
+  // ── Graceful Idle Timeout (Fixes Task 0.4) ──────────────────────────────
+  const IDLE_TIMEOUT_MS = 12 * 60 * 60 * 1000; // 12 hours
+  let idleTimer: NodeJS.Timeout;
+  function resetIdleTimer() {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      if (autoStarted) {
+        try {
+          fs.unlinkSync(DAEMON_PID_FILE);
+        } catch {}
+      }
+      process.exit(0);
+    }, IDLE_TIMEOUT_MS);
+    idleTimer.unref(); // Don't hold the process open just for the timer
+  }
+  resetIdleTimer(); // Start the clock
 
   const server = http.createServer(async (req, res) => {
     const { pathname } = new URL(req.url || '/', `http://${req.headers.host}`);
@@ -262,6 +286,8 @@ export function startDaemon(): void {
 
     if (req.method === 'POST' && pathname === '/check') {
       try {
+        resetIdleTimer(); // Agent is active, reset the shutdown clock
+
         const body = await readBody(req);
         if (body.length > 65_536) return res.writeHead(413).end();
         const { toolName, args, slackDelegated = false, agent, mcpServer } = JSON.parse(body);
@@ -330,17 +356,42 @@ export function startDaemon(): void {
         const id = pathname.split('/').pop()!;
         const entry = pending.get(id);
         if (!entry) return res.writeHead(404).end();
-        const { decision, persist } = JSON.parse(await readBody(req));
-        if (persist) writePersistentDecision(entry.toolName, decision);
+        const { decision, persist, trustDuration } = JSON.parse(await readBody(req)) as {
+          decision: string;
+          persist?: boolean;
+          trustDuration?: string;
+        };
+
+        // Trust session
+        if (decision === 'trust' && trustDuration) {
+          const ms = TRUST_DURATIONS[trustDuration] ?? 60 * 60_000;
+          writeTrustEntry(entry.toolName, ms);
+          appendAuditLog({
+            toolName: entry.toolName,
+            args: entry.args,
+            decision: `trust:${trustDuration}`,
+            timestamp: Date.now(),
+          });
+          clearTimeout(entry.timer);
+          if (entry.waiter) entry.waiter('allow');
+          else entry.earlyDecision = 'allow';
+          pending.delete(id);
+          broadcast('remove', { id });
+          res.writeHead(200);
+          return res.end(JSON.stringify({ ok: true }));
+        }
+
+        const resolvedDecision = decision === 'allow' || decision === 'deny' ? decision : 'deny';
+        if (persist) writePersistentDecision(entry.toolName, resolvedDecision);
         appendAuditLog({
           toolName: entry.toolName,
           args: entry.args,
-          decision,
+          decision: resolvedDecision,
           timestamp: Date.now(),
         });
         clearTimeout(entry.timer);
-        if (entry.waiter) entry.waiter(decision);
-        else entry.earlyDecision = decision;
+        if (entry.waiter) entry.waiter(resolvedDecision);
+        else entry.earlyDecision = resolvedDecision;
         pending.delete(id!);
         broadcast('remove', { id });
         res.writeHead(200);
@@ -351,11 +402,12 @@ export function startDaemon(): void {
     }
 
     if (req.method === 'GET' && pathname === '/settings') {
-      const s = readGlobalSettings();
+      const s = getGlobalSettings();
       res.writeHead(200, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({ ...s, autoStarted }));
     }
 
+    // ── Updated POST /settings to handle new config schema ─────────────────
     if (req.method === 'POST' && pathname === '/settings') {
       if (!validToken(req)) return res.writeHead(403).end();
       try {
@@ -365,6 +417,13 @@ export function startDaemon(): void {
           writeGlobalSetting('autoStartDaemon', data.autoStartDaemon);
         if (data.slackEnabled !== undefined) writeGlobalSetting('slackEnabled', data.slackEnabled);
         if (data.agentMode !== undefined) writeGlobalSetting('agentMode', data.agentMode);
+        if (data.enableTrustSessions !== undefined)
+          writeGlobalSetting('enableTrustSessions', data.enableTrustSessions);
+        if (data.enableUndo !== undefined) writeGlobalSetting('enableUndo', data.enableUndo);
+        if (data.enableHookLogDebug !== undefined)
+          writeGlobalSetting('enableHookLogDebug', data.enableHookLogDebug);
+        if (data.approvers !== undefined) writeGlobalSetting('approvers', data.approvers);
+
         res.writeHead(200);
         return res.end(JSON.stringify({ ok: true }));
       } catch {
@@ -373,7 +432,7 @@ export function startDaemon(): void {
     }
 
     if (req.method === 'GET' && pathname === '/slack-status') {
-      const s = readGlobalSettings();
+      const s = getGlobalSettings();
       res.writeHead(200, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({ hasKey: hasStoredSlackKey(), enabled: s.slackEnabled }));
     }
@@ -382,14 +441,12 @@ export function startDaemon(): void {
       if (!validToken(req)) return res.writeHead(403).end();
       try {
         const { apiKey } = JSON.parse(await readBody(req));
-        if (!fs.existsSync(path.dirname(CREDENTIALS_FILE)))
-          fs.mkdirSync(path.dirname(CREDENTIALS_FILE), { recursive: true });
-        fs.writeFileSync(
+        atomicWriteSync(
           CREDENTIALS_FILE,
           JSON.stringify({ apiKey, apiUrl: 'https://api.node9.ai/api/v1/intercept' }, null, 2),
           { mode: 0o600 }
         );
-        broadcast('slack-status', { hasKey: true, enabled: readGlobalSettings().slackEnabled });
+        broadcast('slack-status', { hasKey: true, enabled: getGlobalSettings().slackEnabled });
         res.writeHead(200);
         return res.end(JSON.stringify({ ok: true }));
       } catch {
@@ -403,7 +460,7 @@ export function startDaemon(): void {
         const toolName = decodeURIComponent(pathname.split('/').pop()!);
         const decisions = readPersistentDecisions();
         delete decisions[toolName];
-        fs.writeFileSync(DECISIONS_FILE, JSON.stringify(decisions, null, 2));
+        atomicWriteSync(DECISIONS_FILE, JSON.stringify(decisions, null, 2));
         broadcast('decisions', decisions);
         res.writeHead(200);
         return res.end(JSON.stringify({ ok: true }));
@@ -447,10 +504,32 @@ export function startDaemon(): void {
   });
 
   daemonServer = server;
+
+  // ── Port Conflict Resolution (Fixes Task 0.2) ───────────────────────────
+  server.on('error', (e: NodeJS.ErrnoException) => {
+    if (e.code === 'EADDRINUSE') {
+      try {
+        if (fs.existsSync(DAEMON_PID_FILE)) {
+          const { pid } = JSON.parse(fs.readFileSync(DAEMON_PID_FILE, 'utf-8'));
+          process.kill(pid, 0); // Throws if process is dead
+          // If we reach here, a legitimate daemon is running. Safely exit.
+          return process.exit(0);
+        }
+      } catch {
+        // Zombie PID detected. Clean up and resurrect server.
+        try {
+          fs.unlinkSync(DAEMON_PID_FILE);
+        } catch {}
+        server.listen(DAEMON_PORT, DAEMON_HOST);
+        return;
+      }
+    }
+    console.error(chalk.red('\n🛑 Node9 Daemon Error:'), e.message);
+    process.exit(1);
+  });
+
   server.listen(DAEMON_PORT, DAEMON_HOST, () => {
-    if (!fs.existsSync(path.dirname(DAEMON_PID_FILE)))
-      fs.mkdirSync(path.dirname(DAEMON_PID_FILE), { recursive: true });
-    fs.writeFileSync(
+    atomicWriteSync(
       DAEMON_PID_FILE,
       JSON.stringify({ pid: process.pid, port: DAEMON_PORT, internalToken, autoStarted }),
       { mode: 0o600 }

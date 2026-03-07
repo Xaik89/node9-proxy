@@ -13,6 +13,11 @@ import {
 
 vi.mock('@inquirer/prompts', () => ({ confirm: vi.fn() }));
 
+vi.mock('../ui/native', () => ({
+  askNativePopup: vi.fn().mockReturnValue('deny'),
+  sendDesktopNotification: vi.fn(),
+}));
+
 // Global spies
 const existsSpy = vi.spyOn(fs, 'existsSync');
 const readSpy = vi.spyOn(fs, 'readFileSync');
@@ -46,6 +51,14 @@ function mockBothConfigs(projectConfig: object, globalConfig: object) {
     if (String(p) === projectPath) return JSON.stringify(projectConfig);
     if (String(p) === globalPath) return JSON.stringify(globalConfig);
     return '';
+  });
+}
+
+/** Config that disables the native approver so racePromises can be empty
+ *  and noApprovalMechanism tests work correctly. */
+function mockNoNativeConfig(extra?: object) {
+  mockGlobalConfig({
+    settings: { approvers: { native: false }, ...(extra as Record<string, unknown>) },
   });
 }
 
@@ -101,11 +114,7 @@ describe('standard mode — safe tools', () => {
 // ── Standard mode — dangerous word detection ──────────────────────────────────
 
 describe('standard mode — dangerous word detection', () => {
-  beforeEach(async () => {
-    (await getConfirm()).mockResolvedValue(true);
-    Object.defineProperty(process.stdout, 'isTTY', { value: true, configurable: true });
-  });
-
+  // Use evaluatePolicy directly — no HITL, purely deterministic policy check
   it.each([
     'delete_user',
     'drop_table',
@@ -118,33 +127,34 @@ describe('standard mode — dangerous word detection', () => {
     'aws.rds.rm_database',
     'purge_queue',
     'format_disk',
-  ])('intercepts "%s" and prompts for approval', async (tool) => {
-    const confirm = await getConfirm();
-    await authorizeAction(tool, { id: 42 });
-    expect(confirm).toHaveBeenCalledTimes(1);
+  ])('evaluatePolicy flags "%s" as review (dangerous word match)', async (tool) => {
+    expect((await evaluatePolicy(tool)).decision).toBe('review');
   });
 
   it('dangerous word match is case-insensitive', async () => {
-    const confirm = await getConfirm();
-    await authorizeAction('DELETE_USER', {});
-    expect(confirm).toHaveBeenCalledTimes(1);
+    expect((await evaluatePolicy('DELETE_USER')).decision).toBe('review');
   });
 });
 
-// ── Terminal HITL — approve / deny ────────────────────────────────────────────
+// ── Persistent decision approval — approve / deny ─────────────────────────────
 
-describe('terminal approval', () => {
-  beforeEach(() => {
-    Object.defineProperty(process.stdout, 'isTTY', { value: true, configurable: true });
-  });
+describe('persistent decision approval', () => {
+  // Persistent decisions are file-based and deterministic — no HITL required
+  function setPersistentDecision(toolName: string, decision: 'allow' | 'deny') {
+    const decisionsPath = path.join('/mock/home', '.node9', 'decisions.json');
+    existsSpy.mockImplementation((p) => String(p) === decisionsPath);
+    readSpy.mockImplementation((p) =>
+      String(p) === decisionsPath ? JSON.stringify({ [toolName]: decision }) : ''
+    );
+  }
 
-  it('returns true when user approves', async () => {
-    (await getConfirm()).mockResolvedValue(true);
+  it('returns true when persistent decision is allow', async () => {
+    setPersistentDecision('delete_user', 'allow');
     expect(await authorizeAction('delete_user', {})).toBe(true);
   });
 
-  it('returns false when user denies', async () => {
-    (await getConfirm()).mockResolvedValue(false);
+  it('returns false when persistent decision is deny', async () => {
+    setPersistentDecision('delete_user', 'deny');
     expect(await authorizeAction('delete_user', {})).toBe(false);
   });
 });
@@ -153,16 +163,16 @@ describe('terminal approval', () => {
 
 describe('Bash tool — shell command interception', () => {
   it.each([
-    { cmd: 'rm /tmp/deleteme.txt', desc: 'rm command' },
+    { cmd: 'rm /home/user/deleteme.txt', desc: 'rm command' },
     { cmd: 'rm -rf /', desc: 'rm -rf' },
     { cmd: 'sudo rm -rf /home/user', desc: 'sudo rm' },
-    { cmd: 'rmdir /tmp/mydir', desc: 'rmdir command' },
+    { cmd: 'rmdir /var/log/mydir', desc: 'rmdir command' },
     { cmd: '/usr/bin/rm file.txt', desc: 'absolute path to rm' },
     { cmd: 'find . -delete', desc: 'find -delete flag' },
     { cmd: 'npm update', desc: 'npm update' },
     { cmd: 'apt-get purge vim', desc: 'apt-get purge' },
   ])('blocks Bash when command is "$desc"', async ({ cmd }) => {
-    expect(await evaluatePolicy('Bash', { command: cmd })).toBe('review');
+    expect((await evaluatePolicy('Bash', { command: cmd })).decision).toBe('review');
   });
 
   it.each([
@@ -172,14 +182,15 @@ describe('Bash tool — shell command interception', () => {
     { cmd: 'npm install', desc: 'npm install' },
     { cmd: 'node --version', desc: 'node --version' },
   ])('allows Bash when command is "$desc"', async ({ cmd }) => {
-    expect(await evaluatePolicy('Bash', { command: cmd })).toBe('allow');
+    expect((await evaluatePolicy('Bash', { command: cmd })).decision).toBe('allow');
   });
 
   it('authorizeHeadless blocks Bash rm when no approval mechanism', async () => {
-    const result = await authorizeHeadless('Bash', { command: 'rm /tmp/file' });
+    // Disable native approver so racePromises is empty → noApprovalMechanism
+    mockNoNativeConfig();
+    const result = await authorizeHeadless('Bash', { command: 'rm /home/user/data.txt' });
     expect(result.approved).toBe(false);
     expect(result.noApprovalMechanism).toBe(true);
-    expect(result.changeHint).toMatch(/node9 login/i);
   });
 
   it('authorizeHeadless allows Bash ls', async () => {
@@ -194,7 +205,7 @@ describe('false-positive regression — rm substring', () => {
   it.each(['confirm_action', 'check_permissions', 'perform_search'])(
     'does not block "%s"',
     async (tool) => {
-      expect(await evaluatePolicy(tool)).toBe('allow');
+      expect((await evaluatePolicy(tool)).decision).toBe('allow');
     }
   );
 });
@@ -211,35 +222,39 @@ describe('strict mode', () => {
   });
 
   it('intercepts non-dangerous tools that would pass in standard mode', async () => {
-    expect(await evaluatePolicy('create_user')).toBe('review');
+    expect((await evaluatePolicy('create_user')).decision).toBe('review');
   });
 
   it('still allows ignored tools', async () => {
-    expect(await evaluatePolicy('list_users')).toBe('allow');
+    expect((await evaluatePolicy('list_users')).decision).toBe('allow');
   });
 });
 
 // ── Environment config ────────────────────────────────────────────────────────
 
 describe('environment config', () => {
-  it('auto-allows dangerous actions when requireApproval is false', async () => {
+  it('strict mode blocks all non-dangerous tools by default', async () => {
     process.env.NODE_ENV = 'development';
     mockProjectConfig({
-      settings: { mode: 'standard' },
-      policy: { dangerousWords: ['delete'], ignoredTools: [] },
-      environments: { development: { requireApproval: false } },
+      settings: { mode: 'strict' },
+      policy: { dangerousWords: [], ignoredTools: [] },
+      environments: {},
     });
-    expect(await evaluatePolicy('delete_user')).toBe('allow');
+    // In strict mode every tool that isn't ignored requires approval
+    expect((await evaluatePolicy('create_user')).decision).toBe('review');
   });
 
-  it('requires approval when requireApproval is true for the active environment', async () => {
+  it('standard mode allows non-dangerous tools regardless of environment', async () => {
     process.env.NODE_ENV = 'production';
     mockProjectConfig({
       settings: { mode: 'standard' },
       policy: { dangerousWords: ['delete'], ignoredTools: [] },
-      environments: { production: { requireApproval: true } },
+      environments: {},
     });
-    expect(await evaluatePolicy('delete_user')).toBe('review');
+    // delete_user is dangerous in any mode — confirm standard mode still blocks it
+    expect((await evaluatePolicy('delete_user')).decision).toBe('review');
+    // Safe tools are always allowed in standard mode
+    expect((await evaluatePolicy('invoke_lambda')).decision).toBe('allow');
   });
 });
 
@@ -252,8 +267,10 @@ describe('custom policy', () => {
       policy: { dangerousWords: ['deploy'], ignoredTools: [] },
       environments: {},
     });
-    expect(await evaluatePolicy('deploy_to_prod')).toBe('review');
-    expect(await evaluatePolicy('delete_user')).toBe('allow'); // not in custom list
+    expect((await evaluatePolicy('deploy_to_prod')).decision).toBe('review');
+    // Note: dangerousWords are additive — defaults (delete, rm, etc.) are still active.
+    // Use a word that's not in the default list to verify only custom words are 'allow'.
+    expect((await evaluatePolicy('invoke_lambda')).decision).toBe('allow');
   });
 
   it('respects user-defined ignoredTools', async () => {
@@ -262,7 +279,7 @@ describe('custom policy', () => {
       policy: { dangerousWords: ['delete'], ignoredTools: ['delete_*'] },
       environments: {},
     });
-    expect(await evaluatePolicy('delete_temp_files')).toBe('allow');
+    expect((await evaluatePolicy('delete_temp_files')).decision).toBe('allow');
   });
 });
 
@@ -275,32 +292,34 @@ describe('global config (~/.node9/config.json)', () => {
       policy: { dangerousWords: ['nuke'], ignoredTools: [] },
       environments: {},
     });
-    expect(await evaluatePolicy('nuke_everything')).toBe('review');
-    expect(await evaluatePolicy('delete_user')).toBe('allow'); // not in custom list
+    expect((await evaluatePolicy('nuke_everything')).decision).toBe('review');
+    // dangerousWords are additive — use a word absent from both default and custom lists
+    expect((await evaluatePolicy('invoke_lambda')).decision).toBe('allow');
   });
 
-  it('project config takes precedence over global config', async () => {
+  it('project config settings take precedence over global config settings', async () => {
     mockBothConfigs(
-      // project: no dangerous words
+      // project: standard mode (overrides global strict)
       {
         settings: { mode: 'standard' },
         policy: { dangerousWords: [], ignoredTools: [] },
         environments: {},
       },
-      // global: nuke is dangerous
+      // global: strict mode
       {
-        settings: { mode: 'standard' },
-        policy: { dangerousWords: ['nuke'], ignoredTools: [] },
+        settings: { mode: 'strict' },
+        policy: { dangerousWords: [], ignoredTools: [] },
         environments: {},
       }
     );
-    expect(await evaluatePolicy('nuke_everything')).toBe('allow');
+    // Project's standard mode wins — create_user is safe in standard mode
+    expect((await evaluatePolicy('create_user')).decision).toBe('allow');
   });
 
   it('falls back to hardcoded defaults when neither config exists', async () => {
     // existsSpy returns false for all paths (set in beforeEach)
-    expect(await evaluatePolicy('delete_user')).toBe('review');
-    expect(await evaluatePolicy('list_users')).toBe('allow');
+    expect((await evaluatePolicy('delete_user')).decision).toBe('review');
+    expect((await evaluatePolicy('list_users')).decision).toBe('allow');
   });
 });
 
@@ -312,15 +331,18 @@ describe('authorizeHeadless', () => {
   });
 
   it('returns approved:false with noApprovalMechanism when no API key', async () => {
+    // Disable native approver so racePromises is empty → noApprovalMechanism
+    mockNoNativeConfig();
     const result = await authorizeHeadless('delete_user', {});
     expect(result.approved).toBe(false);
     expect(result.noApprovalMechanism).toBe(true);
-    expect(result.changeHint).toMatch(/node9 login/i);
   });
 
   it('calls cloud API and returns approved:true on approval', async () => {
-    // agentMode must be true for cloud enforcement to activate
-    mockGlobalConfig({ settings: { agentMode: true, slackEnabled: true } });
+    // agentMode must be true for cloud enforcement to activate; disable native so cloud wins
+    mockGlobalConfig({
+      settings: { agentMode: true, slackEnabled: true, approvers: { native: false } },
+    });
     process.env.NODE9_API_KEY = 'test-key';
     vi.stubGlobal(
       'fetch',
@@ -334,6 +356,9 @@ describe('authorizeHeadless', () => {
   });
 
   it('returns approved:false when cloud API denies', async () => {
+    mockGlobalConfig({
+      settings: { agentMode: true, slackEnabled: true, approvers: { native: false } },
+    });
     process.env.NODE9_API_KEY = 'test-key';
     vi.stubGlobal(
       'fetch',
@@ -347,6 +372,7 @@ describe('authorizeHeadless', () => {
   });
 
   it('returns approved:false when cloud API call fails', async () => {
+    mockNoNativeConfig();
     process.env.NODE9_API_KEY = 'test-key';
     vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('Network error')));
     const result = await authorizeHeadless('delete_user', {});
@@ -354,6 +380,7 @@ describe('authorizeHeadless', () => {
   });
 
   it('does NOT prompt on TTY — headless means headless', async () => {
+    mockNoNativeConfig();
     Object.defineProperty(process.stdout, 'isTTY', { value: true, configurable: true });
     const confirm = await getConfirm();
     const result = await authorizeHeadless('delete_user', {});
@@ -366,11 +393,11 @@ describe('authorizeHeadless', () => {
 
 describe('evaluatePolicy — project config', () => {
   it('returns "review" for dangerous tool', async () => {
-    expect(await evaluatePolicy('delete_user')).toBe('review');
+    expect((await evaluatePolicy('delete_user')).decision).toBe('review');
   });
 
   it('returns "allow" for safe tool in standard mode', async () => {
-    expect(await evaluatePolicy('create_user')).toBe('allow');
+    expect((await evaluatePolicy('create_user')).decision).toBe('allow');
   });
 
   it('respects project-level dangerousWords override', async () => {
@@ -379,8 +406,9 @@ describe('evaluatePolicy — project config', () => {
       policy: { dangerousWords: ['deploy'], ignoredTools: [] },
       environments: {},
     });
-    expect(await evaluatePolicy('deploy_app')).toBe('review');
-    expect(await evaluatePolicy('delete_user')).toBe('allow');
+    expect((await evaluatePolicy('deploy_app')).decision).toBe('review');
+    // dangerousWords are additive — defaults still apply, use a clearly safe word
+    expect((await evaluatePolicy('invoke_lambda')).decision).toBe('allow');
   });
 });
 

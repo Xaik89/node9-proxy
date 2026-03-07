@@ -1,14 +1,15 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
 import {
-  authorizeAction,
   authorizeHeadless,
   redactSecrets,
   DANGEROUS_WORDS,
   isDaemonRunning,
-  getGlobalSettings,
   getCredentials,
-  listCredentialProfiles,
+  checkPause,
+  pauseNode9,
+  resumeNode9,
+  getConfig, // Ensure this is exported from core.ts!
 } from './core';
 import { setupClaude, setupGemini, setupCursor } from './setup';
 import { startDaemon, stopDaemon, daemonStatus, DAEMON_PORT, DAEMON_HOST } from './daemon/index';
@@ -20,10 +21,31 @@ import readline from 'readline';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { createShadowSnapshot, applyUndo, getLatestSnapshotHash } from './undo';
+import { confirm } from '@inquirer/prompts';
 
 const { version } = JSON.parse(
   fs.readFileSync(path.join(__dirname, '../package.json'), 'utf-8')
 ) as { version: string };
+
+/** Parse a duration string like "15m", "1h", "30s" → milliseconds, or null if invalid. */
+function parseDuration(str: string): number | null {
+  const m = str.trim().match(/^(\d+(?:\.\d+)?)\s*(s|m|h|d)?$/i);
+  if (!m) return null;
+  const n = parseFloat(m[1]);
+  switch ((m[2] ?? 'm').toLowerCase()) {
+    case 's':
+      return Math.round(n * 1_000);
+    case 'm':
+      return Math.round(n * 60_000);
+    case 'h':
+      return Math.round(n * 3_600_000);
+    case 'd':
+      return Math.round(n * 86_400_000);
+    default:
+      return null;
+  }
+}
 
 function sanitize(value: string): string {
   // eslint-disable-next-line no-control-regex
@@ -40,7 +62,6 @@ function openBrowserLocal() {
   } catch {}
 }
 
-/** Spawn the daemon detached and poll until it's ready (up to 3 s). */
 async function autoStartDaemonAndWait(): Promise<boolean> {
   try {
     const child = spawn('node9', ['daemon'], {
@@ -53,46 +74,42 @@ async function autoStartDaemonAndWait(): Promise<boolean> {
       await new Promise((r) => setTimeout(r, 250));
       if (isDaemonRunning()) return true;
     }
-  } catch {
-    /* ignore */
-  }
+  } catch {}
   return false;
 }
 
 const program = new Command();
-
 program.name('node9').description('The Sudo Command for AI Agents').version(version);
 
-// Helper for the Proxy logic
 async function runProxy(targetCommand: string) {
   const commandParts = parseCommandString(targetCommand);
   const cmd = commandParts[0];
   const args = commandParts.slice(1);
 
-  // NEW: Try to resolve the full path of the command
   let executable = cmd;
   try {
     const { stdout } = await execa('which', [cmd]);
     if (stdout) executable = stdout.trim();
-  } catch {
-    // Fallback to original cmd if which fails
-  }
+  } catch {}
 
   console.log(chalk.green(`🚀 Node9 Proxy Active: Monitoring [${targetCommand}]`));
 
+  // Spawn the MCP Server / Shell command
   const child = spawn(executable, args, {
-    stdio: ['pipe', 'pipe', 'inherit'],
+    stdio: ['pipe', 'pipe', 'inherit'], // We control STDIN and STDOUT
     shell: true,
-    env: { ...process.env, FORCE_COLOR: '1', TERM: process.env.TERM || 'xterm-256color' },
+    env: { ...process.env, FORCE_COLOR: '1' },
   });
 
-  // Handle stdin: Forward everything to child immediately
-  process.stdin.pipe(child.stdin);
+  // ── INTERCEPT INPUT (Agent -> Server) ──
+  // This is where 'tools/call' requests come from
+  const agentIn = readline.createInterface({ input: process.stdin, terminal: false });
 
-  const childOut = readline.createInterface({ input: child.stdout, terminal: false });
-  childOut.on('line', async (line) => {
+  agentIn.on('line', async (line) => {
     try {
       const message = JSON.parse(line);
+
+      // If the Agent is trying to call a tool
       if (
         message.method === 'call_tool' ||
         message.method === 'tools/call' ||
@@ -100,22 +117,38 @@ async function runProxy(targetCommand: string) {
       ) {
         const name = message.params?.name || message.params?.tool_name || 'unknown';
         const toolArgs = message.params?.arguments || message.params?.tool_input || {};
-        const approved = await authorizeAction(sanitize(name), toolArgs);
-        if (!approved) {
+
+        // Use our Race Engine to authorize
+        const result = await authorizeHeadless(sanitize(name), toolArgs, true, {
+          agent: 'Proxy/MCP',
+        });
+
+        if (!result.approved) {
+          // If denied, send the error back to the Agent and DO NOT forward to the server
           const errorResponse = {
             jsonrpc: '2.0',
             id: message.id,
-            error: { code: -32000, message: 'Node9: Action denied.' },
+            error: {
+              code: -32000,
+              message: `Node9: Action denied. ${result.reason || ''}`,
+            },
           };
-          child.stdin.write(JSON.stringify(errorResponse) + '\n');
-          return;
+          process.stdout.write(JSON.stringify(errorResponse) + '\n');
+          return; // Stop the command here!
         }
       }
-      process.stdout.write(line + '\n');
+      // If approved or not a tool call, forward it to the server's STDIN
+      child.stdin.write(line + '\n');
     } catch {
-      process.stdout.write(line + '\n');
+      // If it's not JSON (raw shell usage), just forward it
+      child.stdin.write(line + '\n');
     }
   });
+
+  // ── FORWARD OUTPUT (Server -> Agent) ──
+  // We just pass the server's responses back to the agent as-is
+  child.stdout.pipe(process.stdout);
+
   child.on('exit', (code) => process.exit(code || 0));
 }
 
@@ -132,14 +165,11 @@ program
       fs.mkdirSync(path.dirname(credPath), { recursive: true });
 
     const profileName = options.profile || 'default';
-
-    // Load existing credentials and migrate flat format → multi-profile if needed
     let existingCreds: Record<string, unknown> = {};
     try {
       if (fs.existsSync(credPath)) {
         const raw = JSON.parse(fs.readFileSync(credPath, 'utf-8')) as Record<string, unknown>;
         if (raw.apiKey) {
-          // Migrate legacy flat format to multi-profile
           existingCreds = {
             default: { apiKey: raw.apiKey, apiUrl: raw.apiUrl || DEFAULT_API_URL },
           };
@@ -147,23 +177,18 @@ program
           existingCreds = raw;
         }
       }
-    } catch {
-      /* ignore */
-    }
+    } catch {}
 
     existingCreds[profileName] = { apiKey, apiUrl: DEFAULT_API_URL };
     fs.writeFileSync(credPath, JSON.stringify(existingCreds, null, 2), { mode: 0o600 });
 
-    // Update agentMode in global config — only for the default profile
     if (profileName === 'default') {
       const configPath = path.join(os.homedir(), '.node9', 'config.json');
       let config: Record<string, unknown> = {};
       try {
         if (fs.existsSync(configPath))
           config = JSON.parse(fs.readFileSync(configPath, 'utf-8')) as Record<string, unknown>;
-      } catch {
-        /* ignore */
-      }
+      } catch {}
       if (!config.settings || typeof config.settings !== 'object') config.settings = {};
       (config.settings as Record<string, unknown>).agentMode = !options.local;
       if (!fs.existsSync(path.dirname(configPath)))
@@ -174,22 +199,12 @@ program
     if (options.profile && profileName !== 'default') {
       console.log(chalk.green(`✅ Profile "${profileName}" saved`));
       console.log(chalk.gray(`   Switch to it per-session:  NODE9_PROFILE=${profileName} claude`));
-      console.log(
-        chalk.gray(
-          `   Or lock a project to it:   add "apiKey": "<your-api-key>" to node9.config.json`
-        )
-      );
     } else if (options.local) {
       console.log(chalk.green(`✅ Privacy mode 🛡️`));
       console.log(chalk.gray(`   All decisions stay on this machine.`));
-      console.log(
-        chalk.gray(`   No data is sent to the cloud. Local config is the only authority.`)
-      );
-      console.log(chalk.gray(`   To enable cloud enforcement: node9 login <apiKey>`));
     } else {
       console.log(chalk.green(`✅ Logged in — agent mode`));
       console.log(chalk.gray(`   Team policy enforced for all calls via Node9 cloud.`));
-      console.log(chalk.gray(`   To keep local control only: node9 login <apiKey> --local`));
     }
   });
 
@@ -207,7 +222,7 @@ program
     process.exit(1);
   });
 
-// 3. INIT
+// 3. INIT (Upgraded with Enterprise Schema)
 program
   .command('init')
   .description('Create ~/.node9/config.json with default policy (safe to run multiple times)')
@@ -222,8 +237,16 @@ program
     }
     const defaultConfig = {
       version: '1.0',
-      settings: { mode: 'standard' },
+      settings: {
+        mode: 'standard',
+        autoStartDaemon: true,
+        agentMode: false,
+        enableUndo: true,
+        enableHookLogDebug: false,
+        approvers: { native: true, browser: true, cloud: true, terminal: true },
+      },
       policy: {
+        sandboxPaths: ['/tmp/**', '**/sandbox/**', '**/test-results/**'],
         dangerousWords: DANGEROUS_WORDS,
         ignoredTools: [
           'list_*',
@@ -233,29 +256,39 @@ program
           'read',
           'write',
           'edit',
-          'multiedit',
           'glob',
           'grep',
           'ls',
           'notebookread',
           'notebookedit',
-          'todoread',
-          'todowrite',
           'webfetch',
           'websearch',
           'exitplanmode',
           'askuserquestion',
+          'agent',
+          'task*',
         ],
         toolInspection: {
           bash: 'command',
           shell: 'command',
           run_shell_command: 'command',
           'terminal.execute': 'command',
+          'postgres:query': 'sql',
         },
         rules: [
           {
             action: 'rm',
-            allowPaths: ['**/node_modules/**', 'dist/**', 'build/**', '.DS_Store'],
+            allowPaths: [
+              '**/node_modules/**',
+              'dist/**',
+              'build/**',
+              '.next/**',
+              'coverage/**',
+              '.cache/**',
+              'tmp/**',
+              'temp/**',
+              '.DS_Store',
+            ],
           },
         ],
       },
@@ -267,37 +300,34 @@ program
     console.log(chalk.gray(`   Edit this file to add custom tool inspection or security rules.`));
   });
 
-// 4. STATUS
+// 4. STATUS (Upgraded to show Waterfall & Undo status)
 program
   .command('status')
   .description('Show current Node9 mode, policy source, and persistent decisions')
   .action(() => {
     const creds = getCredentials();
     const daemonRunning = isDaemonRunning();
-    const settings = getGlobalSettings();
+
+    // Grab the fully resolved waterfall config!
+    const mergedConfig = getConfig();
+    const settings = mergedConfig.settings;
 
     console.log('');
 
     // ── Policy authority ────────────────────────────────────────────────────
     if (creds && settings.agentMode) {
       console.log(chalk.green('  ● Agent mode') + chalk.gray(' — cloud team policy enforced'));
-      console.log(chalk.gray('    All calls → Node9 cloud → Policy Studio rules apply'));
-      console.log(chalk.gray('    Switch to local control: node9 login <apiKey> --local'));
     } else if (creds && !settings.agentMode) {
       console.log(
         chalk.blue('  ● Privacy mode 🛡️') + chalk.gray(' — all decisions stay on this machine')
       );
-      console.log(
-        chalk.gray('    No data is sent to the cloud. Local config is the only authority.')
-      );
-      console.log(chalk.gray('    Enable cloud enforcement: node9 login <apiKey>'));
     } else {
-      console.log(chalk.yellow('  ○ Privacy mode 🛡️') + chalk.gray(' — no API key'));
-      console.log(chalk.gray('    All decisions stay on this machine.'));
-      console.log(chalk.gray('    Connect to your team: node9 login <apiKey>'));
+      console.log(
+        chalk.yellow('  ○ Privacy mode 🛡️') + chalk.gray(' — no API key (Local rules only)')
+      );
     }
 
-    // ── Daemon ──────────────────────────────────────────────────────────────
+    // ── Daemon & Architecture ────────────────────────────────────────────────
     console.log('');
     if (daemonRunning) {
       console.log(
@@ -305,97 +335,62 @@ program
       );
     } else {
       console.log(chalk.gray('  ○ Daemon stopped'));
-      console.log(chalk.gray('    Start: node9 daemon --background'));
     }
 
-    // ── Local config ────────────────────────────────────────────────────────
+    if (settings.enableUndo) {
+      console.log(
+        chalk.magenta('  ● Undo Engine') +
+          chalk.gray(`    → Auto-snapshotting Git repos on AI change`)
+      );
+    }
+
+    // ── Configuration State ──────────────────────────────────────────────────
     console.log('');
-    console.log(`  Mode:    ${chalk.white(settings.mode)}`);
+    const modeLabel =
+      settings.mode === 'audit'
+        ? chalk.blue('audit')
+        : settings.mode === 'strict'
+          ? chalk.red('strict')
+          : chalk.white('standard');
+    console.log(`  Mode:    ${modeLabel}`);
+
     const projectConfig = path.join(process.cwd(), 'node9.config.json');
     const globalConfig = path.join(os.homedir(), '.node9', 'config.json');
-    const configSource = fs.existsSync(projectConfig)
-      ? projectConfig
-      : fs.existsSync(globalConfig)
-        ? globalConfig
-        : chalk.gray('none (built-in defaults)');
-    console.log(`  Config:  ${chalk.gray(configSource)}`);
+    console.log(
+      `  Local:   ${fs.existsSync(projectConfig) ? chalk.green('Active (node9.config.json)') : chalk.gray('Not present')}`
+    );
+    console.log(
+      `  Global:  ${fs.existsSync(globalConfig) ? chalk.green('Active (~/.node9/config.json)') : chalk.gray('Not present')}`
+    );
 
-    // ── Profiles ─────────────────────────────────────────────────────────────
-    const profiles = listCredentialProfiles();
-    if (profiles.length > 1) {
-      const activeProfile = process.env.NODE9_PROFILE || 'default';
-      console.log('');
-      console.log(`  Active profile:  ${chalk.white(activeProfile)}`);
+    if (mergedConfig.policy.sandboxPaths.length > 0) {
       console.log(
-        `  All profiles:    ${profiles.map((p) => (p === activeProfile ? chalk.green(p) : chalk.gray(p))).join(chalk.gray(', '))}`
+        `  Sandbox: ${chalk.green(`${mergedConfig.policy.sandboxPaths.length} safe zones active`)}`
       );
-      console.log(chalk.gray(`  Switch:  NODE9_PROFILE=<name> claude`));
     }
 
-    // ── Persistent decisions ────────────────────────────────────────────────
-    const decisionsFile = path.join(os.homedir(), '.node9', 'decisions.json');
-    let decisions: Record<string, string> = {};
-    try {
-      if (fs.existsSync(decisionsFile))
-        decisions = JSON.parse(fs.readFileSync(decisionsFile, 'utf-8')) as Record<string, string>;
-    } catch {
-      /* ignore */
-    }
-
-    const keys = Object.keys(decisions);
-    console.log('');
-    if (keys.length > 0) {
-      console.log(`  Persistent decisions (${keys.length}):`);
-      keys.forEach((tool) => {
-        const d = decisions[tool];
-        const badge = d === 'allow' ? chalk.green('allow') : chalk.red('deny');
-        console.log(`    ${chalk.gray('·')} ${tool.padEnd(35)} ${badge}`);
-      });
-      console.log(chalk.gray('\n    Manage: node9 daemon --openui → Decisions tab'));
-    } else {
-      console.log(chalk.gray('  No persistent decisions set'));
-    }
-
-    // ── Audit log ────────────────────────────────────────────────────────────
-    const auditLogPath = path.join(os.homedir(), '.node9', 'audit.log');
-    try {
-      if (fs.existsSync(auditLogPath)) {
-        const lines = fs
-          .readFileSync(auditLogPath, 'utf-8')
-          .split('\n')
-          .filter((l) => l.trim().length > 0);
-        console.log('');
-        console.log(
-          `  📋 Local Audit Log: ` +
-            chalk.white(`${lines.length} agent action${lines.length !== 1 ? 's' : ''} recorded`) +
-            chalk.gray(`  (cat ~/.node9/audit.log to view)`)
-        );
-      }
-    } catch {
-      /* ignore */
+    // ── Pause state ──────────────────────────────────────────────────────────
+    const pauseState = checkPause();
+    if (pauseState.paused) {
+      const expiresAt = pauseState.expiresAt
+        ? new Date(pauseState.expiresAt).toLocaleTimeString()
+        : 'indefinitely';
+      console.log('');
+      console.log(
+        chalk.yellow(`  ⏸  PAUSED until ${expiresAt}`) + chalk.gray(' — all tool calls allowed')
+      );
     }
 
     console.log('');
   });
 
-// 5. DAEMON — localhost browser UI for free-tier HITL
+// 5. DAEMON
 program
   .command('daemon')
-  .description('Run the local approval server (browser HITL for free tier)')
-  .addHelpText(
-    'after',
-    '\n  Subcommands: start (default), stop, status' +
-      '\n  Options:' +
-      '\n    --background  (-b)  start detached, no second terminal needed' +
-      '\n    --openui      (-o)  start in background and open the browser (or just open if already running)' +
-      '\n  Example:     node9 daemon --background'
-  )
+  .description('Run the local approval server')
   .argument('[action]', 'start | stop | status (default: start)')
   .option('-b, --background', 'Start the daemon in the background (detached)')
-  .option(
-    '-o, --openui',
-    'Start in background and open browser (or just open browser if already running)'
-  )
+  .option('-o, --openui', 'Start in background and open browser')
   .action(
     async (action: string | undefined, options: { background?: boolean; openui?: boolean }) => {
       const cmd = (action ?? 'start').toLowerCase();
@@ -408,12 +403,10 @@ program
 
       if (options.openui) {
         if (isDaemonRunning()) {
-          // Daemon already running — just open the browser
           openBrowserLocal();
           console.log(chalk.green(`🌐  Opened browser: http://${DAEMON_HOST}:${DAEMON_PORT}/`));
           process.exit(0);
         }
-        // Start in background, wait for it, then open browser
         const child = spawn('node9', ['daemon'], { detached: true, stdio: 'ignore' });
         child.unref();
         for (let i = 0; i < 12; i++) {
@@ -422,7 +415,6 @@ program
         }
         openBrowserLocal();
         console.log(chalk.green(`\n🛡️  Node9 daemon started + browser opened`));
-        console.log(chalk.gray(`   http://${DAEMON_HOST}:${DAEMON_PORT}/`));
         process.exit(0);
       }
 
@@ -430,9 +422,6 @@ program
         const child = spawn('node9', ['daemon'], { detached: true, stdio: 'ignore' });
         child.unref();
         console.log(chalk.green(`\n🛡️  Node9 daemon started in background  (PID ${child.pid})`));
-        console.log(chalk.gray(`   http://${DAEMON_HOST}:${DAEMON_PORT}/`));
-        console.log(chalk.gray(`   node9 daemon status  — check if running`));
-        console.log(chalk.gray(`   node9 daemon stop    — stop it\n`));
         process.exit(0);
       }
 
@@ -440,7 +429,7 @@ program
     }
   );
 
-// 6. CHECK (Internal Hook)
+// 6. CHECK (Internal Hook - Upgraded with AI Negotiation Loop)
 program
   .command('check')
   .description('Hook handler — evaluates a tool call before execution')
@@ -450,129 +439,161 @@ program
       try {
         if (!raw || raw.trim() === '') process.exit(0);
 
-        // Debug logging — only when NODE9_DEBUG=1 to avoid filling disk
-        if (process.env.NODE9_DEBUG === '1') {
+        const payload = JSON.parse(raw) as {
+          tool_name?: string;
+          tool_input?: unknown;
+          name?: string;
+          args?: unknown;
+          cwd?: string;
+        };
+
+        // Change to the project cwd from the hook payload BEFORE loading config,
+        // so getConfig() finds the correct node9.config.json for that project.
+        if (payload.cwd) {
+          try {
+            process.chdir(payload.cwd);
+          } catch {
+            // ignore if cwd doesn't exist
+          }
+        }
+
+        const config = getConfig();
+
+        // Debug logging — controlled by Env Var OR new Settings config
+        if (process.env.NODE9_DEBUG === '1' || config.settings.enableHookLogDebug) {
           const logPath = path.join(os.homedir(), '.node9', 'hook-debug.log');
           if (!fs.existsSync(path.dirname(logPath)))
             fs.mkdirSync(path.dirname(logPath), { recursive: true });
           fs.appendFileSync(logPath, `[${new Date().toISOString()}] STDIN: ${raw}\n`);
-          fs.appendFileSync(
-            logPath,
-            `[${new Date().toISOString()}] TTY: ${process.stdout.isTTY}\n`
-          );
         }
-
-        // Support both Claude Code format { tool_name, tool_input }
-        // and Gemini CLI format           { name, args }
-        const payload = JSON.parse(raw) as {
-          tool_name?: string;
-          tool_input?: unknown; // Claude Code / standard
-          name?: string;
-          args?: unknown; // Gemini CLI BeforeTool
-        };
         const toolName = sanitize(payload.tool_name ?? payload.name ?? '');
         const toolInput = payload.tool_input ?? payload.args ?? {};
 
-        // Detect which AI agent invoked this hook from the payload format.
-        // Claude Code sends { tool_name, tool_input }; Gemini CLI sends { name, args }.
         const agent =
           payload.tool_name !== undefined
             ? 'Claude Code'
             : payload.name !== undefined
               ? 'Gemini CLI'
               : 'Terminal';
-
-        // Detect MCP server from Claude Code's tool name format: mcp__<server>__<tool>
         const mcpMatch = toolName.match(/^mcp__([^_](?:[^_]|_(?!_))*?)__/i);
         const mcpServer = mcpMatch?.[1];
 
-        const sendBlock = (msg: string, result?: { blockedBy?: string; changeHint?: string }) => {
-          const BLOCKED_BY_LABELS: Record<string, string> = {
-            'team-policy': 'team policy (set by your admin)',
-            'persistent-deny': 'you set this tool to always deny',
-            'local-config': 'your local config (dangerousWords / rules)',
-            'local-decision': 'you denied it in the browser',
-            'no-approval-mechanism': 'no approval method is configured',
-          };
+        // ── THE NEGOTIATION LOOP (TALKING BACK TO THE AI) ───────────────
+        // src/cli.ts -> inside the check command action
+
+        const sendBlock = (
+          msg: string,
+          result?: { blockedBy?: string; changeHint?: string; blockedByLabel?: string }
+        ) => {
+          // 1. Determine the context (User vs Policy)
+          const blockedByContext =
+            result?.blockedByLabel || result?.blockedBy || 'Local Security Policy';
+
+          // 2. Identify if it was a human decision or an automated rule
+          const isHumanDecision =
+            blockedByContext.toLowerCase().includes('user') ||
+            blockedByContext.toLowerCase().includes('daemon') ||
+            blockedByContext.toLowerCase().includes('decision');
+
+          // 3. Print to the human terminal for visibility
           console.error(chalk.red(`\n🛑 Node9 blocked "${toolName}"`));
-          if (result?.blockedBy) {
-            console.error(
-              chalk.gray(
-                `   Blocked by: ${BLOCKED_BY_LABELS[result.blockedBy] ?? result.blockedBy}`
-              )
-            );
-          }
-          if (result?.changeHint) {
-            console.error(chalk.cyan(`   To change:  ${result.changeHint}`));
-          }
+          console.error(chalk.gray(`   Triggered by: ${blockedByContext}`));
+          if (result?.changeHint) console.error(chalk.cyan(`   To change:  ${result.changeHint}`));
           console.error('');
-          // Full Claude Code & Gemini compatibility format
+
+          // 4. THE NEGOTIATION PROMPT: This is what the LLM actually reads
+          let aiFeedbackMessage = '';
+
+          if (isHumanDecision) {
+            // Voice for User Rejection
+            aiFeedbackMessage = `NODE9 SECURITY INTERVENTION: The human user specifically REJECTED this action.
+        REASON: ${msg || 'No specific reason provided by user.'}
+
+        INSTRUCTIONS FOR AI AGENT:
+        - Do NOT retry this exact command immediately.
+        - Explain to the user that you understand they blocked the action.
+        - Ask the user if there is an alternative approach they would prefer, or if they intended to block this action entirely.
+        - If you believe this action is critical, explain your reasoning to the user and ask them to run 'node9 pause 15m' to allow you to proceed.`;
+          } else {
+            // Voice for Policy/Rule Rejection
+            aiFeedbackMessage = `NODE9 SECURITY INTERVENTION: Action blocked by automated policy [${blockedByContext}].
+        REASON: ${msg}
+
+        INSTRUCTIONS FOR AI AGENT:
+        - This command violates the current security configuration.
+        - Do NOT attempt to bypass this rule with bash syntax tricks; it will be blocked again.
+        - Pivot to a non-destructive or read-only alternative.
+        - Inform the user which security rule was triggered.`;
+          }
+
+          // 5. Send the structured JSON back to the LLM agent
           process.stdout.write(
             JSON.stringify({
               decision: 'block',
-              reason: msg,
+              reason: aiFeedbackMessage, // This is the core instruction
               hookSpecificOutput: {
                 hookEventName: 'PreToolUse',
                 permissionDecision: 'deny',
-                permissionDecisionReason: msg,
+                permissionDecisionReason: aiFeedbackMessage,
               },
             }) + '\n'
           );
           process.exit(0);
         };
-
-        // Unrecognised payload format — fail closed, don't silently allow.
         if (!toolName) {
           sendBlock('Node9: unrecognised hook payload — tool name missing.');
           return;
         }
 
         const meta = { agent, mcpServer };
+
+        // Pass to Headless authorization
         const result = await authorizeHeadless(toolName, toolInput, false, meta);
+
         if (result.approved) {
-          if (result.checkedBy) {
+          if (result.checkedBy)
             process.stderr.write(`✓ node9 [${result.checkedBy}]: "${toolName}" allowed\n`);
-          }
           process.exit(0);
         }
 
-        // No approval mechanism (no API key, daemon not running) — auto-start daemon and retry.
-        // Skipped when:
-        //   NODE9_NO_AUTO_DAEMON=1   — CI / test environments
-        //   process.stdout.isTTY     — human at terminal, terminal prompt is more appropriate
-        //   autoStartDaemon: false   — user preference in ~/.node9/config.json (toggled via daemon UI)
+        // Auto-start daemon if allowed
         if (
           result.noApprovalMechanism &&
           !isDaemonRunning() &&
           !process.env.NODE9_NO_AUTO_DAEMON &&
           !process.stdout.isTTY &&
-          getGlobalSettings().autoStartDaemon
+          config.settings.autoStartDaemon
         ) {
           console.error(chalk.cyan('\n🛡️  Node9: Starting approval daemon automatically...'));
           const daemonReady = await autoStartDaemonAndWait();
           if (daemonReady) {
             const retry = await authorizeHeadless(toolName, toolInput, false, meta);
             if (retry.approved) {
-              if (retry.checkedBy) {
+              if (retry.checkedBy)
                 process.stderr.write(`✓ node9 [${retry.checkedBy}]: "${toolName}" allowed\n`);
-              }
               process.exit(0);
             }
-            sendBlock(retry.reason ?? `Node9 blocked "${toolName}".`, retry);
+            // Add the dynamic label so we know if it was Cloud, Config, etc.
+            sendBlock(retry.reason ?? `Node9 blocked "${toolName}".`, {
+              ...retry,
+              blockedByLabel: retry.blockedByLabel,
+            });
             return;
           }
         }
 
-        sendBlock(result.reason ?? `Node9 blocked "${toolName}".`, result);
+        // Add the dynamic label to the final block
+        sendBlock(result.reason ?? `Node9 blocked "${toolName}".`, {
+          ...result,
+          blockedByLabel: result.blockedByLabel,
+        });
       } catch (err: unknown) {
-        // On any parse error, fail open — never block Claude due to a Node9 bug.
-        // Write to debug log only if NODE9_DEBUG=1, otherwise silently exit 0.
         if (process.env.NODE9_DEBUG === '1') {
           const logPath = path.join(os.homedir(), '.node9', 'hook-debug.log');
           const errMsg = err instanceof Error ? err.message : String(err);
           fs.appendFileSync(logPath, `[${new Date().toISOString()}] ERROR: ${errMsg}\n`);
         }
-        process.exit(0);
+        process.exit(0); // Fail open so we never break Claude on a parse error
       }
     };
 
@@ -590,8 +611,6 @@ program
       process.stdin.setEncoding('utf-8');
       process.stdin.on('data', (chunk) => (raw += chunk));
       process.stdin.on('end', () => void done());
-      // Safety net: if stdin never closes (agent bug), process whatever we have
-      // after 5 s rather than hanging forever and stalling the AI agent.
       setTimeout(() => void done(), 5000);
     }
   });
@@ -602,43 +621,102 @@ program
   .description('PostToolUse hook — records executed tool calls')
   .argument('[data]', 'JSON string of the tool call')
   .action(async (data) => {
-    const logPayload = (raw: string) => {
+    // 1. Added 'async' here to allow 'await' (Fixes Error 1308)
+    const logPayload = async (raw: string) => {
       try {
         if (!raw || raw.trim() === '') process.exit(0);
-        const payload = JSON.parse(raw) as { tool_name?: string; tool_input?: unknown };
+        const payload = JSON.parse(raw) as {
+          tool_name?: string;
+          name?: string;
+          tool_input?: unknown;
+          args?: unknown;
+        };
 
-        // Redact secrets from the input before stringifying for the log
+        // Handle both Claude (tool_name) and Gemini (name)
+        const tool = sanitize(payload.tool_name ?? payload.name ?? 'unknown');
+        const rawInput = payload.tool_input ?? payload.args ?? {};
+
         const entry = {
           ts: new Date().toISOString(),
-          tool: sanitize(payload.tool_name ?? 'unknown'),
-          input: JSON.parse(redactSecrets(JSON.stringify(payload.tool_input || {}))),
+          tool: tool,
+          input: JSON.parse(redactSecrets(JSON.stringify(rawInput))),
         };
 
         const logPath = path.join(os.homedir(), '.node9', 'audit.log');
         if (!fs.existsSync(path.dirname(logPath)))
           fs.mkdirSync(path.dirname(logPath), { recursive: true });
         fs.appendFileSync(logPath, JSON.stringify(entry) + '\n');
+
+        const config = getConfig();
+        const STATE_CHANGING_TOOLS = [
+          'bash',
+          'shell',
+          'write_file',
+          'edit_file',
+          'replace',
+          'terminal.execute',
+        ];
+
+        if (config.settings.enableUndo && STATE_CHANGING_TOOLS.includes(tool.toLowerCase())) {
+          await createShadowSnapshot();
+        }
       } catch {
-        // Ignored
+        /* ignore */
       }
       process.exit(0);
     };
 
     if (data) {
-      logPayload(data);
+      await logPayload(data);
     } else {
       let raw = '';
       process.stdin.setEncoding('utf-8');
       process.stdin.on('data', (chunk) => (raw += chunk));
-      process.stdin.on('end', () => logPayload(raw));
+      process.stdin.on('end', () => {
+        // Use void to fire the async function from the sync event emitter
+        void logPayload(raw);
+      });
       setTimeout(() => {
         if (!raw) process.exit(0);
       }, 500);
     }
   });
 
-// 8. SMART RUNNER
-// Agent CLIs that use the hook system — proxy mode does not work for these.
+// 8. PAUSE
+program
+  .command('pause')
+  .description('Temporarily disable Node9 protection for a set duration')
+  .option('-d, --duration <duration>', 'How long to pause (e.g. 15m, 1h, 30s)', '15m')
+  .action((options: { duration: string }) => {
+    const ms = parseDuration(options.duration);
+    if (ms === null) {
+      console.error(
+        chalk.red(`\n❌  Invalid duration: "${options.duration}". Use format like 15m, 1h, 30s.\n`)
+      );
+      process.exit(1);
+    }
+    pauseNode9(ms, options.duration);
+    const expiresAt = new Date(Date.now() + ms).toLocaleTimeString();
+    console.log(chalk.yellow(`\n⏸  Node9 paused until ${expiresAt}`));
+    console.log(chalk.gray(`   All tool calls will be allowed without review.`));
+    console.log(chalk.gray(`   Run "node9 resume" to re-enable early.\n`));
+  });
+
+// 9. RESUME
+program
+  .command('resume')
+  .description('Re-enable Node9 protection immediately')
+  .action(() => {
+    const { paused } = checkPause();
+    if (!paused) {
+      console.log(chalk.gray('\nNode9 is already active — nothing to resume.\n'));
+      return;
+    }
+    resumeNode9();
+    console.log(chalk.green('\n▶  Node9 resumed — protection is active.\n'));
+  });
+
+// 10. SMART RUNNER
 const HOOK_BASED_AGENTS: Record<string, string> = {
   claude: 'claude',
   gemini: 'gemini',
@@ -651,58 +729,33 @@ program
     if (commandArgs && commandArgs.length > 0) {
       const firstArg = commandArgs[0].toLowerCase();
 
-      // Friendly error for known agent CLIs that need hook-based integration
       if (HOOK_BASED_AGENTS[firstArg] !== undefined) {
         const target = HOOK_BASED_AGENTS[firstArg];
         console.error(
           chalk.yellow(`\n⚠️  Node9 proxy mode does not support "${target}" directly.`)
         );
-        console.error(
-          chalk.white(`\n   "${target}" is an interactive terminal app — it needs a real`)
-        );
-        console.error(
-          chalk.white(`   TTY and communicates via its own hook system, not JSON-RPC.\n`)
-        );
-        console.error(chalk.bold(`   Use the hook-based integration instead:\n`));
+        console.error(chalk.white(`\n   "${target}" uses its own hook system. Use:`));
         console.error(
           chalk.green(`     node9 addto ${target}   `) + chalk.gray('# one-time setup')
         );
-        console.error(
-          chalk.green(`     ${target}              `) +
-            chalk.gray('# run normally — Node9 hooks fire automatically')
-        );
-        console.error(chalk.white(`\n   For browser approval popups (no API key required):`));
-        console.error(
-          chalk.green(`     node9 daemon --background`) +
-            chalk.gray('# start (no second terminal needed)')
-        );
-        console.error(
-          chalk.green(`     ${target}              `) +
-            chalk.gray('# Node9 will open browser on dangerous actions\n')
-        );
+        console.error(chalk.green(`     ${target}              `) + chalk.gray('# run normally'));
         process.exit(1);
       }
 
       const fullCommand = commandArgs.join(' ');
-
-      // Check the command against policy.
-      // First pass: no terminal fallback — prefer daemon/browser over a plain Y/N prompt.
       let result = await authorizeHeadless('shell', { command: fullCommand });
 
-      // No approval mechanism → try to auto-start the daemon so the browser opens.
-      // The daemon will open the browser itself when the next request arrives.
       if (
         result.noApprovalMechanism &&
         !isDaemonRunning() &&
         !process.env.NODE9_NO_AUTO_DAEMON &&
-        getGlobalSettings().autoStartDaemon
+        getConfig().settings.autoStartDaemon
       ) {
         console.error(chalk.cyan('\n🛡️  Node9: Starting approval daemon automatically...'));
         const daemonReady = await autoStartDaemonAndWait();
         if (daemonReady) result = await authorizeHeadless('shell', { command: fullCommand });
       }
 
-      // Daemon unavailable but a human is at the terminal — fall back to a Y/N prompt.
       if (result.noApprovalMechanism && process.stdout.isTTY) {
         result = await authorizeHeadless('shell', { command: fullCommand }, true);
       }
@@ -711,21 +764,6 @@ program
         console.error(
           chalk.red(`\n❌ Node9 Blocked: ${result.reason || 'Dangerous command detected.'}`)
         );
-        if (result.blockedBy) {
-          const BLOCKED_BY_LABELS: Record<string, string> = {
-            'team-policy': 'Team policy (Node9 cloud)',
-            'persistent-deny': 'Persistent deny rule',
-            'local-config': 'Local config',
-            'local-decision': 'Browser UI decision',
-            'no-approval-mechanism': 'No approval mechanism available',
-          };
-          console.error(
-            chalk.gray(`   Blocked by: ${BLOCKED_BY_LABELS[result.blockedBy] ?? result.blockedBy}`)
-          );
-        }
-        if (result.changeHint) {
-          console.error(chalk.cyan(`   To change:  ${result.changeHint}`));
-        }
         process.exit(1);
       }
 
@@ -736,18 +774,43 @@ program
     }
   });
 
-// Safety net: catch unhandled promise rejections that escape individual try/catch blocks.
-// For the `check` command (hook) these log to the debug file and exit 0 (fail-open) so
-// a Node9 bug never blocks the AI agent. For all other commands they surface the error.
+program
+  .command('undo')
+  .description('Revert the project to the state before the last AI action')
+  .action(async () => {
+    const hash = getLatestSnapshotHash();
+
+    if (!hash) {
+      console.log(chalk.yellow('\nℹ️  No Undo snapshot found for this machine.\n'));
+      return;
+    }
+
+    console.log(chalk.magenta.bold('\n⏪ NODE9 UNDO ENGINE'));
+    console.log(chalk.white(`Target Snapshot: ${chalk.gray(hash.slice(0, 7))}`));
+
+    const proceed = await confirm({
+      message: 'Revert all files to the state before the last AI action?',
+      default: false,
+    });
+
+    if (proceed) {
+      if (applyUndo(hash)) {
+        console.log(chalk.green('✅ Project reverted successfully.\n'));
+      } else {
+        console.error(chalk.red('❌ Undo failed. Ensure you are in a Git repository.\n'));
+      }
+    }
+  });
+
 process.on('unhandledRejection', (reason) => {
   const isCheckHook = process.argv[2] === 'check';
   if (isCheckHook) {
-    if (process.env.NODE9_DEBUG === '1') {
+    if (process.env.NODE9_DEBUG === '1' || getConfig().settings.enableHookLogDebug) {
       const logPath = path.join(os.homedir(), '.node9', 'hook-debug.log');
       const msg = reason instanceof Error ? reason.message : String(reason);
       fs.appendFileSync(logPath, `[${new Date().toISOString()}] UNHANDLED: ${msg}\n`);
     }
-    process.exit(0); // fail-open: never stall the AI agent due to a Node9 bug
+    process.exit(0);
   } else {
     console.error('[Node9] Unhandled error:', reason);
     process.exit(1);

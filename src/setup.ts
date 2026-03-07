@@ -63,8 +63,9 @@ interface GeminiSettings {
 
 function printDaemonTip(): void {
   console.log(
-    chalk.cyan('\n   💡 Enable browser approvals (no API key needed):') +
-      chalk.green('  node9 daemon --background')
+    chalk.cyan('\n   💡 Node9 will protect you automatically using Native OS popups.') +
+      chalk.white('\n      To view your history or manage persistent rules, run:') +
+      chalk.green('\n      node9 daemon --openui')
   );
 }
 
@@ -133,7 +134,7 @@ export async function setupClaude(): Promise<void> {
     if (!settings.hooks.PostToolUse) settings.hooks.PostToolUse = [];
     settings.hooks.PostToolUse.push({
       matcher: '.*',
-      hooks: [{ type: 'command', command: fullPathCommand('log') }],
+      hooks: [{ type: 'command', command: fullPathCommand('log'), timeout: 600 }],
     });
     console.log(chalk.green('  ✅ PostToolUse hook added → node9 log'));
     anythingChanged = true;
@@ -216,7 +217,12 @@ export async function setupGemini(): Promise<void> {
     settings.hooks.BeforeTool.push({
       matcher: '.*',
       hooks: [
-        { name: 'node9-check', type: 'command', command: fullPathCommand('check'), timeout: 60000 },
+        {
+          name: 'node9-check',
+          type: 'command',
+          command: fullPathCommand('check'),
+          timeout: 600000,
+        },
       ],
     });
     console.log(chalk.green('  ✅ BeforeTool hook added → node9 check'));

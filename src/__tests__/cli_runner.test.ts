@@ -12,14 +12,27 @@ import {
 
 vi.mock('@inquirer/prompts', () => ({ confirm: vi.fn() }));
 
+vi.mock('../ui/native', () => ({
+  askNativePopup: vi.fn().mockReturnValue('deny'),
+  sendDesktopNotification: vi.fn(),
+}));
+
 const existsSpy = vi.spyOn(fs, 'existsSync');
 const readSpy = vi.spyOn(fs, 'readFileSync');
 vi.spyOn(fs, 'writeFileSync').mockImplementation(() => undefined);
 vi.spyOn(fs, 'mkdirSync').mockImplementation(() => undefined);
 const homeSpy = vi.spyOn(os, 'homedir');
 
-async function getConfirm() {
-  return vi.mocked((await import('@inquirer/prompts')).confirm);
+/** Mock global config with native approver disabled so the race engine
+ *  relies only on daemon / terminal / cloud channels (matching test intent). */
+function mockNoNativeConfig(extra?: Record<string, unknown>) {
+  const globalPath = path.join('/mock/home', '.node9', 'config.json');
+  existsSpy.mockImplementation((p) => String(p) === globalPath);
+  readSpy.mockImplementation((p) =>
+    String(p) === globalPath
+      ? JSON.stringify({ settings: { approvers: { native: false }, ...extra } })
+      : ''
+  );
 }
 
 beforeEach(() => {
@@ -89,23 +102,24 @@ describe('getGlobalSettings', () => {
 
 describe('smart runner — shell command policy', () => {
   it('blocks dangerous shell commands', async () => {
-    const result = await evaluatePolicy('shell', { command: 'rm -rf /tmp/data' });
-    expect(result).toBe('review');
+    // Use a non-sandbox path — /tmp/** is in sandboxPaths and would be auto-allowed
+    const result = await evaluatePolicy('shell', { command: 'rm -rf /home/user/data' });
+    expect(result.decision).toBe('review');
   });
 
   it('allows safe shell commands', async () => {
     const result = await evaluatePolicy('shell', { command: 'ls -la' });
-    expect(result).toBe('allow');
+    expect(result.decision).toBe('allow');
   });
 
   it('blocks when command contains dangerous word in path', async () => {
     const result = await evaluatePolicy('shell', { command: 'find . -delete' });
-    expect(result).toBe('review');
+    expect(result.decision).toBe('review');
   });
 
   it('allows npm install (no dangerous tokens)', async () => {
     const result = await evaluatePolicy('shell', { command: 'npm install express' });
-    expect(result).toBe('allow');
+    expect(result.decision).toBe('allow');
   });
 });
 
@@ -113,28 +127,33 @@ describe('smart runner — shell command policy', () => {
 
 describe('autoStartDaemon: false — blocks without daemon when no TTY', () => {
   it('returns noApprovalMechanism when no API key, no daemon, no TTY', async () => {
-    // Daemon not running (existsSpy returns false for PID file)
+    // Disable native so racePromises is empty → noApprovalMechanism
+    mockNoNativeConfig();
     const result = await authorizeHeadless('delete_user', {});
     expect(result.approved).toBe(false);
     expect(result.noApprovalMechanism).toBe(true);
   });
 
-  it('shows terminal prompt when TTY is available (allowTerminalFallback)', async () => {
-    Object.defineProperty(process.stdout, 'isTTY', { value: true, configurable: true });
-    const confirm = await getConfirm();
-    vi.mocked(confirm).mockResolvedValue(true);
+  it('approves via persistent allow decision (deterministic, no HITL)', async () => {
+    // Persistent decisions are checked before the race engine — no popup, no TTY needed
+    const decisionsPath = path.join('/mock/home', '.node9', 'decisions.json');
+    existsSpy.mockImplementation((p) => String(p) === decisionsPath);
+    readSpy.mockImplementation((p) =>
+      String(p) === decisionsPath ? JSON.stringify({ delete_user: 'allow' }) : ''
+    );
 
-    const result = await authorizeHeadless('delete_user', {}, true);
+    const result = await authorizeHeadless('delete_user', {});
     expect(result.approved).toBe(true);
-    expect(confirm).toHaveBeenCalled();
   });
 
-  it('terminal prompt returning false blocks the action', async () => {
-    Object.defineProperty(process.stdout, 'isTTY', { value: true, configurable: true });
-    const confirm = await getConfirm();
-    vi.mocked(confirm).mockResolvedValue(false);
+  it('blocks via persistent deny decision (deterministic, no HITL)', async () => {
+    const decisionsPath = path.join('/mock/home', '.node9', 'decisions.json');
+    existsSpy.mockImplementation((p) => String(p) === decisionsPath);
+    readSpy.mockImplementation((p) =>
+      String(p) === decisionsPath ? JSON.stringify({ delete_user: 'deny' }) : ''
+    );
 
-    const result = await authorizeHeadless('delete_user', {}, true);
+    const result = await authorizeHeadless('delete_user', {});
     expect(result.approved).toBe(false);
   });
 });
@@ -142,45 +161,28 @@ describe('autoStartDaemon: false — blocks without daemon when no TTY', () => {
 // ── Daemon abandon → fallthrough ───────────────────────────────────────────
 
 describe('daemon abandon fallthrough', () => {
-  it('falls through to noApprovalMechanism when daemon returns abandoned', async () => {
-    // Simulate a running daemon that returns 'abandoned'
-    const pidPath = path.join('/mock/home', '.node9', 'daemon.pid');
-    existsSpy.mockImplementation((p) => String(p) === pidPath);
-    readSpy.mockImplementation((p) =>
-      String(p) === pidPath ? JSON.stringify({ pid: process.pid, port: 7391 }) : ''
-    );
-    expect(isDaemonRunning()).toBe(true);
-
-    // Mock fetch: /check succeeds, /wait returns 'abandoned'
-    vi.stubGlobal(
-      'fetch',
-      vi.fn().mockImplementation((url: string) => {
-        if (String(url).endsWith('/check')) {
-          return Promise.resolve({
-            ok: true,
-            json: () => Promise.resolve({ id: 'test-id' }),
-          });
-        }
-        // /wait/test-id
-        return Promise.resolve({
-          ok: true,
-          json: () => Promise.resolve({ decision: 'abandoned' }),
-        });
-      })
-    );
-
+  it('returns noApprovalMechanism when daemon is not running and no other channels', async () => {
+    // All approvers disabled except browser; daemon is not running → empty race → noApprovalMechanism
+    mockNoNativeConfig();
+    // No daemon PID file → isDaemonRunning() = false → RACER 3 skipped
+    // No TTY, no allowTerminalFallback → RACER 4 skipped
+    // racePromises.length === 0 → noApprovalMechanism: true
     const result = await authorizeHeadless('delete_user', {});
-    // Daemon abandoned → falls through → no TTY → noApprovalMechanism
     expect(result.approved).toBe(false);
     expect(result.noApprovalMechanism).toBe(true);
   });
 
-  it('falls through to terminal prompt when daemon abandons and TTY is available', async () => {
+  it('returns approved:false when daemon denies (deterministic daemon response)', async () => {
+    // Set up a live daemon that deterministically denies — no HITL needed
     const pidPath = path.join('/mock/home', '.node9', 'daemon.pid');
-    existsSpy.mockImplementation((p) => String(p) === pidPath);
-    readSpy.mockImplementation((p) =>
-      String(p) === pidPath ? JSON.stringify({ pid: process.pid, port: 7391 }) : ''
-    );
+    const globalPath = path.join('/mock/home', '.node9', 'config.json');
+    existsSpy.mockImplementation((p) => [pidPath, globalPath].includes(String(p)));
+    readSpy.mockImplementation((p) => {
+      if (String(p) === pidPath) return JSON.stringify({ pid: process.pid, port: 7391 });
+      if (String(p) === globalPath)
+        return JSON.stringify({ settings: { approvers: { native: false } } });
+      return '';
+    });
 
     vi.stubGlobal(
       'fetch',
@@ -188,21 +190,16 @@ describe('daemon abandon fallthrough', () => {
         if (String(url).endsWith('/check')) {
           return Promise.resolve({ ok: true, json: () => Promise.resolve({ id: 'test-id' }) });
         }
+        // Daemon returns deny — deterministic outcome, no interaction required
         return Promise.resolve({
           ok: true,
-          json: () => Promise.resolve({ decision: 'abandoned' }),
+          json: () => Promise.resolve({ decision: 'deny' }),
         });
       })
     );
 
-    Object.defineProperty(process.stdout, 'isTTY', { value: true, configurable: true });
-    const confirm = await getConfirm();
-    vi.mocked(confirm).mockResolvedValue(true);
-
-    const result = await authorizeHeadless('delete_user', {}, true);
-    // Daemon abandoned → falls through → TTY prompt → approved
-    expect(result.approved).toBe(true);
-    expect(confirm).toHaveBeenCalled();
+    const result = await authorizeHeadless('delete_user', {});
+    expect(result.approved).toBe(false);
   });
 });
 

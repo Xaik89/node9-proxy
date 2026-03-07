@@ -6,6 +6,11 @@ import { setupGemini } from '../setup.js';
 
 vi.mock('@inquirer/prompts', () => ({ confirm: vi.fn() }));
 
+vi.mock('../ui/native', () => ({
+  askNativePopup: vi.fn().mockReturnValue('deny'),
+  sendDesktopNotification: vi.fn(),
+}));
+
 const existsSpy = vi.spyOn(fs, 'existsSync').mockReturnValue(false);
 const readSpy = vi.spyOn(fs, 'readFileSync');
 vi.spyOn(fs, 'writeFileSync').mockImplementation(() => undefined);
@@ -24,7 +29,7 @@ function mockConfig(config: MockConfig) {
   readSpy.mockImplementation((p) => {
     if (String(p) === globalPath) {
       return JSON.stringify({
-        settings: { mode: 'standard', ...config.settings },
+        settings: { mode: 'standard', approvers: { native: false }, ...config.settings },
         policy: {
           dangerousWords: DANGEROUS_WORDS, // Use defaults!
           ignoredTools: [],
@@ -54,26 +59,26 @@ describe('Gemini Integration Security', () => {
   it('identifies "Shell" (capital S) as a shell-executing tool', async () => {
     mockConfig({});
     const result = await evaluatePolicy('Shell', { command: 'rm -rf /' });
-    expect(result).toBe('review');
+    expect(result.decision).toBe('review');
   });
 
   it('identifies "run_shell_command" as a shell-executing tool', async () => {
     mockConfig({});
     const result = await evaluatePolicy('run_shell_command', { command: 'rm -rf /' });
-    expect(result).toBe('review');
+    expect(result.decision).toBe('review');
   });
 
   it('correctly parses complex shell commands inside run_shell_command', async () => {
     mockConfig({});
     const result = await evaluatePolicy('run_shell_command', { command: 'ls && rm -rf tmp' });
-    expect(result).toBe('review');
+    expect(result.decision).toBe('review');
   });
 
   it('blocks dangerous commands in Gemini hooks without API key', async () => {
     mockConfig({});
     const result = await authorizeHeadless('Shell', { command: 'rm -rf /' });
     expect(result.approved).toBe(false);
-    expect(result.reason).toContain('Node9 blocked "Shell"');
+    expect(result.noApprovalMechanism).toBe(true);
   });
 
   it('allows safe shell commands in Gemini hooks', async () => {
@@ -95,12 +100,12 @@ describe('Gemini Integration Security', () => {
     const dangerousResult = await evaluatePolicy('Database.query', {
       payload: { sql: 'DROP TABLE users;' },
     });
-    expect(dangerousResult).toBe('review');
+    expect(dangerousResult.decision).toBe('review');
 
     const safeResult = await evaluatePolicy('Database.query', {
       payload: { sql: 'SELECT * FROM users;' },
     });
-    expect(safeResult).toBe('allow');
+    expect(safeResult.decision).toBe('allow');
   });
 });
 
@@ -109,7 +114,7 @@ describe('Gemini BeforeTool payload format', () => {
     mockConfig({});
     // Gemini sends { name, args } not { tool_name, tool_input }
     const dangerous = await evaluatePolicy('Shell', { command: 'rm -rf /' });
-    expect(dangerous).toBe('review');
+    expect(dangerous.decision).toBe('review');
   });
 
   it('blocks dangerous Gemini tool via name/args format', async () => {

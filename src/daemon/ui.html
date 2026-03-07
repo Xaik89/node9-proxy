@@ -261,6 +261,27 @@
         font-size: 12px;
         font-weight: 500;
       }
+      .btn-trust {
+        background: rgba(240, 136, 62, 0.1);
+        border: 1px solid rgba(240, 136, 62, 0.35);
+        color: var(--primary);
+        font-size: 12px;
+        font-weight: 600;
+      }
+      .btn-trust:hover:not(:disabled) {
+        background: rgba(240, 136, 62, 0.2);
+        filter: none;
+        transform: translateY(-1px);
+      }
+      .trust-row {
+        display: none;
+        grid-column: span 2;
+        grid-template-columns: 1fr 1fr;
+        gap: 8px;
+      }
+      .trust-row.show {
+        display: grid;
+      }
       button:hover:not(:disabled) {
         filter: brightness(1.15);
         transform: translateY(-1px);
@@ -564,6 +585,22 @@
                 <span class="slider"></span>
               </label>
             </div>
+            <div class="setting-row">
+              <div class="setting-text">
+                <div class="setting-label">Trust Sessions</div>
+                <div class="setting-desc">
+                  Show "Trust 30m / 1h" buttons — allow a tool without interruption for a set time.
+                </div>
+              </div>
+              <label class="toggle">
+                <input
+                  type="checkbox"
+                  id="trustSessionsToggle"
+                  onchange="onTrustToggle(this.checked)"
+                />
+                <span class="slider"></span>
+              </label>
+            </div>
           </div>
 
           <div class="panel">
@@ -626,6 +663,7 @@
       const requests = new Set();
       let orgName = null;
       let autoDenyMs = 120000;
+      let trustEnabled = false;
 
       function highlightSyntax(code) {
         if (typeof code !== 'string') return esc(code);
@@ -678,6 +716,21 @@
         }, 200);
       }
 
+      function sendTrust(id, duration) {
+        const card = document.getElementById('c-' + id);
+        if (card) card.style.opacity = '0.5';
+        fetch('/decision/' + id, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Node9-Token': CSRF_TOKEN },
+          body: JSON.stringify({ decision: 'trust', trustDuration: duration }),
+        });
+        setTimeout(() => {
+          card?.remove();
+          requests.delete(id);
+          refresh();
+        }, 200);
+      }
+
       function addCard(req) {
         if (requests.has(req.id)) return;
         requests.add(req.id);
@@ -697,6 +750,7 @@
         card.id = 'c-' + req.id;
         const agentLabel = req.agent ? esc(req.agent) : 'AI Agent';
         const mcpLabel = req.mcpServer ? esc(req.mcpServer) : null;
+        const dis = isSlack ? 'disabled' : '';
         card.innerHTML = `
         <div class="source-row">
           <span class="agent-badge">${agentLabel}</span>
@@ -706,11 +760,15 @@
         ${isSlack ? '<div class="slack-indicator">⚡ Awaiting Slack approval — view only</div>' : ''}
         <span class="label">Input Payload</span>
         <pre>${cmd}</pre>
-        <div class="actions">
-          <button class="btn-allow" onclick="sendDecision('${req.id}','allow',false)" ${isSlack ? 'disabled' : ''}>Approve Execution</button>
-          <button class="btn-deny"  onclick="sendDecision('${req.id}','deny',false)"  ${isSlack ? 'disabled' : ''}>Block Action</button>
-          <button class="btn-secondary" onclick="sendDecision('${req.id}','allow',true)" ${isSlack ? 'disabled' : ''}>Always Allow</button>
-          <button class="btn-secondary" onclick="sendDecision('${req.id}','deny',true)"  ${isSlack ? 'disabled' : ''}>Always Deny</button>
+        <div class="actions" id="act-${req.id}">
+          <button class="btn-allow" onclick="sendDecision('${req.id}','allow',false)" ${dis}>Approve Execution</button>
+          <button class="btn-deny"  onclick="sendDecision('${req.id}','deny',false)"  ${dis}>Block Action</button>
+          <div class="trust-row${trustEnabled ? ' show' : ''}" id="tr-${req.id}">
+            <button class="btn-trust" onclick="sendTrust('${req.id}','30m')" ${dis}>⏱ Trust 30m</button>
+            <button class="btn-trust" onclick="sendTrust('${req.id}','1h')"  ${dis}>⏱ Trust 1h</button>
+          </div>
+          <button class="btn-secondary" onclick="sendDecision('${req.id}','allow',true)" ${dis}>Always Allow</button>
+          <button class="btn-secondary" onclick="sendDecision('${req.id}','deny',true)"  ${dis}>Always Deny</button>
         </div>
       `;
         list.appendChild(card);
@@ -773,6 +831,14 @@
         }).catch(() => {});
       }
 
+      function onTrustToggle(checked) {
+        trustEnabled = checked;
+        saveSetting('enableTrustSessions', checked);
+        document.querySelectorAll('[id^="tr-"]').forEach((el) => {
+          el.classList.toggle('show', checked);
+        });
+      }
+
       fetch('/settings')
         .then((r) => r.json())
         .then((s) => {
@@ -785,6 +851,13 @@
           if (!s.autoStartDaemon && !s.autoStarted) {
             document.getElementById('warnBanner').classList.add('show');
           }
+          trustEnabled = !!s.enableTrustSessions;
+          const trustTog = document.getElementById('trustSessionsToggle');
+          if (trustTog) trustTog.checked = trustEnabled;
+          // Show/hide trust rows on any cards already rendered
+          document.querySelectorAll('[id^="tr-"]').forEach((el) => {
+            el.classList.toggle('show', trustEnabled);
+          });
         })
         .catch(() => {});
 

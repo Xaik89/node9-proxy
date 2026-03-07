@@ -26,7 +26,9 @@ describe('Path-Based Policy (Advanced)', () => {
     vi.spyOn(fs, 'readFileSync').mockReturnValue(JSON.stringify(mockConfig));
 
     // Should be allowed because it matches the glob
-    expect(await evaluatePolicy('Bash', { command: 'rm -rf ./node_modules/lodash' })).toBe('allow');
+    expect(
+      (await evaluatePolicy('Bash', { command: 'rm -rf ./node_modules/lodash' })).decision
+    ).toBe('allow');
   });
 
   it('blocks "rm -rf src" when not in allow list', async () => {
@@ -43,7 +45,7 @@ describe('Path-Based Policy (Advanced)', () => {
     vi.mocked(fs.existsSync).mockReturnValue(true);
     vi.spyOn(fs, 'readFileSync').mockReturnValue(JSON.stringify(mockConfig));
 
-    expect(await evaluatePolicy('Bash', { command: 'rm -rf src' })).toBe('review');
+    expect((await evaluatePolicy('Bash', { command: 'rm -rf src' })).decision).toBe('review');
   });
 
   it('blocks "rm -rf .env" using explicit blockPaths', async () => {
@@ -61,7 +63,7 @@ describe('Path-Based Policy (Advanced)', () => {
     vi.mocked(fs.existsSync).mockReturnValue(true);
     vi.spyOn(fs, 'readFileSync').mockReturnValue(JSON.stringify(mockConfig));
 
-    expect(await evaluatePolicy('Bash', { command: 'rm .env' })).toBe('review');
+    expect((await evaluatePolicy('Bash', { command: 'rm .env' })).decision).toBe('review');
   });
 
   it('correctly tokenizes and identifies "rm" even with complex shell syntax', async () => {
@@ -74,8 +76,10 @@ describe('Path-Based Policy (Advanced)', () => {
     vi.spyOn(fs, 'readFileSync').mockReturnValue(JSON.stringify(mockConfig));
 
     // Pipe bypass attempt
-    expect(await evaluatePolicy('Bash', { command: 'echo "hello" | rm' })).toBe('review');
+    expect((await evaluatePolicy('Bash', { command: 'echo "hello" | rm' })).decision).toBe(
+      'review'
+    );
     // Escaped bypass attempt
-    expect(await evaluatePolicy('Bash', { command: 'r\\m -rf /' })).toBe('review');
+    expect((await evaluatePolicy('Bash', { command: 'r\\m -rf /' })).decision).toBe('review');
   });
 });

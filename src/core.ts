@@ -6,6 +6,123 @@ import path from 'path';
 import os from 'os';
 import pm from 'picomatch';
 import { parse } from 'sh-syntax';
+import { askNativePopup, sendDesktopNotification } from './ui/native';
+
+// ── Feature file paths ────────────────────────────────────────────────────────
+const PAUSED_FILE = path.join(os.homedir(), '.node9', 'PAUSED');
+const TRUST_FILE = path.join(os.homedir(), '.node9', 'trust.json');
+
+interface PauseState {
+  expiry: number;
+  duration: string;
+}
+interface TrustEntry {
+  tool: string;
+  expiry: number;
+}
+interface TrustFile {
+  entries: TrustEntry[];
+}
+
+// ── Global Pause helpers ──────────────────────────────────────────────────────
+
+export function checkPause(): { paused: boolean; expiresAt?: number; duration?: string } {
+  try {
+    if (!fs.existsSync(PAUSED_FILE)) return { paused: false };
+    const state = JSON.parse(fs.readFileSync(PAUSED_FILE, 'utf-8')) as PauseState;
+    if (state.expiry > 0 && Date.now() >= state.expiry) {
+      try {
+        fs.unlinkSync(PAUSED_FILE);
+      } catch {}
+      return { paused: false };
+    }
+    return { paused: true, expiresAt: state.expiry, duration: state.duration };
+  } catch {
+    return { paused: false };
+  }
+}
+
+function atomicWriteSync(filePath: string, data: string, options?: fs.WriteFileOptions): void {
+  const dir = path.dirname(filePath);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  const tmpPath = `${filePath}.${os.hostname()}.${process.pid}.tmp`;
+  fs.writeFileSync(tmpPath, data, options);
+  fs.renameSync(tmpPath, filePath);
+}
+
+export function pauseNode9(durationMs: number, durationStr: string): void {
+  const state: PauseState = { expiry: Date.now() + durationMs, duration: durationStr };
+  atomicWriteSync(PAUSED_FILE, JSON.stringify(state, null, 2)); // Upgraded to atomic
+}
+
+export function resumeNode9(): void {
+  try {
+    if (fs.existsSync(PAUSED_FILE)) fs.unlinkSync(PAUSED_FILE);
+  } catch {}
+}
+
+// ── Trust Session helpers ─────────────────────────────────────────────────────
+
+function getActiveTrustSession(toolName: string): boolean {
+  try {
+    if (!fs.existsSync(TRUST_FILE)) return false;
+    const trust = JSON.parse(fs.readFileSync(TRUST_FILE, 'utf-8')) as TrustFile;
+    const now = Date.now();
+    const active = trust.entries.filter((e) => e.expiry > now);
+    if (active.length !== trust.entries.length) {
+      fs.writeFileSync(TRUST_FILE, JSON.stringify({ entries: active }, null, 2));
+    }
+    return active.some((e) => e.tool === toolName || matchesPattern(toolName, e.tool));
+  } catch {
+    return false;
+  }
+}
+
+export function writeTrustSession(toolName: string, durationMs: number): void {
+  try {
+    let trust: TrustFile = { entries: [] };
+
+    // 1. Try to read existing trust state
+    try {
+      if (fs.existsSync(TRUST_FILE)) {
+        trust = JSON.parse(fs.readFileSync(TRUST_FILE, 'utf-8')) as TrustFile;
+      }
+    } catch {
+      // If the file is corrupt, start with a fresh object
+    }
+
+    // 2. Filter out the specific tool (to overwrite) and remove any expired entries
+    const now = Date.now();
+    trust.entries = trust.entries.filter((e) => e.tool !== toolName && e.expiry > now);
+
+    // 3. Add the new time-boxed entry
+    trust.entries.push({ tool: toolName, expiry: now + durationMs });
+
+    // 4. Perform the ATOMIC write
+    atomicWriteSync(TRUST_FILE, JSON.stringify(trust, null, 2));
+  } catch (err) {
+    // Silent fail: Node9 should never crash an AI agent session due to a file error
+    if (process.env.NODE9_DEBUG === '1') {
+      console.error('[Node9 Trust Error]:', err);
+    }
+  }
+}
+
+function appendAuditModeEntry(toolName: string, args: unknown): void {
+  try {
+    const entry = JSON.stringify({
+      ts: new Date().toISOString(),
+      tool: toolName,
+      args,
+      auditMode: true,
+      wouldHaveBlocked: true,
+    });
+    const logPath = path.join(os.homedir(), '.node9', 'audit.log');
+    const dir = path.dirname(logPath);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.appendFileSync(logPath, entry + '\n');
+  } catch {}
+}
 
 // Default Enterprise Posture
 export const DANGEROUS_WORDS = [
@@ -28,11 +145,6 @@ function tokenize(toolName: string): string[] {
     .toLowerCase()
     .split(/[_.\-\s]+/)
     .filter(Boolean);
-}
-
-function containsDangerousWord(toolName: string, dangerousWords: string[]): boolean {
-  const tokens = tokenize(toolName);
-  return dangerousWords.some((word) => tokens.includes(word.toLowerCase()));
 }
 
 function matchesPattern(text: string, patterns: string[] | string): boolean {
@@ -179,8 +291,16 @@ interface PolicyRule {
 }
 
 interface Config {
-  settings: { mode: string; autoStartDaemon?: boolean };
+  settings: {
+    mode: string;
+    autoStartDaemon?: boolean;
+    agentMode?: boolean;
+    enableUndo?: boolean;
+    enableHookLogDebug?: boolean;
+    approvers: { native: boolean; browser: boolean; cloud: boolean; terminal: boolean };
+  };
   policy: {
+    sandboxPaths: string[];
     dangerousWords: string[];
     ignoredTools: string[];
     toolInspection: Record<string, string>;
@@ -190,8 +310,16 @@ interface Config {
 }
 
 const DEFAULT_CONFIG: Config = {
-  settings: { mode: 'standard' },
+  settings: {
+    mode: 'standard',
+    autoStartDaemon: true,
+    agentMode: false,
+    enableUndo: false,
+    enableHookLogDebug: false,
+    approvers: { native: true, browser: true, cloud: true, terminal: true },
+  },
   policy: {
+    sandboxPaths: ['/tmp/**'],
     dangerousWords: DANGEROUS_WORDS,
     ignoredTools: [
       'list_*',
@@ -199,30 +327,12 @@ const DEFAULT_CONFIG: Config = {
       'read_*',
       'describe_*',
       'read',
-      'write',
-      'edit',
-      'multiedit',
-      'glob',
       'grep',
       'ls',
-      'notebookread',
-      'notebookedit',
-      'todoread',
-      'todowrite',
-      'webfetch',
-      'websearch',
-      'exitplanmode',
       'askuserquestion',
     ],
-    toolInspection: {
-      bash: 'command',
-      run_shell_command: 'command',
-      shell: 'command',
-      'terminal.execute': 'command',
-    },
-    rules: [
-      { action: 'rm', allowPaths: ['**/node_modules/**', 'dist/**', 'build/**', '.DS_Store'] },
-    ],
+    toolInspection: { bash: 'command', shell: 'command' },
+    rules: [{ action: 'rm', allowPaths: ['**/node_modules/**', 'dist/**', '.DS_Store'] }],
   },
   environments: {},
 };
@@ -243,6 +353,8 @@ export function getGlobalSettings(): {
   autoStartDaemon: boolean;
   slackEnabled: boolean;
   agentMode: boolean;
+  enableTrustSessions: boolean;
+  allowGlobalPause: boolean;
 } {
   try {
     const globalConfigPath = path.join(os.homedir(), '.node9', 'config.json');
@@ -257,11 +369,21 @@ export function getGlobalSettings(): {
         autoStartDaemon: settings.autoStartDaemon !== false,
         slackEnabled: settings.slackEnabled !== false,
         // agentMode defaults to false — user must explicitly opt in via `node9 login`
+        //agentMode: settings.approvers.cloud === true,
         agentMode: settings.agentMode === true,
+        enableTrustSessions: settings.enableTrustSessions === true,
+        allowGlobalPause: settings.allowGlobalPause !== false,
       };
     }
   } catch {}
-  return { mode: 'standard', autoStartDaemon: true, slackEnabled: true, agentMode: false };
+  return {
+    mode: 'standard',
+    autoStartDaemon: true,
+    slackEnabled: true,
+    agentMode: false,
+    enableTrustSessions: false,
+    allowGlobalPause: true,
+  };
 }
 
 /**
@@ -293,63 +415,111 @@ function getInternalToken(): string | null {
 
 export async function evaluatePolicy(
   toolName: string,
-  args?: unknown
-): Promise<'allow' | 'review'> {
+  args?: unknown,
+  agent?: string // NEW: Added agent metadata parameter
+): Promise<{ decision: 'allow' | 'review'; blockedByLabel?: string }> {
   const config = getConfig();
-  if (matchesPattern(toolName, config.policy.ignoredTools)) return 'allow';
+
+  // 1. Ignored tools (Fast Path) - Always allow these first
+  if (matchesPattern(toolName, config.policy.ignoredTools)) return { decision: 'allow' };
+
+  let allTokens: string[] = [];
+  let actionTokens: string[] = [];
+  let pathTokens: string[] = [];
+
+  // 2. Tokenize the input
   const shellCommand = extractShellCommand(toolName, args, config.policy.toolInspection);
   if (shellCommand) {
-    const { actions, paths, allTokens } = await analyzeShellCommand(shellCommand);
+    const analyzed = await analyzeShellCommand(shellCommand);
+    allTokens = analyzed.allTokens;
+    actionTokens = analyzed.actions;
+    pathTokens = analyzed.paths;
 
-    // Inline interpreter execution (python3 -c, bash -c, perl -e, node -e, etc.)
-    // is arbitrary code execution regardless of what the inner script does.
+    // Inline arbitrary code execution is always a review
     const INLINE_EXEC_PATTERN = /^(python3?|bash|sh|zsh|perl|ruby|node|php|lua)\s+(-c|-e|-eval)\s/i;
-    if (INLINE_EXEC_PATTERN.test(shellCommand.trim())) return 'review';
-
-    for (const action of actions) {
-      const basename = action.includes('/') ? action.split('/').pop() : action;
-      const rule = config.policy.rules.find(
-        (r) =>
-          r.action === action ||
-          matchesPattern(action, r.action) ||
-          (basename && (r.action === basename || matchesPattern(basename, r.action)))
-      );
-      if (rule) {
-        if (paths.length > 0) {
-          const anyBlocked = paths.some((p) => matchesPattern(p, rule.blockPaths || []));
-          if (anyBlocked) return 'review';
-          const allAllowed = paths.every((p) => matchesPattern(p, rule.allowPaths || []));
-          if (allAllowed) return 'allow';
-        }
-        return 'review';
-      }
+    if (INLINE_EXEC_PATTERN.test(shellCommand.trim())) {
+      return { decision: 'review', blockedByLabel: 'Node9 Standard (Inline Execution)' };
     }
+  } else {
+    allTokens = tokenize(toolName);
+    actionTokens = [toolName];
+  }
 
-    // Check tokens for dangerous words using word-boundary matching to avoid
-    // false positives like "remake" matching "make" or "updated_at" matching "update".
-    // Whole-token exact match is also accepted (handles tokens without word boundaries).
-    const isDangerous = allTokens.some((token) =>
-      config.policy.dangerousWords.some((word) => {
-        const w = word.toLowerCase();
-        if (token === w) return true;
-        try {
-          return new RegExp(`\\b${w}\\b`, 'i').test(token);
-        } catch {
-          return false;
-        }
-      })
+  // ── 3. CONTEXTUAL RISK DOWNGRADE (PRD Section 3 / Phase 3) ──────────────
+  // If the human is typing manually, we only block "Nuclear" actions.
+  const isManual = agent === 'Terminal';
+  if (isManual) {
+    const NUCLEAR_COMMANDS = [
+      'drop',
+      'destroy',
+      'purge',
+      'rmdir',
+      'format',
+      'truncate',
+      'alter',
+      'grant',
+      'revoke',
+      'docker',
+    ];
+
+    const hasNuclear = allTokens.some((t) => NUCLEAR_COMMANDS.includes(t.toLowerCase()));
+
+    // If it's manual and NOT nuclear, we auto-allow (bypass standard "dangerous" words like 'rm' or 'delete')
+    if (!hasNuclear) return { decision: 'allow' };
+
+    // If it IS nuclear, we fall through to the standard logic so the developer
+    // gets a "Flagged By: Manual Nuclear Protection" popup.
+  }
+
+  // ── 4. Sandbox Check (Safe Zones) ───────────────────────────────────────
+  if (pathTokens.length > 0 && config.policy.sandboxPaths.length > 0) {
+    const allInSandbox = pathTokens.every((p) => matchesPattern(p, config.policy.sandboxPaths));
+    if (allInSandbox) return { decision: 'allow' };
+  }
+
+  // ── 5. Rules Evaluation ─────────────────────────────────────────────────
+  for (const action of actionTokens) {
+    const rule = config.policy.rules.find(
+      (r) => r.action === action || matchesPattern(action, r.action)
     );
-    if (isDangerous) return 'review';
-    if (config.settings.mode === 'strict') return 'review';
-    return 'allow';
+    if (rule) {
+      if (pathTokens.length > 0) {
+        const anyBlocked = pathTokens.some((p) => matchesPattern(p, rule.blockPaths || []));
+        if (anyBlocked)
+          return { decision: 'review', blockedByLabel: 'Project/Global Config (Rule Block)' };
+        const allAllowed = pathTokens.every((p) => matchesPattern(p, rule.allowPaths || []));
+        if (allAllowed) return { decision: 'allow' };
+      }
+      return { decision: 'review', blockedByLabel: 'Project/Global Config (Rule Default Block)' };
+    }
   }
-  const isDangerous = containsDangerousWord(toolName, config.policy.dangerousWords);
-  if (isDangerous || config.settings.mode === 'strict') {
+
+  // ── 6. Dangerous Words Evaluation ───────────────────────────────────────
+  const isDangerous = allTokens.some((token) =>
+    config.policy.dangerousWords.some((word) => {
+      const w = word.toLowerCase();
+      if (token === w) return true;
+      try {
+        return new RegExp(`\\b${w}\\b`, 'i').test(token);
+      } catch {
+        return false;
+      }
+    })
+  );
+
+  if (isDangerous) {
+    const label = isManual ? 'Manual Nuclear Protection' : 'Merged Config (Dangerous Word)';
+    return { decision: 'review', blockedByLabel: label };
+  }
+
+  // ── 7. Strict Mode Fallback ─────────────────────────────────────────────
+  if (config.settings.mode === 'strict') {
     const envConfig = getActiveEnvironment(config);
-    if (envConfig?.requireApproval === false) return 'allow';
-    return 'review';
+    if (envConfig?.requireApproval === false) return { decision: 'allow' };
+    return { decision: 'review', blockedByLabel: 'Global Config (Strict Mode Active)' };
   }
-  return 'allow';
+
+  return { decision: 'allow' };
 }
 
 /** Returns true when toolName matches an ignoredTools pattern (fast-path, silent allow). */
@@ -390,23 +560,47 @@ export function getPersistentDecision(toolName: string): 'allow' | 'deny' | null
 async function askDaemon(
   toolName: string,
   args: unknown,
-  meta?: { agent?: string; mcpServer?: string }
+  meta?: { agent?: string; mcpServer?: string },
+  signal?: AbortSignal // NEW: Added signal
 ): Promise<'allow' | 'deny' | 'abandoned'> {
   const base = `http://${DAEMON_HOST}:${DAEMON_PORT}`;
-  const checkRes = await fetch(`${base}/check`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ toolName, args, agent: meta?.agent, mcpServer: meta?.mcpServer }),
-    signal: AbortSignal.timeout(5000),
-  });
-  if (!checkRes.ok) throw new Error('Daemon fail');
-  const { id } = (await checkRes.json()) as { id: string };
-  const waitRes = await fetch(`${base}/wait/${id}`, { signal: AbortSignal.timeout(120_000) });
-  if (!waitRes.ok) return 'deny';
-  const { decision } = (await waitRes.json()) as { decision: string };
-  if (decision === 'allow') return 'allow';
-  if (decision === 'abandoned') return 'abandoned';
-  return 'deny';
+
+  // Custom abort logic for Node 18 compatibility
+  const checkCtrl = new AbortController();
+  const checkTimer = setTimeout(() => checkCtrl.abort(), 5000);
+  const onAbort = () => checkCtrl.abort();
+  if (signal) signal.addEventListener('abort', onAbort);
+
+  try {
+    const checkRes = await fetch(`${base}/check`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ toolName, args, agent: meta?.agent, mcpServer: meta?.mcpServer }),
+      signal: checkCtrl.signal,
+    });
+    if (!checkRes.ok) throw new Error('Daemon fail');
+    const { id } = (await checkRes.json()) as { id: string };
+
+    const waitCtrl = new AbortController();
+    const waitTimer = setTimeout(() => waitCtrl.abort(), 120_000);
+    const onWaitAbort = () => waitCtrl.abort();
+    if (signal) signal.addEventListener('abort', onWaitAbort);
+
+    try {
+      const waitRes = await fetch(`${base}/wait/${id}`, { signal: waitCtrl.signal });
+      if (!waitRes.ok) return 'deny';
+      const { decision } = (await waitRes.json()) as { decision: string };
+      if (decision === 'allow') return 'allow';
+      if (decision === 'abandoned') return 'abandoned';
+      return 'deny';
+    } finally {
+      clearTimeout(waitTimer);
+      if (signal) signal.removeEventListener('abort', onWaitAbort);
+    }
+  } finally {
+    clearTimeout(checkTimer);
+    if (signal) signal.removeEventListener('abort', onAbort);
+  }
 }
 
 /** Register a viewer-mode card on the daemon (Slack is the real authority). */
@@ -468,7 +662,7 @@ export interface AuthResult {
   approved: boolean;
   reason?: string;
   noApprovalMechanism?: boolean;
-  /** What caused the block — used to print a targeted "where to fix it" hint. */
+  blockedByLabel?: string;
   blockedBy?:
     | 'team-policy'
     | 'persistent-deny'
@@ -476,9 +670,15 @@ export interface AuthResult {
     | 'local-decision'
     | 'no-approval-mechanism';
   changeHint?: string;
-  /** Where the approval decision was made — set only for non-trivial approvals so
-   *  the CLI can surface a visible confirmation line (mirrors Gemini's hook UI). */
-  checkedBy?: 'cloud' | 'daemon' | 'local-policy' | 'persistent';
+  checkedBy?:
+    | 'cloud'
+    | 'daemon'
+    | 'terminal'
+    | 'local-policy'
+    | 'persistent'
+    | 'trust'
+    | 'paused'
+    | 'audit';
 }
 
 export async function authorizeHeadless(
@@ -487,120 +687,303 @@ export async function authorizeHeadless(
   allowTerminalFallback = false,
   meta?: { agent?: string; mcpServer?: string }
 ): Promise<AuthResult> {
-  const { agentMode } = getGlobalSettings();
-  // Cloud enforcement is active only when the user explicitly opted in (agentMode: true)
-  // AND cloud credentials are present. Otherwise local config is the authority.
-  const cloudEnforced = agentMode && hasSlack();
+  if (process.env.NODE9_PAUSED === '1') return { approved: true, checkedBy: 'paused' };
+  const pauseState = checkPause();
+  if (pauseState.paused) return { approved: true, checkedBy: 'paused' };
 
-  if (!cloudEnforced) {
-    // Fast path: ignored tools are silently allowed — no checkedBy, no UI feedback.
-    if (isIgnoredTool(toolName)) return { approved: true };
+  const creds = getCredentials();
+  const config = getConfig();
 
-    const policyDecision = await evaluatePolicy(toolName, args);
-    if (policyDecision === 'allow') return { approved: true, checkedBy: 'local-policy' };
+  const isTestEnv = !!(process.env.VITEST || process.env.NODE_ENV === 'test' || process.env.CI);
+  const approvers = isTestEnv
+    ? { native: false, browser: false, cloud: false, terminal: false }
+    : config.settings.approvers || { native: true, browser: true, cloud: true, terminal: true };
+
+  const isManual = meta?.agent === 'Terminal';
+
+  let explainableLabel = 'Local Config';
+
+  if (config.settings.mode === 'audit') {
+    if (!isIgnoredTool(toolName)) {
+      const policyResult = await evaluatePolicy(toolName, args, meta?.agent);
+      if (policyResult.decision === 'review') {
+        appendAuditModeEntry(toolName, args);
+        sendDesktopNotification(
+          'Node9 Audit Mode',
+          `Would have blocked "${toolName}" (${policyResult.blockedByLabel || 'Local Config'}) — running in audit mode`
+        );
+      }
+    }
+    return { approved: true, checkedBy: 'audit' };
+  }
+
+  // Fast Paths (Ignore, Trust, Policy Allow)
+  if (!isIgnoredTool(toolName)) {
+    if (getActiveTrustSession(toolName)) return { approved: true, checkedBy: 'trust' };
+    const policyResult = await evaluatePolicy(toolName, args, meta?.agent);
+    if (policyResult.decision === 'allow') return { approved: true, checkedBy: 'local-policy' };
+
+    explainableLabel = policyResult.blockedByLabel || 'Local Config';
 
     const persistent = getPersistentDecision(toolName);
     if (persistent === 'allow') return { approved: true, checkedBy: 'persistent' };
-    if (persistent === 'deny')
+    if (persistent === 'deny') {
       return {
         approved: false,
-        reason: `Node9: "${toolName}" is set to always deny.`,
+        reason: `This tool ("${toolName}") is explicitly listed in your 'Always Deny' list.`,
         blockedBy: 'persistent-deny',
-        changeHint: `Open the daemon UI to manage decisions:  node9 daemon --openui`,
+        blockedByLabel: 'Persistent User Rule',
       };
+    }
+  } else {
+    return { approved: true };
   }
 
-  // ── Cloud / team policy is the authority ─────────────────────────────────
+  // ── THE HANDSHAKE (Phase 4.1: Remote Lock Check) ──────────────────────────
+  let cloudRequestId: string | null = null;
+  let isRemoteLocked = false;
+  const cloudEnforced = approvers.cloud && !!creds?.apiKey && hasSlack();
+
   if (cloudEnforced) {
-    const creds = getCredentials()!;
-    const envConfig = getActiveEnvironment(getConfig());
+    try {
+      const envConfig = getActiveEnvironment(getConfig());
+      const initResult = await initNode9SaaS(toolName, args, creds!, envConfig?.slackChannel, meta);
 
-    // Register a viewer card on the daemon if it's running, so the browser
-    // shows the pending action (with disabled buttons — cloud decides).
-    let viewerId: string | null = null;
-    const internalToken = getInternalToken();
-    if (isDaemonRunning() && internalToken) {
-      viewerId = await notifyDaemonViewer(toolName, args, meta).catch(() => null);
+      if (!initResult.pending) {
+        return {
+          approved: !!initResult.approved,
+          reason:
+            initResult.reason ||
+            (initResult.approved ? undefined : 'Action rejected by organization policy.'),
+          checkedBy: initResult.approved ? 'cloud' : undefined,
+          blockedBy: initResult.approved ? undefined : 'team-policy',
+          blockedByLabel: 'Organization Policy (SaaS)',
+        };
+      }
+
+      cloudRequestId = initResult.requestId || null;
+      isRemoteLocked = !!initResult.remoteApprovalOnly; // 🔒 THE GOVERNANCE LOCK
+      explainableLabel = 'Organization Policy (SaaS)';
+    } catch (err: unknown) {
+      const error = err as Error;
+      console.error(
+        chalk.yellow(
+          `\n⚠️  Node9: Cloud API Handshake failed (${error.message}). Falling back to local rules...\n`
+        )
+      );
     }
+  }
 
-    const approved = await callNode9SaaS(toolName, args, creds, envConfig?.slackChannel, meta);
+  // ── THE MULTI-CHANNEL RACE ENGINE ──────────────────────────────────────────
+  const abortController = new AbortController();
+  const { signal } = abortController;
+  const racePromises: Promise<AuthResult>[] = [];
 
-    if (viewerId && internalToken) {
-      resolveViaDaemon(viewerId, approved ? 'allow' : 'deny', internalToken).catch(() => null);
-    }
+  let viewerId: string | null = null;
+  const internalToken = getInternalToken();
 
+  // 🏁 RACER 1: Cloud SaaS Channel (The Poller)
+  if (cloudEnforced && cloudRequestId) {
+    racePromises.push(
+      (async () => {
+        try {
+          if (isDaemonRunning() && internalToken) {
+            viewerId = await notifyDaemonViewer(toolName, args, meta).catch(() => null);
+          }
+          const cloudResult = await pollNode9SaaS(cloudRequestId, creds!, signal);
+
+          return {
+            approved: cloudResult.approved,
+            reason: cloudResult.approved
+              ? undefined
+              : cloudResult.reason || 'Action rejected by organization administrator via Slack.',
+            checkedBy: cloudResult.approved ? 'cloud' : undefined,
+            blockedBy: cloudResult.approved ? undefined : 'team-policy',
+            blockedByLabel: 'Organization Policy (SaaS)',
+          };
+        } catch (err: unknown) {
+          const error = err as Error;
+          if (error.name === 'AbortError' || error.message?.includes('Aborted')) throw err;
+          throw err;
+        }
+      })()
+    );
+  }
+
+  // 🏁 RACER 2: Native OS Popup
+  if (approvers.native && !isManual) {
+    racePromises.push(
+      (async () => {
+        // Pass isRemoteLocked so the popup knows to hide the "Allow" button
+        const decision = await askNativePopup(
+          toolName,
+          args,
+          meta?.agent,
+          explainableLabel,
+          isRemoteLocked,
+          signal
+        );
+
+        if (decision === 'always_allow') {
+          writeTrustSession(toolName, 3600000);
+          return { approved: true, checkedBy: 'trust' };
+        }
+
+        const isApproved = decision === 'allow';
+        return {
+          approved: isApproved,
+          reason: isApproved
+            ? undefined
+            : "The human user clicked 'Block' on the system dialog window.",
+          checkedBy: isApproved ? 'daemon' : undefined,
+          blockedBy: isApproved ? undefined : 'local-decision',
+          blockedByLabel: 'User Decision (Native)',
+        };
+      })()
+    );
+  }
+
+  // 🏁 RACER 3: Browser Dashboard
+  if (approvers.browser && isDaemonRunning()) {
+    racePromises.push(
+      (async () => {
+        try {
+          if (!approvers.native && !cloudEnforced) {
+            console.error(
+              chalk.yellow('\n🛡️  Node9: Action suspended — waiting for browser approval.')
+            );
+            console.error(chalk.cyan(`   URL → http://${DAEMON_HOST}:${DAEMON_PORT}/\n`));
+          }
+
+          const daemonDecision = await askDaemon(toolName, args, meta, signal);
+          if (daemonDecision === 'abandoned') throw new Error('Abandoned');
+
+          const isApproved = daemonDecision === 'allow';
+          return {
+            approved: isApproved,
+            reason: isApproved
+              ? undefined
+              : 'The human user rejected this action via the Node9 Browser Dashboard.',
+            checkedBy: isApproved ? 'daemon' : undefined,
+            blockedBy: isApproved ? undefined : 'local-decision',
+            blockedByLabel: 'User Decision (Browser)',
+          };
+        } catch (err) {
+          throw err;
+        }
+      })()
+    );
+  }
+
+  // 🏁 RACER 4: Terminal Prompt
+  if (approvers.terminal && allowTerminalFallback && process.stdout.isTTY) {
+    racePromises.push(
+      (async () => {
+        try {
+          console.log(chalk.bgRed.white.bold(` 🛑 NODE9 INTERCEPTOR `));
+          console.log(`${chalk.bold('Action:')} ${chalk.red(toolName)}`);
+          console.log(`${chalk.bold('Flagged By:')} ${chalk.yellow(explainableLabel)}`);
+
+          if (isRemoteLocked) {
+            console.log(chalk.yellow(`⚡ LOCKED BY ADMIN POLICY: Waiting for Slack Approval...\n`));
+            // If locked, we don't ask [Y/n]. We just keep the promise alive until the SaaS wins and aborts it.
+            await new Promise((_, reject) => {
+              signal.addEventListener('abort', () => reject(new Error('Aborted by SaaS')));
+            });
+          }
+
+          const TIMEOUT_MS = 60_000;
+          let timer: NodeJS.Timeout;
+          const result = await new Promise<boolean>((resolve, reject) => {
+            timer = setTimeout(() => reject(new Error('Terminal Timeout')), TIMEOUT_MS);
+            confirm(
+              { message: `Authorize? (auto-deny in ${TIMEOUT_MS / 1000}s)`, default: false },
+              { signal }
+            )
+              .then(resolve)
+              .catch(reject);
+          });
+          clearTimeout(timer!);
+
+          return {
+            approved: result,
+            reason: result
+              ? undefined
+              : "The human user typed 'N' in the terminal to reject this action.",
+            checkedBy: result ? 'terminal' : undefined,
+            blockedBy: result ? undefined : 'local-decision',
+            blockedByLabel: 'User Decision (Terminal)',
+          };
+        } catch (err: unknown) {
+          const error = err as Error;
+          if (
+            error.name === 'AbortError' ||
+            error.message?.includes('Prompt was canceled') ||
+            error.message?.includes('Aborted by SaaS')
+          )
+            throw err;
+          if (error.message === 'Terminal Timeout') {
+            return {
+              approved: false,
+              reason: 'The terminal prompt timed out without a human response.',
+              blockedBy: 'local-decision',
+            };
+          }
+          throw err;
+        }
+      })()
+    );
+  }
+
+  // 🏆 RESOLVE THE RACE
+  if (racePromises.length === 0) {
     return {
-      approved,
-      checkedBy: approved ? 'cloud' : undefined,
-      blockedBy: approved ? undefined : 'team-policy',
-      changeHint: approved
-        ? undefined
-        : `Visit your Node9 dashboard → Policy Studio to change this rule`,
+      approved: false,
+      noApprovalMechanism: true,
+      reason: `Action blocked because no approval channels are available. (Native/Browser UI is disabled in config, and this terminal is non-interactive).`,
+      blockedBy: 'no-approval-mechanism',
+      blockedByLabel: 'Security Posture Lockdown',
     };
   }
 
-  // ── Local browser daemon is the authority ────────────────────────────────
-  if (isDaemonRunning()) {
-    console.error(chalk.yellow('\n🛡️  Node9: Action suspended — waiting for your approval.'));
-    console.error(chalk.cyan(`   Browser UI → http://${DAEMON_HOST}:${DAEMON_PORT}/\n`));
-    try {
-      const daemonDecision = await askDaemon(toolName, args, meta);
-      if (daemonDecision === 'abandoned') {
-        console.error(chalk.yellow('\n⚠️  Browser closed without a decision. Falling back...'));
-      } else {
-        return {
-          approved: daemonDecision === 'allow',
-          reason:
-            daemonDecision === 'deny'
-              ? `Node9 blocked "${toolName}" — denied in browser.`
-              : undefined,
-          checkedBy: daemonDecision === 'allow' ? 'daemon' : undefined,
-          blockedBy: daemonDecision === 'deny' ? 'local-decision' : undefined,
-          changeHint:
-            daemonDecision === 'deny'
-              ? `Open the daemon UI to change:  node9 daemon --openui`
-              : undefined,
-        };
+  const finalResult = await new Promise<AuthResult>((resolve) => {
+    let resolved = false;
+    let failures = 0;
+    const total = racePromises.length;
+
+    const finish = (res: AuthResult) => {
+      if (!resolved) {
+        resolved = true;
+        abortController.abort(); // KILL THE LOSERS
+
+        if (viewerId && internalToken) {
+          resolveViaDaemon(viewerId, res.approved ? 'allow' : 'deny', internalToken).catch(
+            () => null
+          );
+        }
+        resolve(res);
       }
-    } catch {}
-  }
+    };
 
-  // ── Terminal Y/N prompt ───────────────────────────────────────────────────
-  if (allowTerminalFallback && process.stdout.isTTY) {
-    console.log(chalk.bgRed.white.bold(` 🛑 NODE9 INTERCEPTOR `));
-    console.log(`${chalk.bold('Action:')} ${chalk.red(toolName)}`);
-    const argsPreview = JSON.stringify(args, null, 2);
-    console.log(
-      `${chalk.bold('Args:')}\n${chalk.gray(argsPreview.length > 500 ? argsPreview.slice(0, 500) + '...' : argsPreview)}`
-    );
-    const controller = new AbortController();
-    const TIMEOUT_MS = 30_000;
-    const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
-    try {
-      const approved = await confirm(
-        { message: `Authorize? (auto-deny in ${TIMEOUT_MS / 1000}s)`, default: false },
-        { signal: controller.signal }
-      );
-      clearTimeout(timer);
-      return { approved };
-    } catch {
-      clearTimeout(timer);
-      console.error(chalk.yellow('\n⏱  Prompt timed out — action denied by default.'));
-      return { approved: false };
+    for (const p of racePromises) {
+      p.then(finish).catch((err) => {
+        if (
+          err.name === 'AbortError' ||
+          err.message?.includes('canceled') ||
+          err.message?.includes('Aborted') ||
+          err.message === 'Abandoned'
+        )
+          return;
+        failures++;
+        if (failures === total && !resolved) {
+          finish({ approved: false, reason: 'All approval channels failed or disconnected.' });
+        }
+      });
     }
-  }
+  });
 
-  // ── No approval mechanism ─────────────────────────────────────────────────
-  return {
-    approved: false,
-    noApprovalMechanism: true,
-    reason: `Node9 blocked "${toolName}". No approval mechanism is active.`,
-    blockedBy: 'no-approval-mechanism',
-    changeHint: `Start the approval daemon:  node9 daemon --background\n   Or connect to your team:   node9 login <apiKey>`,
-  };
+  return finalResult;
 }
-
-export { getCredentials };
 
 /**
  * Returns the names of all saved profiles in ~/.node9/credentials.json.
@@ -611,85 +994,78 @@ export function listCredentialProfiles(): string[] {
     const credPath = path.join(os.homedir(), '.node9', 'credentials.json');
     if (!fs.existsSync(credPath)) return [];
     const creds = JSON.parse(fs.readFileSync(credPath, 'utf-8')) as Record<string, unknown>;
-    // Multi-profile format: keys are profile names with object values
     if (!creds.apiKey) return Object.keys(creds).filter((k) => typeof creds[k] === 'object');
   } catch {}
   return [];
 }
 
-/**
- * Policy resolution hierarchy (highest → lowest priority):
- *
- *  1. Cloud Policy Studio  — when agentMode:true + API key (handled in authorizeHeadless)
- *  2. ./node9.config.json  — project-level source of truth
- *  3. ~/.node9/config.json — machine-level source of truth
- *  4. Hardcoded defaults   — safety net when no config file exists at all
- *
- * Each level is a complete source of truth — the first file found is used entirely.
- * No cross-file merging: a project config does not inherit from the global config.
- * Within a single file, any unspecified field falls back to its hardcoded default
- * so that minimal configs (e.g. only setting dangerousWords) still work correctly.
- */
-function getConfig(): Config {
+export function getConfig(): Config {
   if (cachedConfig) return cachedConfig;
 
-  const projectConfig = tryLoadConfig(path.join(process.cwd(), 'node9.config.json'));
-  if (projectConfig) {
-    cachedConfig = buildConfig(projectConfig);
-    return cachedConfig;
-  }
+  const globalPath = path.join(os.homedir(), '.node9', 'config.json');
+  const projectPath = path.join(process.cwd(), 'node9.config.json');
 
-  const globalConfig = tryLoadConfig(path.join(os.homedir(), '.node9', 'config.json'));
-  if (globalConfig) {
-    cachedConfig = buildConfig(globalConfig);
-    return cachedConfig;
-  }
+  const globalConfig = tryLoadConfig(globalPath);
+  const projectConfig = tryLoadConfig(projectPath);
 
-  cachedConfig = DEFAULT_CONFIG;
+  const mergedSettings = {
+    ...DEFAULT_CONFIG.settings,
+    approvers: { ...DEFAULT_CONFIG.settings.approvers },
+  };
+  const mergedPolicy = {
+    sandboxPaths: [...DEFAULT_CONFIG.policy.sandboxPaths],
+    dangerousWords: [...DEFAULT_CONFIG.policy.dangerousWords],
+    ignoredTools: [...DEFAULT_CONFIG.policy.ignoredTools],
+    toolInspection: { ...DEFAULT_CONFIG.policy.toolInspection },
+    rules: [...DEFAULT_CONFIG.policy.rules],
+  };
+
+  const applyLayer = (source: Record<string, unknown> | null) => {
+    if (!source) return;
+    const s = (source.settings || {}) as Partial<Config['settings']>;
+    const p = (source.policy || {}) as Partial<Config['policy']>;
+
+    if (s.mode !== undefined) mergedSettings.mode = s.mode;
+    if (s.autoStartDaemon !== undefined) mergedSettings.autoStartDaemon = s.autoStartDaemon;
+    if (s.agentMode !== undefined) mergedSettings.agentMode = s.agentMode;
+    if (s.enableUndo !== undefined) mergedSettings.enableUndo = s.enableUndo;
+    if (s.enableHookLogDebug !== undefined)
+      mergedSettings.enableHookLogDebug = s.enableHookLogDebug;
+    if (s.approvers) mergedSettings.approvers = { ...mergedSettings.approvers, ...s.approvers };
+
+    if (p.sandboxPaths) mergedPolicy.sandboxPaths.push(...p.sandboxPaths);
+    if (p.dangerousWords) mergedPolicy.dangerousWords.push(...p.dangerousWords);
+    if (p.ignoredTools) mergedPolicy.ignoredTools.push(...p.ignoredTools);
+    if (p.toolInspection)
+      mergedPolicy.toolInspection = { ...mergedPolicy.toolInspection, ...p.toolInspection };
+    if (p.rules) mergedPolicy.rules.push(...p.rules);
+  };
+
+  applyLayer(globalConfig);
+  applyLayer(projectConfig);
+
+  if (process.env.NODE9_MODE) mergedSettings.mode = process.env.NODE9_MODE as string;
+
+  mergedPolicy.sandboxPaths = [...new Set(mergedPolicy.sandboxPaths)];
+  mergedPolicy.dangerousWords = [...new Set(mergedPolicy.dangerousWords)];
+  mergedPolicy.ignoredTools = [...new Set(mergedPolicy.ignoredTools)];
+
+  cachedConfig = {
+    settings: mergedSettings,
+    policy: mergedPolicy,
+    environments: {},
+  };
+
   return cachedConfig;
 }
 
 function tryLoadConfig(filePath: string): Record<string, unknown> | null {
   if (!fs.existsSync(filePath)) return null;
   try {
-    const config = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
-    validateConfig(config, filePath);
-    return config;
+    return JSON.parse(fs.readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
   } catch {
     return null;
   }
-}
-
-function validateConfig(config: Record<string, unknown>, path: string): void {
-  const allowedTopLevel = ['version', 'settings', 'policy', 'environments', 'apiKey', 'apiUrl'];
-  Object.keys(config).forEach((key) => {
-    if (!allowedTopLevel.includes(key))
-      console.warn(chalk.yellow(`⚠️  Node9: Unknown top-level key "${key}" in ${path}`));
-  });
-}
-
-/**
- * Builds a Config from a parsed file.
- * Each field falls back independently to its hardcoded default only if absent —
- * so a file that only sets `dangerousWords` still gets `ignoredTools` etc.,
- * but a file that explicitly sets `ignoredTools: []` gets an empty list.
- */
-function buildConfig(parsed: Record<string, unknown>): Config {
-  const p = (parsed.policy as Partial<Config['policy']>) || {};
-  const s = (parsed.settings as Partial<Config['settings']>) || {};
-  return {
-    settings: {
-      mode: s.mode ?? DEFAULT_CONFIG.settings.mode,
-      autoStartDaemon: s.autoStartDaemon ?? DEFAULT_CONFIG.settings.autoStartDaemon,
-    },
-    policy: {
-      dangerousWords: p.dangerousWords ?? DEFAULT_CONFIG.policy.dangerousWords,
-      ignoredTools: p.ignoredTools ?? DEFAULT_CONFIG.policy.ignoredTools,
-      toolInspection: p.toolInspection ?? DEFAULT_CONFIG.policy.toolInspection,
-      rules: p.rules ?? DEFAULT_CONFIG.policy.rules,
-    },
-    environments: (parsed.environments as Record<string, EnvironmentConfig>) || {},
-  };
 }
 
 function getActiveEnvironment(config: Config): EnvironmentConfig | null {
@@ -697,51 +1073,27 @@ function getActiveEnvironment(config: Config): EnvironmentConfig | null {
   return config.environments[env] ?? null;
 }
 
-function getCredentials() {
+export function getCredentials() {
   const DEFAULT_API_URL = 'https://api.node9.ai/api/v1/intercept';
-
-  // 1. Env var — highest priority, always wins (CI, Docker, per-session overrides)
-  if (process.env.NODE9_API_KEY)
+  if (process.env.NODE9_API_KEY) {
     return {
       apiKey: process.env.NODE9_API_KEY,
       apiUrl: process.env.NODE9_API_URL || DEFAULT_API_URL,
     };
-
-  // 2. Per-project node9.config.json apiKey — lets each repo point to its own workspace
-  try {
-    const projectConfigPath = path.join(process.cwd(), 'node9.config.json');
-    if (fs.existsSync(projectConfigPath)) {
-      const projectConfig = JSON.parse(fs.readFileSync(projectConfigPath, 'utf-8')) as Record<
-        string,
-        unknown
-      >;
-      if (typeof projectConfig.apiKey === 'string' && projectConfig.apiKey) {
-        return {
-          apiKey: projectConfig.apiKey,
-          apiUrl:
-            (typeof projectConfig.apiUrl === 'string' && projectConfig.apiUrl) || DEFAULT_API_URL,
-        };
-      }
-    }
-  } catch {}
-
-  // 3. ~/.node9/credentials.json — supports both flat (legacy) and named profiles
+  }
   try {
     const credPath = path.join(os.homedir(), '.node9', 'credentials.json');
     if (fs.existsSync(credPath)) {
       const creds = JSON.parse(fs.readFileSync(credPath, 'utf-8')) as Record<string, unknown>;
-
-      // Multi-profile format: { "default": { apiKey, apiUrl }, "gemini": { apiKey, apiUrl } }
       const profileName = process.env.NODE9_PROFILE || 'default';
       const profile = creds[profileName] as Record<string, unknown> | undefined;
+
       if (profile?.apiKey) {
         return {
           apiKey: profile.apiKey as string,
           apiUrl: (profile.apiUrl as string) || DEFAULT_API_URL,
         };
       }
-
-      // Legacy flat format: { "apiKey": "...", "apiUrl": "..." }
       if (creds.apiKey) {
         return {
           apiKey: creds.apiKey as string,
@@ -750,7 +1102,6 @@ function getCredentials() {
       }
     }
   } catch {}
-
   return null;
 }
 
@@ -759,16 +1110,32 @@ export async function authorizeAction(toolName: string, args: unknown): Promise<
   return result.approved;
 }
 
-async function callNode9SaaS(
+export interface CloudApprovalResult {
+  approved: boolean;
+  reason?: string;
+  remoteApprovalOnly?: boolean;
+}
+
+/**
+ * STEP 1: The Handshake. Runs BEFORE the local UI is spawned to check for locks.
+ */
+async function initNode9SaaS(
   toolName: string,
   args: unknown,
   creds: { apiKey: string; apiUrl: string },
   slackChannel?: string,
   meta?: { agent?: string; mcpServer?: string }
-): Promise<boolean> {
+): Promise<{
+  pending: boolean;
+  requestId?: string;
+  approved?: boolean;
+  reason?: string;
+  remoteApprovalOnly?: boolean;
+}> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 35000);
     const response = await fetch(creds.apiUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${creds.apiKey}` },
@@ -786,60 +1153,66 @@ async function callNode9SaaS(
       }),
       signal: controller.signal,
     });
-    clearTimeout(timeout);
-    if (!response.ok) throw new Error('API fail');
-    const data = (await response.json()) as {
-      approved: boolean;
-      pending?: boolean;
+
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+    // FIX: Using TypeScript 'as' casting to resolve the unknown type error
+    return (await response.json()) as {
+      pending: boolean;
       requestId?: string;
+      approved?: boolean;
+      reason?: string;
+      remoteApprovalOnly?: boolean;
     };
-
-    // Auto-allowed or auto-blocked — no polling needed
-    if (!data.pending) return data.approved;
-
-    // PENDING — poll GET /intercept/status/:requestId until a decision is made
-    if (!data.requestId) return false;
-    const statusUrl = `${creds.apiUrl}/status/${data.requestId}`;
-
-    // Tell the user where to act
-    console.error(chalk.yellow('\n🛡️  Node9: Action suspended — waiting for your approval.'));
-    if (isDaemonRunning()) {
-      console.error(
-        chalk.cyan('   Browser UI → ') + chalk.bold(`http://${DAEMON_HOST}:${DAEMON_PORT}/`)
-      );
-    }
-    console.error(chalk.cyan('   Dashboard  → ') + chalk.bold('Mission Control > Flows'));
-    console.error(chalk.gray('   Agent is paused. Approve or deny to continue.\n'));
-
-    const POLL_INTERVAL_MS = 3000;
-    const POLL_DEADLINE = Date.now() + 5 * 60 * 1000; // 5-minute timeout
-
-    while (Date.now() < POLL_DEADLINE) {
-      await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
-      try {
-        const statusRes = await fetch(statusUrl, {
-          headers: { Authorization: `Bearer ${creds.apiKey}` },
-          signal: AbortSignal.timeout(5000),
-        });
-        if (!statusRes.ok) continue;
-        const { status } = (await statusRes.json()) as { status: string };
-        if (status === 'APPROVED') {
-          console.error(chalk.green('✅  Approved — continuing.\n'));
-          return true;
-        }
-        if (status === 'DENIED' || status === 'AUTO_BLOCKED' || status === 'TIMED_OUT') {
-          console.error(chalk.red('❌  Denied — action blocked.\n'));
-          return false;
-        }
-        // status === 'PENDING' → keep polling
-      } catch {
-        // transient network error, retry on next tick
-      }
-    }
-
-    console.error(chalk.yellow('⏱  Timed out waiting for approval — action blocked.\n'));
-    return false; // timed out waiting for a decision
-  } catch {
-    return false;
+  } finally {
+    clearTimeout(timeout);
   }
+}
+
+/**
+ * STEP 2: The Poller. Runs INSIDE the Race Engine.
+ */
+async function pollNode9SaaS(
+  requestId: string,
+  creds: { apiKey: string; apiUrl: string },
+  signal: AbortSignal
+): Promise<CloudApprovalResult> {
+  const statusUrl = `${creds.apiUrl}/status/${requestId}`;
+  const POLL_INTERVAL_MS = 1000;
+  const POLL_DEADLINE = Date.now() + 10 * 60 * 1000;
+
+  console.error(chalk.yellow('\n🛡️  Node9: Action suspended — waiting for Organization approval.'));
+  console.error(chalk.cyan('   Dashboard  → ') + chalk.bold('Mission Control > Flows'));
+
+  while (Date.now() < POLL_DEADLINE) {
+    if (signal.aborted) throw new Error('Aborted');
+    await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+
+    try {
+      const pollCtrl = new AbortController();
+      const pollTimer = setTimeout(() => pollCtrl.abort(), 5000);
+      const statusRes = await fetch(statusUrl, {
+        headers: { Authorization: `Bearer ${creds.apiKey}` },
+        signal: pollCtrl.signal,
+      });
+      clearTimeout(pollTimer);
+
+      if (!statusRes.ok) continue;
+
+      // FIX: Using TypeScript 'as' casting to resolve the unknown type error
+      const { status, reason } = (await statusRes.json()) as { status: string; reason?: string };
+
+      if (status === 'APPROVED') {
+        console.error(chalk.green('✅  Approved via Cloud.\n'));
+        return { approved: true, reason };
+      }
+      if (status === 'DENIED' || status === 'AUTO_BLOCKED' || status === 'TIMED_OUT') {
+        console.error(chalk.red('❌  Denied via Cloud.\n'));
+        return { approved: false, reason };
+      }
+    } catch {
+      /* transient network error */
+    }
+  }
+  return { approved: false, reason: 'Cloud approval timed out after 10 minutes.' };
 }
