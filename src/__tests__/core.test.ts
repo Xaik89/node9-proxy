@@ -2,30 +2,96 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { authorizeAction, evaluatePolicy, authorizeHeadless, _resetConfigCache } from '../core.js';
 
+// 1. Lock down the testing environment globally so it survives between tests.
+process.env.NODE9_TESTING = '1';
+process.env.VITEST = 'true';
+process.env.NODE_ENV = 'test';
+
+// 2. Mock Terminal prompts
 vi.mock('@inquirer/prompts', () => ({ confirm: vi.fn() }));
+
+// 3. Mock Native UI module
+vi.mock('../ui/native', () => ({
+  askNativePopup: vi.fn().mockResolvedValue('deny'),
+  sendDesktopNotification: vi.fn(),
+}));
+
+// 4. THE ULTIMATE KILL-SWITCH: Mock Node.js OS commands
+// If the real UI module accidentally loads, this physically prevents it from opening a window.
+vi.mock('child_process', () => ({
+  spawn: vi.fn().mockReturnValue({
+    unref: vi.fn(),
+    stdout: { on: vi.fn() },
+    on: vi.fn((event, cb) => {
+      // Instantly simulate the user clicking "Block" so the test moves on without a popup
+      if (event === 'close') cb(1);
+    }),
+  }),
+}));
+
+// 5. NOW we import core AFTER the mocks are registered!
+import {
+  authorizeAction,
+  evaluatePolicy,
+  authorizeHeadless,
+  _resetConfigCache,
+  getPersistentDecision,
+  isDaemonRunning,
+} from '../core.js';
 
 // Global spies
 const existsSpy = vi.spyOn(fs, 'existsSync');
 const readSpy = vi.spyOn(fs, 'readFileSync');
-const writeSpy = vi.spyOn(fs, 'writeFileSync');
-const mkdirSpy = vi.spyOn(fs, 'mkdirSync');
+vi.spyOn(fs, 'writeFileSync').mockImplementation(() => undefined);
+vi.spyOn(fs, 'mkdirSync').mockImplementation(() => undefined);
 const homeSpy = vi.spyOn(os, 'homedir');
 
 async function getConfirm() {
   return vi.mocked((await import('@inquirer/prompts')).confirm);
 }
 
+// ── Config mock helpers ───────────────────────────────────────────────────────
+
+function mockProjectConfig(config: object) {
+  const projectPath = path.join(process.cwd(), 'node9.config.json');
+  existsSpy.mockImplementation((p) => String(p) === projectPath);
+  readSpy.mockImplementation((p) => (String(p) === projectPath ? JSON.stringify(config) : ''));
+}
+
+function mockGlobalConfig(config: object) {
+  const globalPath = path.join('/mock/home', '.node9', 'config.json');
+  existsSpy.mockImplementation((p) => String(p) === globalPath);
+  readSpy.mockImplementation((p) => (String(p) === globalPath ? JSON.stringify(config) : ''));
+}
+
+function mockBothConfigs(projectConfig: object, globalConfig: object) {
+  const projectPath = path.join(process.cwd(), 'node9.config.json');
+  const globalPath = path.join('/mock/home', '.node9', 'config.json');
+  existsSpy.mockImplementation((p) => [projectPath, globalPath].includes(String(p)));
+  readSpy.mockImplementation((p) => {
+    if (String(p) === projectPath) return JSON.stringify(projectConfig);
+    if (String(p) === globalPath) return JSON.stringify(globalConfig);
+    return '';
+  });
+}
+
+/** Config that disables the native approver so racePromises can be empty
+ *  and noApprovalMechanism tests work correctly. */
+function mockNoNativeConfig(extra?: object) {
+  mockGlobalConfig({
+    settings: { approvers: { native: false }, ...(extra as Record<string, unknown>) },
+  });
+}
+
+// ── Lifecycle ─────────────────────────────────────────────────────────────────
+
 beforeEach(() => {
   _resetConfigCache();
   existsSpy.mockReturnValue(false);
   readSpy.mockReturnValue('');
-  writeSpy.mockImplementation(() => undefined);
-  mkdirSpy.mockImplementation(() => undefined);
   homeSpy.mockReturnValue('/mock/home');
-
-  // Default headless
+  delete process.env.NODE9_API_KEY;
   Object.defineProperty(process.stdout, 'isTTY', { value: false, configurable: true });
 });
 
@@ -33,70 +99,422 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-describe('authorizeAction', () => {
-  it('returns true for safe tool calls', async () => {
+// ── Ignored tool patterns ─────────────────────────────────────────────────────
+
+describe('ignored tool patterns', () => {
+  it.each([
+    'list_users',
+    'list_s3_buckets',
+    'get_config',
+    'get_user_by_id',
+    'read_file',
+    'read_object',
+    'describe_table',
+    'describe_instance',
+  ])('allows "%s" without prompting', async (tool) => {
     const confirm = await getConfirm();
-    expect(await authorizeAction('list_users', {})).toBe(true);
+    expect(await authorizeAction(tool, {})).toBe(true);
     expect(confirm).not.toHaveBeenCalled();
   });
+});
 
-  it('prompts user for dangerous actions when no API key is configured', async () => {
-    const confirm = await getConfirm();
-    confirm.mockResolvedValue(true);
-    Object.defineProperty(process.stdout, 'isTTY', { value: true, configurable: true });
+// ── Standard mode — safe tools ────────────────────────────────────────────────
 
-    expect(await authorizeAction('delete_user', { id: 123 })).toBe(true);
-    expect(confirm).toHaveBeenCalled();
+describe('standard mode — safe tools', () => {
+  it.each(['create_user', 'send_notification', 'invoke_lambda', 'start_job'])(
+    'allows "%s" without prompting',
+    async (tool) => {
+      const confirm = await getConfirm();
+      expect(await authorizeAction(tool, {})).toBe(true);
+      expect(confirm).not.toHaveBeenCalled();
+    }
+  );
+});
+
+// ── Standard mode — dangerous word detection ──────────────────────────────────
+
+describe('standard mode — dangerous word detection', () => {
+  // Use evaluatePolicy directly — no HITL, purely deterministic policy check
+  it.each([
+    'delete_user',
+    'drop_table',
+    'remove_file',
+    'terminate_instance',
+    'refund_payment',
+    'write_record',
+    'update_schema',
+    'destroy_cluster',
+    'aws.rds.rm_database',
+    'purge_queue',
+    'format_disk',
+  ])('evaluatePolicy flags "%s" as review (dangerous word match)', async (tool) => {
+    expect((await evaluatePolicy(tool)).decision).toBe('review');
   });
 
-  it('returns false when user denies terminal approval', async () => {
-    const confirm = await getConfirm();
-    confirm.mockResolvedValue(false);
-    Object.defineProperty(process.stdout, 'isTTY', { value: true, configurable: true });
-
-    expect(await authorizeAction('drop_table', { name: 'users' })).toBe(false);
+  it('dangerous word match is case-insensitive', async () => {
+    expect((await evaluatePolicy('DELETE_USER')).decision).toBe('review');
   });
 });
 
-describe('evaluatePolicy', () => {
-  it.each(['list_users', 'get_config', 'read_file', 'describe_table'])(
-    'returns "allow" for ignored tool "%s"',
+// ── Persistent decision approval — approve / deny ─────────────────────────────
+
+describe('persistent decision approval', () => {
+  // Persistent decisions are file-based and deterministic — no HITL required
+  function setPersistentDecision(toolName: string, decision: 'allow' | 'deny') {
+    const decisionsPath = path.join('/mock/home', '.node9', 'decisions.json');
+    existsSpy.mockImplementation((p) => String(p) === decisionsPath);
+    readSpy.mockImplementation((p) =>
+      String(p) === decisionsPath ? JSON.stringify({ [toolName]: decision }) : ''
+    );
+  }
+
+  it('returns true when persistent decision is allow', async () => {
+    setPersistentDecision('delete_user', 'allow');
+    expect(await authorizeAction('delete_user', {})).toBe(true);
+  });
+
+  it('returns false when persistent decision is deny', async () => {
+    setPersistentDecision('delete_user', 'deny');
+    expect(await authorizeAction('delete_user', {})).toBe(false);
+  });
+});
+
+// ── Bash tool — shell command interception ────────────────────────────────────
+
+describe('Bash tool — shell command interception', () => {
+  it.each([
+    { cmd: 'rm /home/user/deleteme.txt', desc: 'rm command' },
+    { cmd: 'rm -rf /', desc: 'rm -rf' },
+    { cmd: 'sudo rm -rf /home/user', desc: 'sudo rm' },
+    { cmd: 'rmdir /var/log/mydir', desc: 'rmdir command' },
+    { cmd: '/usr/bin/rm file.txt', desc: 'absolute path to rm' },
+    { cmd: 'find . -delete', desc: 'find -delete flag' },
+    { cmd: 'npm update', desc: 'npm update' },
+    { cmd: 'apt-get purge vim', desc: 'apt-get purge' },
+  ])('blocks Bash when command is "$desc"', async ({ cmd }) => {
+    expect((await evaluatePolicy('Bash', { command: cmd })).decision).toBe('review');
+  });
+
+  it.each([
+    { cmd: 'ls -la', desc: 'ls' },
+    { cmd: 'cat /etc/hosts', desc: 'cat' },
+    { cmd: 'git status', desc: 'git status' },
+    { cmd: 'npm install', desc: 'npm install' },
+    { cmd: 'node --version', desc: 'node --version' },
+  ])('allows Bash when command is "$desc"', async ({ cmd }) => {
+    expect((await evaluatePolicy('Bash', { command: cmd })).decision).toBe('allow');
+  });
+
+  it('authorizeHeadless blocks Bash rm when no approval mechanism', async () => {
+    // Disable native approver so racePromises is empty → noApprovalMechanism
+    mockNoNativeConfig();
+    const result = await authorizeHeadless('Bash', { command: 'rm /home/user/data.txt' });
+    expect(result.approved).toBe(false);
+    expect(result.noApprovalMechanism).toBe(true);
+  });
+
+  it('authorizeHeadless allows Bash ls', async () => {
+    const result = await authorizeHeadless('Bash', { command: 'ls -la' });
+    expect(result.approved).toBe(true);
+  });
+});
+
+// ── False-positive regression ─────────────────────────────────────────────────
+
+describe('false-positive regression — rm substring', () => {
+  it.each(['confirm_action', 'check_permissions', 'perform_search'])(
+    'does not block "%s"',
     async (tool) => {
-      expect(await evaluatePolicy(tool)).toBe('allow');
+      expect((await evaluatePolicy(tool)).decision).toBe('allow');
     }
   );
+});
 
-  it.each(['delete_user', 'drop_table', 'rm_data', 'destroy_cluster'])(
-    'returns "review" for dangerous tool "%s"',
-    async (tool) => {
-      expect(await evaluatePolicy(tool)).toBe('review');
-    }
-  );
+// ── Strict mode ───────────────────────────────────────────────────────────────
 
-  it('respects project-level node9.config.json', async () => {
-    const projectPath = path.join(process.cwd(), 'node9.config.json');
-    existsSpy.mockImplementation((p) => String(p) === projectPath);
-    readSpy.mockImplementation((p) => {
-      if (String(p) === projectPath) {
-        return JSON.stringify({ policy: { dangerousWords: ['deploy'] } });
-      }
-      return '';
+describe('strict mode', () => {
+  beforeEach(() => {
+    mockProjectConfig({
+      settings: { mode: 'strict' },
+      policy: { dangerousWords: [], ignoredTools: ['list_*'] },
+      environments: {},
     });
+  });
 
-    expect(await evaluatePolicy('deploy_app')).toBe('review');
-    expect(await evaluatePolicy('delete_user')).toBe('allow');
+  it('intercepts non-dangerous tools that would pass in standard mode', async () => {
+    expect((await evaluatePolicy('create_user')).decision).toBe('review');
+  });
+
+  it('still allows ignored tools', async () => {
+    expect((await evaluatePolicy('list_users')).decision).toBe('allow');
   });
 });
+
+// ── Environment config ────────────────────────────────────────────────────────
+
+describe('environment config', () => {
+  it('strict mode blocks all non-dangerous tools by default', async () => {
+    process.env.NODE_ENV = 'development';
+    mockProjectConfig({
+      settings: { mode: 'strict' },
+      policy: { dangerousWords: [], ignoredTools: [] },
+      environments: {},
+    });
+    // In strict mode every tool that isn't ignored requires approval
+    expect((await evaluatePolicy('create_user')).decision).toBe('review');
+  });
+
+  it('standard mode allows non-dangerous tools regardless of environment', async () => {
+    process.env.NODE_ENV = 'production';
+    mockProjectConfig({
+      settings: { mode: 'standard' },
+      policy: { dangerousWords: ['delete'], ignoredTools: [] },
+      environments: {},
+    });
+    // delete_user is dangerous in any mode — confirm standard mode still blocks it
+    expect((await evaluatePolicy('delete_user')).decision).toBe('review');
+    // Safe tools are always allowed in standard mode
+    expect((await evaluatePolicy('invoke_lambda')).decision).toBe('allow');
+  });
+});
+
+// ── Custom policy ─────────────────────────────────────────────────────────────
+
+describe('custom policy', () => {
+  it('respects user-defined dangerousWords', async () => {
+    mockProjectConfig({
+      settings: { mode: 'standard' },
+      policy: { dangerousWords: ['deploy'], ignoredTools: [] },
+      environments: {},
+    });
+    expect((await evaluatePolicy('deploy_to_prod')).decision).toBe('review');
+    // Note: dangerousWords are additive — defaults (delete, rm, etc.) are still active.
+    // Use a word that's not in the default list to verify only custom words are 'allow'.
+    expect((await evaluatePolicy('invoke_lambda')).decision).toBe('allow');
+  });
+
+  it('respects user-defined ignoredTools', async () => {
+    mockProjectConfig({
+      settings: { mode: 'standard' },
+      policy: { dangerousWords: ['delete'], ignoredTools: ['delete_*'] },
+      environments: {},
+    });
+    expect((await evaluatePolicy('delete_temp_files')).decision).toBe('allow');
+  });
+});
+
+// ── Global config ─────────────────────────────────────────────────────────────
+
+describe('global config (~/.node9/config.json)', () => {
+  it('is used when no project config exists', async () => {
+    mockGlobalConfig({
+      settings: { mode: 'standard' },
+      policy: { dangerousWords: ['nuke'], ignoredTools: [] },
+      environments: {},
+    });
+    expect((await evaluatePolicy('nuke_everything')).decision).toBe('review');
+    // dangerousWords are additive — use a word absent from both default and custom lists
+    expect((await evaluatePolicy('invoke_lambda')).decision).toBe('allow');
+  });
+
+  it('project config settings take precedence over global config settings', async () => {
+    mockBothConfigs(
+      // project: standard mode (overrides global strict)
+      {
+        settings: { mode: 'standard' },
+        policy: { dangerousWords: [], ignoredTools: [] },
+        environments: {},
+      },
+      // global: strict mode
+      {
+        settings: { mode: 'strict' },
+        policy: { dangerousWords: [], ignoredTools: [] },
+        environments: {},
+      }
+    );
+    // Project's standard mode wins — create_user is safe in standard mode
+    expect((await evaluatePolicy('create_user')).decision).toBe('allow');
+  });
+
+  it('falls back to hardcoded defaults when neither config exists', async () => {
+    // existsSpy returns false for all paths (set in beforeEach)
+    expect((await evaluatePolicy('delete_user')).decision).toBe('review');
+    expect((await evaluatePolicy('list_users')).decision).toBe('allow');
+  });
+});
+
+// ── authorizeHeadless — full coverage ─────────────────────────────────────────
 
 describe('authorizeHeadless', () => {
-  it('returns approved:true for safe actions', async () => {
-    const result = await authorizeHeadless('list_users', {});
-    expect(result).toEqual({ approved: true });
+  it('returns approved:true for safe tools', async () => {
+    expect(await authorizeHeadless('list_users', {})).toEqual({ approved: true });
   });
 
-  it('returns approved:false with a helpful reason when no API key is configured', async () => {
+  it('returns approved:false with noApprovalMechanism when no API key', async () => {
+    // Disable native approver so racePromises is empty → noApprovalMechanism
+    mockNoNativeConfig();
     const result = await authorizeHeadless('delete_user', {});
     expect(result.approved).toBe(false);
-    expect(result.reason).toMatch(/node9 login/i);
+    expect(result.noApprovalMechanism).toBe(true);
+  });
+
+  it('calls cloud API and returns approved:true on approval', async () => {
+    // approvers.cloud must be true for cloud enforcement to activate; disable native so cloud wins
+    mockGlobalConfig({
+      settings: { slackEnabled: true, approvers: { native: false, cloud: true } },
+    });
+    process.env.NODE9_API_KEY = 'test-key';
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ approved: true, message: 'Approved via Slack' }),
+      })
+    );
+    const result = await authorizeHeadless('delete_user', { id: 1 });
+    expect(result.approved).toBe(true);
+  });
+
+  it('returns approved:false when cloud API denies', async () => {
+    mockGlobalConfig({
+      settings: { slackEnabled: true, approvers: { native: false, cloud: true } },
+    });
+    process.env.NODE9_API_KEY = 'test-key';
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ approved: false }),
+      })
+    );
+    const result = await authorizeHeadless('delete_user', { id: 1 });
+    expect(result.approved).toBe(false);
+  });
+
+  it('returns approved:false when cloud API call fails', async () => {
+    mockNoNativeConfig();
+    process.env.NODE9_API_KEY = 'test-key';
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('Network error')));
+    const result = await authorizeHeadless('delete_user', {});
+    expect(result.approved).toBe(false);
+  });
+
+  it('does NOT prompt on TTY — headless means headless', async () => {
+    mockNoNativeConfig();
+    Object.defineProperty(process.stdout, 'isTTY', { value: true, configurable: true });
+    const confirm = await getConfirm();
+    const result = await authorizeHeadless('delete_user', {});
+    expect(result.approved).toBe(false);
+    expect(confirm).not.toHaveBeenCalled();
+  });
+});
+
+// ── evaluatePolicy — project config ──────────────────────────────────────────
+
+describe('evaluatePolicy — project config', () => {
+  it('returns "review" for dangerous tool', async () => {
+    expect((await evaluatePolicy('delete_user')).decision).toBe('review');
+  });
+
+  it('returns "allow" for safe tool in standard mode', async () => {
+    expect((await evaluatePolicy('create_user')).decision).toBe('allow');
+  });
+
+  it('respects project-level dangerousWords override', async () => {
+    mockProjectConfig({
+      settings: { mode: 'standard' },
+      policy: { dangerousWords: ['deploy'], ignoredTools: [] },
+      environments: {},
+    });
+    expect((await evaluatePolicy('deploy_app')).decision).toBe('review');
+    // dangerousWords are additive — defaults still apply, use a clearly safe word
+    expect((await evaluatePolicy('invoke_lambda')).decision).toBe('allow');
+  });
+});
+
+// ── Persistent decisions ──────────────────────────────────────────────────────
+
+describe('getPersistentDecision', () => {
+  it('returns null when decisions file does not exist', () => {
+    // existsSpy already returns false in beforeEach
+    expect(getPersistentDecision('delete_user')).toBeNull();
+  });
+
+  it('returns "allow" when tool is set to always allow', () => {
+    const decisionsPath = path.join('/mock/home', '.node9', 'decisions.json');
+    existsSpy.mockImplementation((p) => String(p) === decisionsPath);
+    readSpy.mockImplementation((p) =>
+      String(p) === decisionsPath ? JSON.stringify({ delete_user: 'allow' }) : ''
+    );
+    expect(getPersistentDecision('delete_user')).toBe('allow');
+  });
+
+  it('returns "deny" when tool is set to always deny', () => {
+    const decisionsPath = path.join('/mock/home', '.node9', 'decisions.json');
+    existsSpy.mockImplementation((p) => String(p) === decisionsPath);
+    readSpy.mockImplementation((p) =>
+      String(p) === decisionsPath ? JSON.stringify({ delete_user: 'deny' }) : ''
+    );
+    expect(getPersistentDecision('delete_user')).toBe('deny');
+  });
+
+  it('returns null for an unrecognised value', () => {
+    const decisionsPath = path.join('/mock/home', '.node9', 'decisions.json');
+    existsSpy.mockImplementation((p) => String(p) === decisionsPath);
+    readSpy.mockImplementation((p) =>
+      String(p) === decisionsPath ? JSON.stringify({ delete_user: 'maybe' }) : ''
+    );
+    expect(getPersistentDecision('delete_user')).toBeNull();
+  });
+});
+
+describe('authorizeHeadless — persistent decisions', () => {
+  it('approves without API when persistent decision is "allow"', async () => {
+    const decisionsPath = path.join('/mock/home', '.node9', 'decisions.json');
+    existsSpy.mockImplementation((p) => String(p) === decisionsPath);
+    readSpy.mockImplementation((p) =>
+      String(p) === decisionsPath ? JSON.stringify({ delete_user: 'allow' }) : ''
+    );
+    const result = await authorizeHeadless('delete_user', {});
+    expect(result.approved).toBe(true);
+  });
+
+  it('blocks without API when persistent decision is "deny"', async () => {
+    const decisionsPath = path.join('/mock/home', '.node9', 'decisions.json');
+    existsSpy.mockImplementation((p) => String(p) === decisionsPath);
+    readSpy.mockImplementation((p) =>
+      String(p) === decisionsPath ? JSON.stringify({ delete_user: 'deny' }) : ''
+    );
+    const result = await authorizeHeadless('delete_user', {});
+    expect(result.approved).toBe(false);
+    expect(result.reason).toMatch(/always deny/i);
+  });
+});
+
+// ── isDaemonRunning ───────────────────────────────────────────────────────────
+
+describe('isDaemonRunning', () => {
+  it('returns false when PID file does not exist', () => {
+    // existsSpy returns false (set in beforeEach)
+    expect(isDaemonRunning()).toBe(false);
+  });
+
+  it('returns false when PID file has wrong port', () => {
+    const pidPath = path.join('/mock/home', '.node9', 'daemon.pid');
+    existsSpy.mockImplementation((p) => String(p) === pidPath);
+    readSpy.mockImplementation((p) =>
+      String(p) === pidPath ? JSON.stringify({ pid: process.pid, port: 9999 }) : ''
+    );
+    expect(isDaemonRunning()).toBe(false);
+  });
+
+  it('returns true when PID exists and process is alive', () => {
+    const pidPath = path.join('/mock/home', '.node9', 'daemon.pid');
+    existsSpy.mockImplementation((p) => String(p) === pidPath);
+    readSpy.mockImplementation((p) =>
+      // Use current process PID so kill(pid, 0) succeeds
+      String(p) === pidPath ? JSON.stringify({ pid: process.pid, port: 7391 }) : ''
+    );
+    expect(isDaemonRunning()).toBe(true);
   });
 });

@@ -1,3 +1,4 @@
+// src/index.ts
 import { authorizeAction } from './core';
 
 /**

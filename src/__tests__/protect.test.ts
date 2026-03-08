@@ -1,25 +1,41 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import fs from 'fs';
+import os from 'os';
 import { protect } from '../index.js';
 import { _resetConfigCache } from '../core.js';
 
-vi.mock('@inquirer/prompts', () => ({
-  confirm: vi.fn(),
+// Fully block all HITL channels — tests use deterministic mechanisms only
+vi.mock('@inquirer/prompts', () => ({ confirm: vi.fn() }));
+vi.mock('../ui/native', () => ({
+  askNativePopup: vi.fn().mockReturnValue('deny'),
+  sendDesktopNotification: vi.fn(),
 }));
 
-vi.spyOn(fs, 'existsSync').mockReturnValue(false);
-vi.spyOn(fs, 'readFileSync');
+const existsSpy = vi.spyOn(fs, 'existsSync').mockReturnValue(false);
+const readSpy = vi.spyOn(fs, 'readFileSync').mockReturnValue('');
+vi.spyOn(os, 'homedir').mockReturnValue('/mock/home');
 
 beforeEach(() => {
   _resetConfigCache();
   delete process.env.NODE9_API_KEY;
-  Object.defineProperty(process.stdout, 'isTTY', { value: true, configurable: true });
+  existsSpy.mockReturnValue(false);
+  readSpy.mockReturnValue('');
+  Object.defineProperty(process.stdout, 'isTTY', { value: false, configurable: true });
 });
+
+/** Grant approval for a tool via a persistent decision file (no HITL needed). */
+function setPersistentDecision(toolName: string, decision: 'allow' | 'deny') {
+  const decisionsPath = '/mock/home/.node9/decisions.json';
+  existsSpy.mockImplementation((p) => String(p) === decisionsPath);
+  readSpy.mockImplementation((p) =>
+    String(p) === decisionsPath ? JSON.stringify({ [toolName]: decision }) : ''
+  );
+}
 
 describe('protect()', () => {
   it('calls the wrapped function and returns its result when approved', async () => {
-    const { confirm } = await import('@inquirer/prompts');
-    vi.mocked(confirm).mockResolvedValue(true);
+    // Approval via persistent decision — no human interaction needed
+    setPersistentDecision('delete_resource', 'allow');
 
     const fn = vi.fn().mockResolvedValue('ok');
     const secured = protect('delete_resource', fn);
@@ -31,8 +47,8 @@ describe('protect()', () => {
   });
 
   it('throws and does NOT call the wrapped function when denied', async () => {
-    const { confirm } = await import('@inquirer/prompts');
-    vi.mocked(confirm).mockResolvedValue(false);
+    // Denial via persistent decision — no human interaction needed
+    setPersistentDecision('delete_resource', 'deny');
 
     const fn = vi.fn();
     const secured = protect('delete_resource', fn);
@@ -49,14 +65,14 @@ describe('protect()', () => {
 
     const result = await secured();
 
+    // Ignored tool — fast-path allow with no approval channel touched
     expect(confirm).not.toHaveBeenCalled();
     expect(fn).toHaveBeenCalledTimes(1);
     expect(result).toBe('data');
   });
 
   it('preserves the original function return type', async () => {
-    const { confirm } = await import('@inquirer/prompts');
-    vi.mocked(confirm).mockResolvedValue(true);
+    setPersistentDecision('delete_record', 'allow');
 
     const fn = vi.fn().mockResolvedValue({ id: 1, name: 'test' });
     const secured = protect('delete_record', fn);

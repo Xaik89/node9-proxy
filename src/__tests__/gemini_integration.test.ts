@@ -1,4 +1,14 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+// 1. MUST be the very first lines of the file
+import { vi } from 'vitest';
+
+// 2. Add '.js' to the path and use 'mockResolvedValue' (since it's an async function now)
+vi.mock('../ui/native.js', () => ({
+  askNativePopup: vi.fn().mockResolvedValue('deny'),
+  sendDesktopNotification: vi.fn(),
+}));
+
+// 3. Now perform your regular imports
+import { describe, it, expect, beforeEach } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import { evaluatePolicy, authorizeHeadless, _resetConfigCache, DANGEROUS_WORDS } from '../core.js';
@@ -24,7 +34,7 @@ function mockConfig(config: MockConfig) {
   readSpy.mockImplementation((p) => {
     if (String(p) === globalPath) {
       return JSON.stringify({
-        settings: { mode: 'standard', ...config.settings },
+        settings: { mode: 'standard', approvers: { native: false }, ...config.settings },
         policy: {
           dangerousWords: DANGEROUS_WORDS, // Use defaults!
           ignoredTools: [],
@@ -54,26 +64,26 @@ describe('Gemini Integration Security', () => {
   it('identifies "Shell" (capital S) as a shell-executing tool', async () => {
     mockConfig({});
     const result = await evaluatePolicy('Shell', { command: 'rm -rf /' });
-    expect(result).toBe('review');
+    expect(result.decision).toBe('review');
   });
 
   it('identifies "run_shell_command" as a shell-executing tool', async () => {
     mockConfig({});
     const result = await evaluatePolicy('run_shell_command', { command: 'rm -rf /' });
-    expect(result).toBe('review');
+    expect(result.decision).toBe('review');
   });
 
   it('correctly parses complex shell commands inside run_shell_command', async () => {
     mockConfig({});
     const result = await evaluatePolicy('run_shell_command', { command: 'ls && rm -rf tmp' });
-    expect(result).toBe('review');
+    expect(result.decision).toBe('review');
   });
 
   it('blocks dangerous commands in Gemini hooks without API key', async () => {
     mockConfig({});
     const result = await authorizeHeadless('Shell', { command: 'rm -rf /' });
     expect(result.approved).toBe(false);
-    expect(result.reason).toContain('Node9 blocked "Shell"');
+    expect(result.noApprovalMechanism).toBe(true);
   });
 
   it('allows safe shell commands in Gemini hooks', async () => {
@@ -95,12 +105,35 @@ describe('Gemini Integration Security', () => {
     const dangerousResult = await evaluatePolicy('Database.query', {
       payload: { sql: 'DROP TABLE users;' },
     });
-    expect(dangerousResult).toBe('review');
+    expect(dangerousResult.decision).toBe('review');
 
     const safeResult = await evaluatePolicy('Database.query', {
       payload: { sql: 'SELECT * FROM users;' },
     });
-    expect(safeResult).toBe('allow');
+    expect(safeResult.decision).toBe('allow');
+  });
+});
+
+describe('Gemini BeforeTool payload format', () => {
+  it('evaluates tool policy from Gemini { name, args } format', async () => {
+    mockConfig({});
+    // Gemini sends { name, args } not { tool_name, tool_input }
+    const dangerous = await evaluatePolicy('Shell', { command: 'rm -rf /' });
+    expect(dangerous.decision).toBe('review');
+  });
+
+  it('blocks dangerous Gemini tool via name/args format', async () => {
+    mockConfig({});
+    const result = await authorizeHeadless('Shell', { command: 'rm -rf /' });
+    expect(result.approved).toBe(false);
+  });
+
+  it('allows safe Gemini read tool via name/args format', async () => {
+    mockConfig({
+      policy: { ignoredTools: ['read_*', 'ReadFile'] },
+    });
+    const result = await authorizeHeadless('ReadFile', { path: '/etc/hosts' });
+    expect(result.approved).toBe(true);
   });
 });
 

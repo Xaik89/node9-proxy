@@ -5,280 +5,132 @@
 [![NPM Version](https://img.shields.io/npm/v/@node9/proxy.svg)](https://www.npmjs.com/package/@node9/proxy)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
-**Node9** is the execution security layer for the Agentic Era. It acts as a deterministic "Sudo" proxy between AI Agents (Claude Code, Gemini CLI, Cursor, MCP Servers) and your production environment.
+**Node9** is the execution security layer for the Agentic Era. It encases autonomous AI Agents (Claude Code, Gemini CLI, Cursor, MCP Servers) in a deterministic security wrapper, intercepting dangerous shell commands and tool calls before they execute.
 
-While others try to _guess_ if a prompt is malicious (Semantic Security), Node9 _intercepts_ the actual action (Execution Security).
-
-## 🗺️ Architecture
-
-```mermaid
-sequenceDiagram
-    participant LLM as AI Model (Gemini/Claude)
-    participant Agent as Agent CLI (Gemini/Claude Code)
-    participant Node9 as Node9 Proxy
-    participant OS as Local System/Shell
-
-    LLM->>Agent: "Delete the tmp folder"
-    Agent->>Node9: Tool Call: Shell { command: "rm -rf ./tmp" }
-
-    Note over Node9: 🧠 Semantic Parser analyzes AST
-    Note over Node9: 🛡️ Policy Engine checks rules
-
-    alt is dangerous & not allowed
-        Node9-->>Agent: ❌ BLOCK: Decision denied
-        Agent-->>LLM: "Action blocked by security policy"
-    else is safe OR approved by user
-        Node9->>OS: Execute: rm -rf ./tmp
-        OS-->>Node9: Success
-        Node9-->>Agent: Tool Result: Success
-        Agent-->>LLM: "Folder deleted"
-    end
-```
+While others try to _guess_ if a prompt is malicious (Semantic Security), Node9 _governs_ the actual action (Execution Security).
 
 ---
 
-## 🛑 The Problem: Agent Liability
+## ⚡ Key Architectural Upgrades
 
-In 2026, AI agents have "Write Access" to everything (GitHub, AWS, Stripe, Databases).
+### 🏁 The Multi-Channel Race Engine
 
-- **The Risk:** An agent hallucinating a `DROP DATABASE` or an unauthorized `aws.delete_instance`.
-- **The Solution:** Node9 intercepts high-risk tool calls and pauses execution until a human provides a signature.
+Node9 initiates a **Concurrent Race** across all enabled channels. The first channel to receive a human signature wins and instantly cancels the others:
 
-## 🚀 Key Features
+- **Native Popup:** OS-level dialog (Mac/Win/Linux) for sub-second keyboard dismissal.
+- **Browser Dashboard:** Local web UI for deep inspection of large payloads (SQL/Code).
+- **Cloud (Slack):** Remote asynchronous approval for team governance.
+- **Terminal:** Classic `[Y/n]` prompt for manual proxy usage and SSH sessions.
 
-- **Deterministic "Sudo" Mode:** Intercepts dangerous tool calls based on hardcoded policies.
-- **Human-in-the-Loop (HITL):** Requires explicit approval via the **Terminal** (Local) or **Slack** (Cloud).
-- **One-Command Setup:** `node9 addto claude` wires up full protection in seconds — no manual config editing.
-- **MCP Native:** Deep-packet inspection of JSON-RPC traffic. Protects any Model Context Protocol server.
-- **Hook Native:** Plugs into Claude Code, Gemini CLI, and Cursor's native hook systems to intercept built-in tools (Bash, Write, Edit) — not just MCP calls.
-- **Global Config:** Store your security posture in a `node9.config.json` file in your project root.
+### 🧠 AI Negotiation Loop
+
+Node9 doesn't just "cut the wire." When a command is blocked, it injects a **Structured Negotiation Prompt** back into the AI’s context window. This teaches the AI why it was stopped and instructs it to pivot to a safer alternative or apologize to the human.
+
+### 🌊 The Resolution Waterfall
+
+Security posture is resolved using a strict 5-tier waterfall:
+
+1.  **Env Vars:** Session-level overrides (e.g., `NODE9_PAUSED=1`).
+2.  **Cloud (SaaS):** Global organization "Locks" that cannot be bypassed locally.
+3.  **Project Config:** Repository-specific rules (`node9.config.json`).
+4.  **Global Config:** Personal UI preferences (`~/.node9/config.json`).
+5.  **Defaults:** The built-in safety net.
 
 ---
 
-## 📦 Installation
+## 🚀 Quick Start
 
 ```bash
 npm install -g @node9/proxy
-```
 
----
-
-## ⚡ Quick Start
-
-The fastest way to get full protection is one command:
-
-```bash
-# Protect Claude Code (MCP servers + Bash/Write/Edit hooks)
+# 1. Setup protection for your favorite agent
 node9 addto claude
-
-# Protect Gemini CLI (BeforeTool / AfterTool hooks)
 node9 addto gemini
 
-# Protect Cursor
-node9 addto cursor
+# 2. (Optional) Connect to Slack for remote approvals
+node9 login <your_api_key>
+
+# 3. Check your status
+node9 status
 ```
-
-### 🎯 The Smart Runner
-
-You can now protect any command by simply prefixing it with `node9`:
-
-```bash
-# Intercepts 'rm -rf /' before starting
-node9 "rm -rf /"
-
-# Runs Gemini with full proxy & hook protection
-node9 gemini
-```
-
-_Note: Always wrap the target command in quotes to avoid argument conflicts._
-
-Node9 will show you exactly what it's about to change and ask for confirmation before touching any config file.
 
 ---
 
-## 🛠 Usage
+## 🛠 Protection Modes
 
-### 1. Connect to Node9 Cloud (Optional)
-
-To route approvals to **Slack** when you are away from your terminal, login once with your API key:
-
-```bash
-node9 login <your_api_key>
-```
-
-_Your credentials are stored securely in `~/.node9/credentials.json`._
-
-### 2. One-Command Agent Setup
-
-`node9 addto <target>` wires up Node9 to your AI agent automatically:
-
-| Target   | MCP Servers | Built-in Tools (Bash, Write, Edit...) | Audit Log |
-| -------- | :---------: | :-----------------------------------: | :-------: |
-| `claude` |     ✅      |       ✅ via `PreToolUse` hook        |    ✅     |
-| `gemini` |     ✅      |       ✅ via `BeforeTool` hook        |    ✅     |
-| `cursor` |     ✅      |       ✅ via `preToolUse` hook        |    ✅     |
-
-**What it does under the hood:**
-
-- Wraps your existing MCP servers with `node9 proxy` (asks for confirmation first)
-- Adds a pre-execution hook → `node9 check` runs before every tool call
-- Adds a post-execution hook → `node9 log` writes every executed action to `~/.node9/audit.log`
-
-### 3. Manual Command & MCP Protection
-
-To protect any command or MCP server manually:
-
-**Protecting the Gemini CLI:**
-
-```bash
-node9 gemini
-```
-
-**Protecting a direct command:**
-
-```bash
-node9 "rm -rf ./data"
-```
-
-**Protecting GitHub MCP Server:**
-
-```bash
-node9 "npx @modelcontextprotocol/server-github"
-```
-
-### 4. SDK — Protect Functions in Your Own Code
-
-Wrap any async function with `protect()` to require human approval before it runs:
-
-```typescript
-import { protect } from '@node9/proxy';
-
-const deleteDatabase = protect('aws.rds.delete_database', async (name: string) => {
-  // ... actual deletion logic
-});
-
-// Node9 intercepts this and prompts for approval before running
-await deleteDatabase('production-db-v1');
-```
+| Mode            | Target                 | How it works                                            |
+| :-------------- | :--------------------- | :------------------------------------------------------ |
+| **Hook Mode**   | Claude, Gemini, Cursor | `node9 addto <agent>` wires native pre-execution hooks. |
+| **Proxy Mode**  | MCP Servers, Shell     | `node9 "npx <server>"` intercepts JSON-RPC traffic.     |
+| **Manual Mode** | You                    | `node9 rm -rf /` protects you from your own typos.      |
 
 ---
 
 ## ⚙️ Configuration (`node9.config.json`)
 
-Add a `node9.config.json` to your project root or `~/.node9/config.json` for global use.
+Rules are **merged additive**—you cannot "un-danger" a word locally if it was defined as dangerous by a higher authority (like the Cloud).
 
 ```json
 {
   "settings": {
-    "mode": "standard"
+    "mode": "standard",
+    "enableUndo": true,
+    "approvers": {
+      "native": true,
+      "browser": true,
+      "cloud": true,
+      "terminal": true
+    }
   },
   "policy": {
-    "dangerousWords": ["delete", "drop", "terminate", "rm", "rmdir"],
+    "sandboxPaths": ["/tmp/**", "**/test-results/**"],
+    "dangerousWords": ["drop", "destroy", "purge", "push --force"],
     "ignoredTools": ["list_*", "get_*", "read_*"],
     "toolInspection": {
       "bash": "command",
-      "shell": "command",
-      "run_shell_command": "command"
-    },
-    "rules": [
-      {
-        "action": "rm",
-        "allowPaths": ["**/node_modules/**", "dist/**", "build/**"]
-      }
-    ]
-  },
-  "environments": {
-    "production": {
-      "requireApproval": true,
-      "slackChannel": "#alerts-prod-security"
-    },
-    "development": {
-      "requireApproval": false
+      "postgres:query": "sql"
     }
   }
 }
 ```
 
-**Modes:**
+---
 
-- `standard`: Allows everything except tools containing `dangerousWords`.
-- `strict`: Blocks **everything** except tools listed in `ignoredTools`.
+## ⏪ Phase 2: The "Undo" Engine (Coming Soon)
 
-**Environment overrides** (keyed by `NODE_ENV`):
-
-- `requireApproval: false` — auto-allow all actions in that environment (useful for local dev).
-- `slackChannel` — route cloud approvals to a specific Slack channel for that environment.
-
-### 🔌 Universal Tool Inspection (The "Universal Adapter")
-
-Node9 can protect **any** tool, even if it's not Claude or Gemini. You can tell Node9 where to find the "dangerous" payload in any tool call.
-
-Example: Protecting a custom "Stripe" MCP server:
-
-```json
-"toolInspection": {
-  "stripe.send_refund": "amount",
-  "github.delete*": "params.repo_name"
-}
-```
-
-Now, whenever your agent calls `stripe.send_refund`, Node9 will extract the `amount` and check it against your global security policy.
+Node9 is currently building **Shadow Git Snapshots**. When enabled, Node9 takes a silent, lightweight Git snapshot right before an AI agent is allowed to edit or delete files. If the AI hallucinates, you can revert the entire session with one click: `node9 undo`.
 
 ---
 
-## 🛡️ How it Works
+## 🔧 Troubleshooting
 
-Node9 is **deterministic**. It doesn't use AI to check AI.
+**`node9 check` exits immediately / Claude is never blocked**
+Node9 fails open by design to prevent breaking your agent. Check debug logs: `NODE9_DEBUG=1 claude`.
 
-### Hook Mode (via `node9 addto`)
+**Terminal prompt never appears during Claude/Gemini sessions**
+Interactive agents run hooks in a "Headless" subprocess. You **must** enable `native: true` or `browser: true` in your config to see approval prompts.
 
-```
-Claude wants to run Bash("rm -rf /data")
-          │
-    PreToolUse hook fires
-    → node9 check
-          │
-     ┌────┴─────┐
-     │ BLOCKED  │  → Claude is told the action was denied
-     └──────────┘
-          OR
-     ┌──────────┐
-     │ APPROVED │  → Claude runs the command
-     └──────────┘
-          │
-    PostToolUse hook fires
-    → node9 log  → appended to ~/.node9/audit.log
-```
-
-### Proxy Mode (via `node9 proxy`)
-
-```
-1. Intercept  — catches the JSON-RPC tools/call request mid-flight
-2. Evaluate   — checks against your local node9.config.json
-3. Suspend    — execution is frozen in a PENDING state
-4. Authorize  — Local: prompt in terminal / Cloud: button in Slack
-5. Release    — command forwarded to the target only after approval
-```
+**"Blocked by Organization (SaaS)"**
+A corporate policy has locked this action. You must click the "Approve" button in your company's Slack channel to proceed.
 
 ---
 
-## 📈 Roadmap
+## 🗺️ Roadmap
 
-- [x] Local Terminal "Sudo" (OSS)
-- [x] MCP JSON-RPC Interceptor
-- [x] Slack Remote Approvals (Pro)
-- [x] One-command setup (`node9 addto claude/gemini/cursor`)
-- [x] Hook-native integration (PreToolUse / BeforeTool / preToolUse)
-- [x] Audit log (`~/.node9/audit.log`)
-- [ ] **Multi-Admin Quorum** (Approve only if 2 admins click)
-- [ ] **SOC2 Tamper-proof Audit Logs** (Enterprise)
-
----
-
-## 🏢 Enterprise & Commercial Use
-
-The local proxy is free forever for individual developers. For teams requiring **Slack Integration**, **VPC Deployment**, and **Tamper-proof Audit Logs**, visit [node9.ai](https://node9.ai) or contact `support@node9.ai`.
+- [x] **Multi-Channel Race Engine** (Simultaneous Native/Browser/Cloud/Terminal)
+- [x] **AI Negotiation Loop** (Instructional feedback loop to guide LLM behavior)
+- [x] **Resolution Waterfall** (Cascading configuration: Env > Cloud > Project > Global)
+- [x] **Native OS Dialogs** (Sub-second approval via Mac/Win/Linux system windows)
+- [x] **One-command Agent Setup** (`node9 addto claude | gemini | cursor`)
+- [x] **Identity-Aware Execution** (Differentiates between Human vs. AI risk levels)
+- [ ] **Shadow Git Snapshots** (1-click Undo for AI hallucinations)
+- [ ] **Execution Sandboxing** (Simulate dangerous commands in a virtual FS before applying)
+- [ ] **Multi-Admin Quorum** (Require 2+ human signatures for high-stakes production actions)
+- [ ] **SOC2 Tamper-proof Audit Trail** (Cryptographically signed, cloud-managed logs)
 
 ---
 
-**Safe Agentic Automations Start with Node9.** 🛡️🚀
+## 🏢 Enterprise & Compliance
+
+Node9 Pro provides **Governance Locking**, **SAML/SSO**, and **VPC Deployment**.
+Visit [node9.ai](https://node9.ai
