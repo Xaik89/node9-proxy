@@ -114,8 +114,8 @@ function appendAuditModeEntry(toolName: string, args: unknown): void {
       ts: new Date().toISOString(),
       tool: toolName,
       args,
-      auditMode: true,
-      wouldHaveBlocked: true,
+      decision: 'would-have-blocked',
+      source: 'audit-mode',
     });
     const logPath = path.join(os.homedir(), '.node9', 'audit.log');
     const dir = path.dirname(logPath);
@@ -294,7 +294,6 @@ interface Config {
   settings: {
     mode: string;
     autoStartDaemon?: boolean;
-    agentMode?: boolean;
     enableUndo?: boolean;
     enableHookLogDebug?: boolean;
     approvers: { native: boolean; browser: boolean; cloud: boolean; terminal: boolean };
@@ -313,13 +312,12 @@ const DEFAULT_CONFIG: Config = {
   settings: {
     mode: 'standard',
     autoStartDaemon: true,
-    agentMode: false,
     enableUndo: false,
     enableHookLogDebug: false,
     approvers: { native: true, browser: true, cloud: true, terminal: true },
   },
   policy: {
-    sandboxPaths: ['/tmp/**'],
+    sandboxPaths: [],
     dangerousWords: DANGEROUS_WORDS,
     ignoredTools: [
       'list_*',
@@ -352,7 +350,6 @@ export function getGlobalSettings(): {
   mode: string;
   autoStartDaemon: boolean;
   slackEnabled: boolean;
-  agentMode: boolean;
   enableTrustSessions: boolean;
   allowGlobalPause: boolean;
 } {
@@ -368,9 +365,6 @@ export function getGlobalSettings(): {
         mode: (settings.mode as string) || 'standard',
         autoStartDaemon: settings.autoStartDaemon !== false,
         slackEnabled: settings.slackEnabled !== false,
-        // agentMode defaults to false — user must explicitly opt in via `node9 login`
-        //agentMode: settings.approvers.cloud === true,
-        agentMode: settings.agentMode === true,
         enableTrustSessions: settings.enableTrustSessions === true,
         allowGlobalPause: settings.allowGlobalPause !== false,
       };
@@ -380,7 +374,6 @@ export function getGlobalSettings(): {
     mode: 'standard',
     autoStartDaemon: true,
     slackEnabled: true,
-    agentMode: false,
     enableTrustSessions: false,
     allowGlobalPause: true,
   };
@@ -508,7 +501,8 @@ export async function evaluatePolicy(
   );
 
   if (isDangerous) {
-    const label = isManual ? 'Manual Nuclear Protection' : 'Merged Config (Dangerous Word)';
+    // Use "Project/Global Config" so E2E tests can verify hierarchy overrides
+    const label = isManual ? 'Manual Nuclear Protection' : 'Project/Global Config (Dangerous Word)';
     return { decision: 'review', blockedByLabel: label };
   }
 
@@ -694,11 +688,31 @@ export async function authorizeHeadless(
   const creds = getCredentials();
   const config = getConfig();
 
-  const isTestEnv = !!(process.env.VITEST || process.env.NODE_ENV === 'test' || process.env.CI);
+  // 1. Check if we are in any kind of test environment (Vitest, CI, or E2E)
+  const isTestEnv = !!(
+    process.env.VITEST ||
+    process.env.NODE_ENV === 'test' ||
+    process.env.CI ||
+    process.env.NODE9_TESTING === '1'
+  );
+
+  // Get the actual config from file/defaults
   const approvers = isTestEnv
-    ? { native: false, browser: false, cloud: false, terminal: false }
+    ? {
+        native: false,
+        browser: false,
+        cloud: config.settings.approvers?.cloud ?? true,
+        terminal: false,
+      }
     : config.settings.approvers || { native: true, browser: true, cloud: true, terminal: true };
 
+  // 2. THE TEST SILENCER: If we are in a test environment, hard-disable all physical UIs.
+  // We leave 'cloud' alone so your SaaS/Cloud tests can still manage it via mock configs!
+  if (process.env.VITEST || process.env.NODE_ENV === 'test' || process.env.NODE9_TESTING === '1') {
+    approvers.native = false;
+    approvers.browser = false;
+    approvers.terminal = false;
+  }
   const isManual = meta?.agent === 'Terminal';
 
   let explainableLabel = 'Local Config';
@@ -742,7 +756,7 @@ export async function authorizeHeadless(
   // ── THE HANDSHAKE (Phase 4.1: Remote Lock Check) ──────────────────────────
   let cloudRequestId: string | null = null;
   let isRemoteLocked = false;
-  const cloudEnforced = approvers.cloud && !!creds?.apiKey && hasSlack();
+  const cloudEnforced = approvers.cloud && !!creds?.apiKey;
 
   if (cloudEnforced) {
     try {
@@ -766,12 +780,41 @@ export async function authorizeHeadless(
       explainableLabel = 'Organization Policy (SaaS)';
     } catch (err: unknown) {
       const error = err as Error;
+      const isAuthError = error.message.includes('401') || error.message.includes('403');
+      const isNetworkError =
+        error.message.includes('fetch') ||
+        error.name === 'AbortError' ||
+        error.message.includes('ECONNREFUSED');
+
+      const reason = isAuthError
+        ? 'Invalid or missing API key. Run `node9 login` to generate a key (must start with n9_live_).'
+        : isNetworkError
+          ? 'Could not reach the Node9 cloud. Check your network or API URL.'
+          : error.message;
+
       console.error(
-        chalk.yellow(
-          `\n⚠️  Node9: Cloud API Handshake failed (${error.message}). Falling back to local rules...\n`
-        )
+        chalk.yellow(`\n⚠️  Node9: Cloud API Handshake failed — ${reason}`) +
+          chalk.dim(`\n   Falling back to local rules...\n`)
       );
     }
+  }
+
+  // ── TERMINAL STATUS ─────────────────────────────────────────────────────────
+  // Print before the race so the message is guaranteed to show regardless of
+  // which channel wins (cloud message was previously lost when native popup
+  // resolved first and aborted the race before pollNode9SaaS could print it).
+  if (cloudEnforced && cloudRequestId) {
+    console.error(
+      chalk.yellow('\n🛡️  Node9: Action suspended — waiting for Organization approval.')
+    );
+    console.error(chalk.cyan('   Dashboard  → ') + chalk.bold('Mission Control > Flows\n'));
+  } else if (!cloudEnforced) {
+    const cloudOffReason = !creds?.apiKey
+      ? 'no API key — run `node9 login` to connect'
+      : 'privacy mode (cloud disabled)';
+    console.error(
+      chalk.dim(`\n🛡️  Node9: intercepted "${toolName}" — cloud off (${cloudOffReason})\n`)
+    );
   }
 
   // ── THE MULTI-CHANNEL RACE ENGINE ──────────────────────────────────────────
@@ -940,9 +983,11 @@ export async function authorizeHeadless(
     return {
       approved: false,
       noApprovalMechanism: true,
-      reason: `Action blocked because no approval channels are available. (Native/Browser UI is disabled in config, and this terminal is non-interactive).`,
+      reason:
+        `NODE9 SECURITY INTERVENTION: Action blocked by automated policy [${explainableLabel}].\n` +
+        `REASON: Action blocked because no approval channels are available. (Native/Browser UI is disabled in config, and this terminal is non-interactive).`,
       blockedBy: 'no-approval-mechanism',
-      blockedByLabel: 'Security Posture Lockdown',
+      blockedByLabel: explainableLabel,
     };
   }
 
@@ -970,10 +1015,21 @@ export async function authorizeHeadless(
         if (
           err.name === 'AbortError' ||
           err.message?.includes('canceled') ||
-          err.message?.includes('Aborted') ||
-          err.message === 'Abandoned'
+          err.message?.includes('Aborted')
         )
           return;
+        // 'Abandoned' means the browser dashboard closed without deciding.
+        // Don't silently swallow it — that would leave the race promise hanging
+        // forever when the browser racer is the only channel.
+        if (err.message === 'Abandoned') {
+          finish({
+            approved: false,
+            reason: 'Browser dashboard closed without making a decision.',
+            blockedBy: 'local-decision',
+            blockedByLabel: 'Browser Dashboard (Abandoned)',
+          });
+          return;
+        }
         failures++;
         if (failures === total && !resolved) {
           finish({ approved: false, reason: 'All approval channels failed or disconnected.' });
@@ -1027,15 +1083,15 @@ export function getConfig(): Config {
 
     if (s.mode !== undefined) mergedSettings.mode = s.mode;
     if (s.autoStartDaemon !== undefined) mergedSettings.autoStartDaemon = s.autoStartDaemon;
-    if (s.agentMode !== undefined) mergedSettings.agentMode = s.agentMode;
     if (s.enableUndo !== undefined) mergedSettings.enableUndo = s.enableUndo;
     if (s.enableHookLogDebug !== undefined)
       mergedSettings.enableHookLogDebug = s.enableHookLogDebug;
     if (s.approvers) mergedSettings.approvers = { ...mergedSettings.approvers, ...s.approvers };
 
-    if (p.sandboxPaths) mergedPolicy.sandboxPaths.push(...p.sandboxPaths);
-    if (p.dangerousWords) mergedPolicy.dangerousWords.push(...p.dangerousWords);
-    if (p.ignoredTools) mergedPolicy.ignoredTools.push(...p.ignoredTools);
+    if (p.sandboxPaths) mergedPolicy.sandboxPaths = [...p.sandboxPaths];
+    if (p.dangerousWords) mergedPolicy.dangerousWords = [...p.dangerousWords];
+    if (p.ignoredTools) mergedPolicy.ignoredTools = [...p.ignoredTools];
+
     if (p.toolInspection)
       mergedPolicy.toolInspection = { ...mergedPolicy.toolInspection, ...p.toolInspection };
     if (p.rules) mergedPolicy.rules.push(...p.rules);
@@ -1180,9 +1236,6 @@ async function pollNode9SaaS(
   const statusUrl = `${creds.apiUrl}/status/${requestId}`;
   const POLL_INTERVAL_MS = 1000;
   const POLL_DEADLINE = Date.now() + 10 * 60 * 1000;
-
-  console.error(chalk.yellow('\n🛡️  Node9: Action suspended — waiting for Organization approval.'));
-  console.error(chalk.cyan('   Dashboard  → ') + chalk.bold('Mission Control > Flows'));
 
   while (Date.now() < POLL_DEADLINE) {
     if (signal.aborted) throw new Error('Aborted');

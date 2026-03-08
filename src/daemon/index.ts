@@ -4,7 +4,7 @@ import http from 'http';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { execSync } from 'child_process';
+import { spawn } from 'child_process';
 import { randomUUID } from 'crypto';
 import chalk from 'chalk';
 import { getGlobalSettings } from '../core';
@@ -18,10 +18,11 @@ const GLOBAL_CONFIG_FILE = path.join(homeDir, '.node9', 'config.json');
 const CREDENTIALS_FILE = path.join(homeDir, '.node9', 'credentials.json');
 
 interface AuditEntry {
-  toolName: string;
+  ts: string;
+  tool: string;
   args: unknown;
   decision: string;
-  timestamp: number;
+  source: string;
 }
 
 export const AUDIT_LOG_FILE = path.join(homeDir, '.node9', 'audit.log');
@@ -70,17 +71,18 @@ function redactArgs(value: unknown): unknown {
   return result;
 }
 
-function appendAuditLog(data: {
-  toolName: string;
-  args: unknown;
-  decision: string;
-  timestamp: number;
-}): void {
+function appendAuditLog(data: { toolName: string; args: unknown; decision: string }): void {
   try {
-    const entry = JSON.stringify({ ...data, args: redactArgs(data.args) }) + '\n';
+    const entry: AuditEntry = {
+      ts: new Date().toISOString(),
+      tool: data.toolName,
+      args: redactArgs(data.args),
+      decision: data.decision,
+      source: 'daemon',
+    };
     const dir = path.dirname(AUDIT_LOG_FILE);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    fs.appendFileSync(AUDIT_LOG_FILE, entry);
+    fs.appendFileSync(AUDIT_LOG_FILE, JSON.stringify(entry) + '\n');
   } catch {}
 }
 
@@ -147,6 +149,7 @@ const pending = new Map<string, PendingEntry>();
 const sseClients = new Set<http.ServerResponse>();
 let abandonTimer: ReturnType<typeof setTimeout> | null = null;
 let daemonServer: http.Server | null = null;
+let hadBrowserClient = false; // true once at least one SSE client has connected
 
 function abandonPending() {
   abandonTimer = null;
@@ -182,10 +185,13 @@ function broadcast(event: string, data: unknown) {
 
 function openBrowser(url: string) {
   try {
-    const opts = { stdio: 'ignore' as const };
-    if (process.platform === 'darwin') execSync(`open "${url}"`, opts);
-    else if (process.platform === 'win32') execSync(`cmd /c start "" "${url}"`, opts);
-    else execSync(`xdg-open "${url}"`, opts);
+    const args =
+      process.platform === 'darwin'
+        ? ['open', url]
+        : process.platform === 'win32'
+          ? ['cmd', '/c', 'start', '', url]
+          : ['xdg-open', url];
+    spawn(args[0], args.slice(1), { detached: true, stdio: 'ignore' }).unref();
   } catch {}
 }
 
@@ -259,6 +265,7 @@ export function startDaemon(): void {
         clearTimeout(abandonTimer);
         abandonTimer = null;
       }
+      hadBrowserClient = true;
       sseClients.add(res);
       res.write(
         `event: init\ndata: ${JSON.stringify({
@@ -279,7 +286,12 @@ export function startDaemon(): void {
       return req.on('close', () => {
         sseClients.delete(res);
         if (sseClients.size === 0 && pending.size > 0) {
-          abandonTimer = setTimeout(abandonPending, 2000);
+          // Give 10s if browser was already open (page reload / brief disconnect),
+          // 15s on cold-start (browser needs time to open and connect SSE).
+          // 2s was too short: auto-opened browsers often reconnect SSE mid-load,
+          // causing a disconnect+reconnect that exceeded the 2s window and
+          // abandoned the pending request before the user could see it.
+          abandonTimer = setTimeout(abandonPending, hadBrowserClient ? 10_000 : 15_000);
         }
       });
     }
@@ -309,7 +321,6 @@ export function startDaemon(): void {
                 toolName: e.toolName,
                 args: e.args,
                 decision: 'auto-deny',
-                timestamp: Date.now(),
               });
               if (e.waiter) e.waiter('deny');
               else e.earlyDecision = 'deny';
@@ -327,7 +338,10 @@ export function startDaemon(): void {
           agent: entry.agent,
           mcpServer: entry.mcpServer,
         });
-        if (sseClients.size === 0) openBrowser(`http://127.0.0.1:${DAEMON_PORT}/`);
+        // When auto-started, the CLI already called openBrowserLocal() before
+        // the request was registered, so the browser is already opening.
+        // Skip here to avoid opening a duplicate tab.
+        if (sseClients.size === 0 && !autoStarted) openBrowser(`http://127.0.0.1:${DAEMON_PORT}/`);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ id }));
       } catch {
@@ -370,7 +384,6 @@ export function startDaemon(): void {
             toolName: entry.toolName,
             args: entry.args,
             decision: `trust:${trustDuration}`,
-            timestamp: Date.now(),
           });
           clearTimeout(entry.timer);
           if (entry.waiter) entry.waiter('allow');
@@ -387,7 +400,6 @@ export function startDaemon(): void {
           toolName: entry.toolName,
           args: entry.args,
           decision: resolvedDecision,
-          timestamp: Date.now(),
         });
         clearTimeout(entry.timer);
         if (entry.waiter) entry.waiter(resolvedDecision);
@@ -416,7 +428,6 @@ export function startDaemon(): void {
         if (data.autoStartDaemon !== undefined)
           writeGlobalSetting('autoStartDaemon', data.autoStartDaemon);
         if (data.slackEnabled !== undefined) writeGlobalSetting('slackEnabled', data.slackEnabled);
-        if (data.agentMode !== undefined) writeGlobalSetting('agentMode', data.agentMode);
         if (data.enableTrustSessions !== undefined)
           writeGlobalSetting('enableTrustSessions', data.enableTrustSessions);
         if (data.enableUndo !== undefined) writeGlobalSetting('enableUndo', data.enableUndo);
@@ -481,7 +492,6 @@ export function startDaemon(): void {
           toolName: entry.toolName,
           args: entry.args,
           decision,
-          timestamp: Date.now(),
         });
         clearTimeout(entry.timer);
         if (entry.waiter) entry.waiter(decision);

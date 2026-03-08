@@ -57,11 +57,38 @@ export async function createShadowSnapshot(): Promise<string | null> {
 
 /**
  * Reverts the current directory to a specific Git commit hash.
+ * Also removes files that were created after the snapshot (git restore
+ * alone does not delete files that aren't in the source tree).
  */
 export function applyUndo(hash: string): boolean {
   try {
-    const res = spawnSync('git', ['restore', '--source', hash, '--staged', '--worktree', '.']);
-    return res.status === 0;
+    // 1. Restore all tracked files to snapshot state
+    const restore = spawnSync('git', [
+      'restore',
+      '--source',
+      hash,
+      '--staged',
+      '--worktree',
+      '.',
+    ]);
+    if (restore.status !== 0) return false;
+
+    // 2. Find files in the snapshot tree
+    const lsTree = spawnSync('git', ['ls-tree', '-r', '--name-only', hash]);
+    const snapshotFiles = new Set(
+      lsTree.stdout.toString().trim().split('\n').filter(Boolean)
+    );
+
+    // 3. Find currently tracked files that weren't in the snapshot → delete them
+    const lsCurrent = spawnSync('git', ['ls-files']);
+    const currentFiles = lsCurrent.stdout.toString().trim().split('\n').filter(Boolean);
+    for (const file of currentFiles) {
+      if (!snapshotFiles.has(file) && fs.existsSync(file)) {
+        fs.unlinkSync(file);
+      }
+    }
+
+    return true;
   } catch {
     return false;
   }

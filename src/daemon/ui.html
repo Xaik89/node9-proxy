@@ -604,12 +604,12 @@
           </div>
 
           <div class="panel">
-            <div class="panel-title">💬 Slack Approvals</div>
+            <div class="panel-title">💬 Cloud Approvals</div>
             <div class="setting-row">
               <div class="setting-text">
-                <div class="setting-label">Enable Slack</div>
+                <div class="setting-label">Enable Cloud</div>
                 <div class="setting-desc">
-                  Use Slack as the approval authority when a key is saved.
+                  Use Cloud/Slack as the approval authority when a key is saved.
                 </div>
               </div>
               <label class="toggle">
@@ -800,8 +800,10 @@
           autoDenyMs = data.autoDenyMs;
           if (orgName) {
             const b = document.getElementById('cloudBadge');
-            b.innerText = orgName;
-            b.classList.add('online');
+            if (b) {
+              b.innerText = orgName;
+              b.classList.add('online');
+            }
           }
           data.requests.forEach(addCard);
         });

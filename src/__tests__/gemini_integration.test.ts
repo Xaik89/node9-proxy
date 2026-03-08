@@ -1,15 +1,20 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+// 1. MUST be the very first lines of the file
+import { vi } from 'vitest';
+
+// 2. Add '.js' to the path and use 'mockResolvedValue' (since it's an async function now)
+vi.mock('../ui/native.js', () => ({
+  askNativePopup: vi.fn().mockResolvedValue('deny'),
+  sendDesktopNotification: vi.fn(),
+}));
+
+// 3. Now perform your regular imports
+import { describe, it, expect, beforeEach } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import { evaluatePolicy, authorizeHeadless, _resetConfigCache, DANGEROUS_WORDS } from '../core.js';
 import { setupGemini } from '../setup.js';
 
 vi.mock('@inquirer/prompts', () => ({ confirm: vi.fn() }));
-
-vi.mock('../ui/native', () => ({
-  askNativePopup: vi.fn().mockReturnValue('deny'),
-  sendDesktopNotification: vi.fn(),
-}));
 
 const existsSpy = vi.spyOn(fs, 'existsSync').mockReturnValue(false);
 const readSpy = vi.spyOn(fs, 'readFileSync');

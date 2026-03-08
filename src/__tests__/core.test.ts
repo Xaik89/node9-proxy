@@ -2,6 +2,35 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+
+// 1. Lock down the testing environment globally so it survives between tests.
+process.env.NODE9_TESTING = '1';
+process.env.VITEST = 'true';
+process.env.NODE_ENV = 'test';
+
+// 2. Mock Terminal prompts
+vi.mock('@inquirer/prompts', () => ({ confirm: vi.fn() }));
+
+// 3. Mock Native UI module
+vi.mock('../ui/native', () => ({
+  askNativePopup: vi.fn().mockResolvedValue('deny'),
+  sendDesktopNotification: vi.fn(),
+}));
+
+// 4. THE ULTIMATE KILL-SWITCH: Mock Node.js OS commands
+// If the real UI module accidentally loads, this physically prevents it from opening a window.
+vi.mock('child_process', () => ({
+  spawn: vi.fn().mockReturnValue({
+    unref: vi.fn(),
+    stdout: { on: vi.fn() },
+    on: vi.fn((event, cb) => {
+      // Instantly simulate the user clicking "Block" so the test moves on without a popup
+      if (event === 'close') cb(1);
+    }),
+  }),
+}));
+
+// 5. NOW we import core AFTER the mocks are registered!
 import {
   authorizeAction,
   evaluatePolicy,
@@ -10,13 +39,6 @@ import {
   getPersistentDecision,
   isDaemonRunning,
 } from '../core.js';
-
-vi.mock('@inquirer/prompts', () => ({ confirm: vi.fn() }));
-
-vi.mock('../ui/native', () => ({
-  askNativePopup: vi.fn().mockReturnValue('deny'),
-  sendDesktopNotification: vi.fn(),
-}));
 
 // Global spies
 const existsSpy = vi.spyOn(fs, 'existsSync');
@@ -70,13 +92,11 @@ beforeEach(() => {
   readSpy.mockReturnValue('');
   homeSpy.mockReturnValue('/mock/home');
   delete process.env.NODE9_API_KEY;
-  delete process.env.NODE_ENV;
   Object.defineProperty(process.stdout, 'isTTY', { value: false, configurable: true });
 });
 
 afterEach(() => {
   vi.clearAllMocks();
-  vi.unstubAllGlobals();
 });
 
 // ── Ignored tool patterns ─────────────────────────────────────────────────────
@@ -339,9 +359,9 @@ describe('authorizeHeadless', () => {
   });
 
   it('calls cloud API and returns approved:true on approval', async () => {
-    // agentMode must be true for cloud enforcement to activate; disable native so cloud wins
+    // approvers.cloud must be true for cloud enforcement to activate; disable native so cloud wins
     mockGlobalConfig({
-      settings: { agentMode: true, slackEnabled: true, approvers: { native: false } },
+      settings: { slackEnabled: true, approvers: { native: false, cloud: true } },
     });
     process.env.NODE9_API_KEY = 'test-key';
     vi.stubGlobal(
@@ -357,7 +377,7 @@ describe('authorizeHeadless', () => {
 
   it('returns approved:false when cloud API denies', async () => {
     mockGlobalConfig({
-      settings: { agentMode: true, slackEnabled: true, approvers: { native: false } },
+      settings: { slackEnabled: true, approvers: { native: false, cloud: true } },
     });
     process.env.NODE9_API_KEY = 'test-key';
     vi.stubGlobal(

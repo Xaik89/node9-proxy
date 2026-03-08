@@ -70,9 +70,28 @@ async function autoStartDaemonAndWait(): Promise<boolean> {
       env: { ...process.env, NODE9_AUTO_STARTED: '1' },
     });
     child.unref();
-    for (let i = 0; i < 12; i++) {
+    for (let i = 0; i < 20; i++) {
       await new Promise((r) => setTimeout(r, 250));
-      if (isDaemonRunning()) return true;
+      if (!isDaemonRunning()) continue;
+      // Verify the HTTP server is actually accepting connections, not just that
+      // the process is alive. isDaemonRunning() only checks the PID file, which
+      // could be stale (OS PID reuse) or written before the socket is fully ready.
+      try {
+        const res = await fetch('http://127.0.0.1:7391/settings', {
+          signal: AbortSignal.timeout(500),
+        });
+        if (res.ok) {
+          // Open the browser NOW — before the approval request is registered —
+          // so the browser has time to connect SSE. If we wait until POST /check,
+          // broadcast('add') fires with sseClients.size === 0 and the request
+          // depends on the async openBrowser() inside the daemon, which can lose
+          // the race with the browser's own page-load timing.
+          openBrowserLocal();
+          return true;
+        }
+      } catch {
+        // HTTP not ready yet — keep polling
+      }
     }
   } catch {}
   return false;
@@ -190,7 +209,15 @@ program
           config = JSON.parse(fs.readFileSync(configPath, 'utf-8')) as Record<string, unknown>;
       } catch {}
       if (!config.settings || typeof config.settings !== 'object') config.settings = {};
-      (config.settings as Record<string, unknown>).agentMode = !options.local;
+      const s = config.settings as Record<string, unknown>;
+      const approvers = (s.approvers as Record<string, unknown>) || {
+        native: true,
+        browser: true,
+        cloud: true,
+        terminal: true,
+      };
+      approvers.cloud = !options.local;
+      s.approvers = approvers;
       if (!fs.existsSync(path.dirname(configPath)))
         fs.mkdirSync(path.dirname(configPath), { recursive: true });
       fs.writeFileSync(configPath, JSON.stringify(config, null, 2), { mode: 0o600 });
@@ -240,7 +267,6 @@ program
       settings: {
         mode: 'standard',
         autoStartDaemon: true,
-        agentMode: false,
         enableUndo: true,
         enableHookLogDebug: false,
         approvers: { native: true, browser: true, cloud: true, terminal: true },
@@ -315,9 +341,9 @@ program
     console.log('');
 
     // ── Policy authority ────────────────────────────────────────────────────
-    if (creds && settings.agentMode) {
+    if (creds && settings.approvers.cloud) {
       console.log(chalk.green('  ● Agent mode') + chalk.gray(' — cloud team policy enforced'));
-    } else if (creds && !settings.agentMode) {
+    } else if (creds && !settings.approvers.cloud) {
       console.log(
         chalk.blue('  ● Privacy mode 🛡️') + chalk.gray(' — all decisions stay on this machine')
       );
@@ -547,6 +573,26 @@ program
 
         const meta = { agent, mcpServer };
 
+        // Snapshot BEFORE the tool runs (PreToolUse) so undo can restore to
+        // the state prior to this change. Snapshotting after (PostToolUse)
+        // captures the changed state, making undo a no-op.
+        const STATE_CHANGING_TOOLS_PRE = [
+          'bash',
+          'shell',
+          'write_file',
+          'edit_file',
+          'replace',
+          'terminal.execute',
+          'str_replace_based_edit_tool',
+          'create_file',
+        ];
+        if (
+          config.settings.enableUndo &&
+          STATE_CHANGING_TOOLS_PRE.includes(toolName.toLowerCase())
+        ) {
+          await createShadowSnapshot();
+        }
+
         // Pass to Headless authorization
         const result = await authorizeHeadless(toolName, toolInput, false, meta);
 
@@ -639,7 +685,9 @@ program
         const entry = {
           ts: new Date().toISOString(),
           tool: tool,
-          input: JSON.parse(redactSecrets(JSON.stringify(rawInput))),
+          args: JSON.parse(redactSecrets(JSON.stringify(rawInput))),
+          decision: 'allowed',
+          source: 'post-hook',
         };
 
         const logPath = path.join(os.homedir(), '.node9', 'audit.log');
