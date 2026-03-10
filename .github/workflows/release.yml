@@ -5,10 +5,10 @@ on:
     branches: [main]
 
 permissions:
-  contents: write       # create tags + commits
-  issues: write         # comment on issues
-  pull-requests: write  # comment on PRs
-  id-token: write       # npm provenance
+  contents: write # create tags + commits
+  issues: write # comment on issues
+  pull-requests: write # comment on PRs
+  id-token: write # npm provenance
 
 jobs:
   release:
@@ -17,7 +17,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0        # full history so semantic-release can walk commits
+          fetch-depth: 0 # full history so semantic-release can walk commits
           persist-credentials: false
 
       - uses: actions/setup-node@v4
