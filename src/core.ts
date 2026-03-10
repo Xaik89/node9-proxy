@@ -696,23 +696,20 @@ export async function authorizeHeadless(
     process.env.NODE9_TESTING === '1'
   );
 
-  // Get the actual config from file/defaults
-  const approvers = isTestEnv
-    ? {
-        native: false,
-        browser: false,
-        cloud: config.settings.approvers?.cloud ?? true,
-        terminal: false,
-      }
-    : config.settings.approvers || { native: true, browser: true, cloud: true, terminal: true };
+  // 2. Clone the config object!
+  // This prevents us from accidentally mutating the global config cache.
+  const approvers = {
+    ...(config.settings.approvers || { native: true, browser: true, cloud: true, terminal: true }),
+  };
 
-  // 2. THE TEST SILENCER: If we are in a test environment, hard-disable all physical UIs.
-  // We leave 'cloud' alone so your SaaS/Cloud tests can still manage it via mock configs!
-  if (process.env.VITEST || process.env.NODE_ENV === 'test' || process.env.NODE9_TESTING === '1') {
+  // 3. THE TEST SILENCER: Hard-disable all physical UIs in test/CI environments.
+  // We leave 'cloud' untouched so your SaaS/Cloud tests can still manage it via mock configs.
+  if (isTestEnv) {
     approvers.native = false;
     approvers.browser = false;
     approvers.terminal = false;
   }
+
   const isManual = meta?.agent === 'Terminal';
 
   let explainableLabel = 'Local Config';
@@ -733,14 +730,23 @@ export async function authorizeHeadless(
 
   // Fast Paths (Ignore, Trust, Policy Allow)
   if (!isIgnoredTool(toolName)) {
-    if (getActiveTrustSession(toolName)) return { approved: true, checkedBy: 'trust' };
+    if (getActiveTrustSession(toolName)) {
+      if (creds?.apiKey) auditLocalAllow(toolName, args, 'trust', creds, meta);
+      return { approved: true, checkedBy: 'trust' };
+    }
     const policyResult = await evaluatePolicy(toolName, args, meta?.agent);
-    if (policyResult.decision === 'allow') return { approved: true, checkedBy: 'local-policy' };
+    if (policyResult.decision === 'allow') {
+      if (creds?.apiKey) auditLocalAllow(toolName, args, 'local-policy', creds, meta);
+      return { approved: true, checkedBy: 'local-policy' };
+    }
 
     explainableLabel = policyResult.blockedByLabel || 'Local Config';
 
     const persistent = getPersistentDecision(toolName);
-    if (persistent === 'allow') return { approved: true, checkedBy: 'persistent' };
+    if (persistent === 'allow') {
+      if (creds?.apiKey) auditLocalAllow(toolName, args, 'persistent', creds, meta);
+      return { approved: true, checkedBy: 'persistent' };
+    }
     if (persistent === 'deny') {
       return {
         approved: false,
@@ -750,6 +756,7 @@ export async function authorizeHeadless(
       };
     }
   } else {
+    if (creds?.apiKey) auditLocalAllow(toolName, args, 'ignoredTools', creds, meta);
     return { approved: true };
   }
 
@@ -807,7 +814,7 @@ export async function authorizeHeadless(
     console.error(
       chalk.yellow('\n🛡️  Node9: Action suspended — waiting for Organization approval.')
     );
-    console.error(chalk.cyan('   Dashboard  → ') + chalk.bold('Mission Control > Flows\n'));
+    console.error(chalk.cyan('   Dashboard  → ') + chalk.bold('Mission Control > Activity Feed\n'));
   } else if (!cloudEnforced) {
     const cloudOffReason = !creds?.apiKey
       ? 'no API key — run `node9 login` to connect'
@@ -1006,6 +1013,7 @@ export async function authorizeHeadless(
             () => null
           );
         }
+
         resolve(res);
       }
     };
@@ -1037,6 +1045,15 @@ export async function authorizeHeadless(
       });
     }
   });
+
+  // If a LOCAL channel (native/browser/terminal) won while the cloud had a
+  // pending request open, report the decision back to the SaaS so Mission
+  // Control doesn't stay stuck on PENDING forever.
+  // We await this (not fire-and-forget) because the CLI process may exit
+  // immediately after this function returns, killing any in-flight fetch.
+  if (cloudRequestId && creds && finalResult.checkedBy !== 'cloud') {
+    await resolveNode9SaaS(cloudRequestId, creds, finalResult.approved);
+  }
 
   return finalResult;
 }
@@ -1088,9 +1105,9 @@ export function getConfig(): Config {
       mergedSettings.enableHookLogDebug = s.enableHookLogDebug;
     if (s.approvers) mergedSettings.approvers = { ...mergedSettings.approvers, ...s.approvers };
 
-    if (p.sandboxPaths) mergedPolicy.sandboxPaths = [...p.sandboxPaths];
+    if (p.sandboxPaths) mergedPolicy.sandboxPaths.push(...p.sandboxPaths);
     if (p.dangerousWords) mergedPolicy.dangerousWords = [...p.dangerousWords];
-    if (p.ignoredTools) mergedPolicy.ignoredTools = [...p.ignoredTools];
+    if (p.ignoredTools) mergedPolicy.ignoredTools.push(...p.ignoredTools);
 
     if (p.toolInspection)
       mergedPolicy.toolInspection = { ...mergedPolicy.toolInspection, ...p.toolInspection };
@@ -1170,6 +1187,39 @@ export interface CloudApprovalResult {
   approved: boolean;
   reason?: string;
   remoteApprovalOnly?: boolean;
+}
+
+/**
+ * Fire-and-forget: send an audit record to the backend for a locally fast-pathed call.
+ * Never blocks the agent — failures are silently ignored.
+ */
+function auditLocalAllow(
+  toolName: string,
+  args: unknown,
+  checkedBy: string,
+  creds: { apiKey: string; apiUrl: string },
+  meta?: { agent?: string; mcpServer?: string }
+): void {
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(), 5000);
+
+  fetch(`${creds.apiUrl}/audit`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${creds.apiKey}` },
+    body: JSON.stringify({
+      toolName,
+      args,
+      checkedBy,
+      context: {
+        agent: meta?.agent,
+        mcpServer: meta?.mcpServer,
+        hostname: os.hostname(),
+        cwd: process.cwd(),
+        platform: os.platform(),
+      },
+    }),
+    signal: controller.signal,
+  }).catch(() => {});
 }
 
 /**
@@ -1268,4 +1318,29 @@ async function pollNode9SaaS(
     }
   }
   return { approved: false, reason: 'Cloud approval timed out after 10 minutes.' };
+}
+
+/**
+ * Reports a locally-made decision (native/browser/terminal) back to the SaaS
+ * so the pending request doesn't stay stuck in Mission Control.
+ */
+async function resolveNode9SaaS(
+  requestId: string,
+  creds: { apiKey: string; apiUrl: string },
+  approved: boolean
+): Promise<void> {
+  try {
+    const resolveUrl = `${creds.apiUrl}/requests/${requestId}`;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 5000);
+    await fetch(resolveUrl, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${creds.apiKey}` },
+      body: JSON.stringify({ decision: approved ? 'APPROVED' : 'DENIED' }),
+      signal: ctrl.signal,
+    });
+    clearTimeout(timer);
+  } catch {
+    /* fire-and-forget — don't block the proxy on a network error */
+  }
 }
