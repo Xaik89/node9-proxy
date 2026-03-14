@@ -232,8 +232,7 @@ The `field` key supports dot-notation for nested args: `"params.query.sql"`.
 
 Use `node9 explain <tool> <args>` to dry-run any tool call and see exactly which smart rule (or other policy tier) would trigger.
 
-<<<<<<< Updated upstream
----
+## <<<<<<< Updated upstream
 
 ## 🖥️ CLI Reference
 
@@ -333,8 +332,7 @@ All checks passed ✅
 
 ### `node9 explain`
 
-=======
----
+## =======
 
 ## 🖥️ CLI Reference
 
@@ -375,8 +373,8 @@ All checks passed ✅
 
 ### `node9 explain`
 
->>>>>>> Stashed changes
-Dry-runs the policy engine and prints exactly which rule (or waterfall tier) would block or allow a given tool call — useful for debugging your config:
+> > > > > > > Stashed changes
+> > > > > > > Dry-runs the policy engine and prints exactly which rule (or waterfall tier) would block or allow a given tool call — useful for debugging your config:
 
 ```bash
 node9 explain bash '{"command":"rm -rf /tmp/build"}'
