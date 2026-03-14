@@ -16,7 +16,7 @@ While others try to _guess_ if a prompt is malicious (Semantic Security), Node9 
 **AIs are literal.** When you ask an agent to "Fix my disk space," it might decide to run `docker system prune -af`.
 
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/0e45e843-4cf7-408e-95ce-23fb09525ee4" width="100%">
+  <img src="https://github.com/user-attachments/assets/afae9caa-0605-4cac-929a-c14198383169" width="100%">
 </p>
 
 **With Node9, the interaction looks like this:**
@@ -232,6 +232,7 @@ The `field` key supports dot-notation for nested args: `"params.query.sql"`.
 
 Use `node9 explain <tool> <args>` to dry-run any tool call and see exactly which smart rule (or other policy tier) would trigger.
 
+<<<<<<< Updated upstream
 ---
 
 ## 🖥️ CLI Reference
@@ -332,6 +333,49 @@ All checks passed ✅
 
 ### `node9 explain`
 
+=======
+---
+
+## 🖥️ CLI Reference
+
+| Command                       | Description                                                                           |
+| :---------------------------- | :------------------------------------------------------------------------------------ |
+| `node9 setup`                 | Interactive menu — detects installed agents and wires hooks for you                   |
+| `node9 addto <agent>`         | Wire hooks for a specific agent (`claude`, `gemini`, `cursor`)                        |
+| `node9 init`                  | Create default `~/.node9/config.json`                                                 |
+| `node9 status`                | Show current protection status and active rules                                       |
+| `node9 doctor`                | Health check — verifies binaries, config, credentials, and all agent hooks            |
+| `node9 explain <tool> [args]` | Trace the policy waterfall for a given tool call (dry-run, no approval prompt)        |
+| `node9 undo [--steps N]`      | Revert the last N AI file edits using shadow Git snapshots                            |
+| `node9 check`                 | Called by agent hooks; evaluates a pending tool call and exits 0 (allow) or 1 (block) |
+
+### `node9 doctor`
+
+Runs a full self-test and exits 1 if any required check fails:
+
+```
+Node9 Doctor  v1.2.0
+────────────────────────────────────────
+Binaries
+  ✅  Node.js v20.11.0
+  ✅  git version 2.43.0
+
+Configuration
+  ✅  ~/.node9/config.json found and valid
+  ✅  ~/.node9/credentials.json — cloud credentials found
+
+Agent Hooks
+  ✅  Claude Code — PreToolUse hook active
+  ⚠️  Gemini CLI — not configured (optional)
+  ⚠️  Cursor — not configured (optional)
+
+────────────────────────────────────────
+All checks passed ✅
+```
+
+### `node9 explain`
+
+>>>>>>> Stashed changes
 Dry-runs the policy engine and prints exactly which rule (or waterfall tier) would block or allow a given tool call — useful for debugging your config:
 
 ```bash
