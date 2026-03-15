@@ -3,7 +3,7 @@
 ### The "Sudo" Command for AI Agents.
 
 [![NPM Version](https://img.shields.io/npm/v/@node9/proxy.svg)](https://www.npmjs.com/package/@node9/proxy)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
 **Node9** is the execution security layer for the Agentic Era. It encases autonomous AI Agents (Claude Code, Gemini CLI, Cursor, MCP Servers) in a deterministic security wrapper, intercepting dangerous shell commands and tool calls before they execute.
 
@@ -72,8 +72,6 @@ Example output:
 
 Revert to this snapshot? [y/N]
 ```
-
-Node9 keeps the last 10 snapshots. Snapshots are only taken for file-writing tools (`write_file`, `edit_file`, `str_replace_based_edit_tool`, `create_file`) — not for read-only or shell commands.
 
 Node9 keeps the last 10 snapshots. Snapshots are only taken for file-writing tools (`write_file`, `edit_file`, `str_replace_based_edit_tool`, `create_file`) — not for read-only or shell commands.
 
