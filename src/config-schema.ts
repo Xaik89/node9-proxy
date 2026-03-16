@@ -121,3 +121,44 @@ export function validateConfig(raw: unknown, filePath: string): string | null {
 
   return `Invalid config at ${filePath}:\n${lines.join('\n')}`;
 }
+
+/**
+ * Like validateConfig, but also returns a sanitized copy of the config with
+ * invalid fields removed. Top-level fields that fail validation are dropped so
+ * they cannot override valid values from a higher-priority config layer.
+ */
+export function sanitizeConfig(
+  raw: unknown
+): { sanitized: Record<string, unknown>; error: string | null } {
+  const result = ConfigFileSchema.safeParse(raw);
+  if (result.success) {
+    return { sanitized: result.data as Record<string, unknown>, error: null };
+  }
+
+  // Build the set of top-level keys that have at least one validation error
+  const invalidTopLevelKeys = new Set(
+    result.error.issues
+      .filter((issue) => issue.path.length > 0)
+      .map((issue) => String(issue.path[0]))
+  );
+
+  // Keep only the top-level keys that had no errors
+  const sanitized: Record<string, unknown> = {};
+  if (typeof raw === 'object' && raw !== null) {
+    for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+      if (!invalidTopLevelKeys.has(key)) {
+        sanitized[key] = value;
+      }
+    }
+  }
+
+  const lines = result.error.issues.map((issue) => {
+    const path = issue.path.length > 0 ? issue.path.join('.') : 'root';
+    return `  • ${path}: ${issue.message}`;
+  });
+
+  return {
+    sanitized,
+    error: `Invalid config:\n${lines.join('\n')}`,
+  };
+}

@@ -8,7 +8,7 @@ import pm from 'picomatch';
 import { parse } from 'sh-syntax';
 import { askNativePopup, sendDesktopNotification } from './ui/native';
 import { computeRiskMetadata, RiskMetadata } from './context-sniper';
-import { validateConfig } from './config-schema';
+import { sanitizeConfig } from './config-schema';
 
 // ── Feature file paths ────────────────────────────────────────────────────────
 const PAUSED_FILE = path.join(os.homedir(), '.node9', 'PAUSED');
@@ -2019,13 +2019,13 @@ function tryLoadConfig(filePath: string): Record<string, unknown> | null {
     );
     return null;
   }
-  const error = validateConfig(raw, filePath);
+  const { sanitized, error } = sanitizeConfig(raw);
   if (error) {
     process.stderr.write(
-      `\n⚠️  Node9: ${error}\n   → Invalid fields ignored, using defaults for those keys\n\n`
+      `\n⚠️  Node9: Invalid config at ${filePath}:\n${error.replace('Invalid config:\n', '')}\n   → Invalid fields ignored, using defaults for those keys\n\n`
     );
   }
-  return raw as Record<string, unknown>;
+  return sanitized;
 }
 
 function getActiveEnvironment(config: Config): EnvironmentConfig | null {
