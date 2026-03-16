@@ -33,6 +33,11 @@ interface RunResult {
  * Synchronous runner — safe only when no in-process mock server is involved,
  * because spawnSync blocks the event loop (preventing the mock server from
  * responding to requests from the child process).
+ *
+ * cwd defaults to os.tmpdir() (not the project root) so the subprocess never
+ * picks up the repo's own node9.config.json and inherits only the HOME config
+ * written by makeTempHome(). Pass tmpHome explicitly to keep both HOME and cwd
+ * consistent.
  */
 function runCheck(
   payload: object,
@@ -43,7 +48,7 @@ function runCheck(
   const result = spawnSync(process.execPath, [CLI, 'check', JSON.stringify(payload)], {
     encoding: 'utf-8',
     timeout: timeoutMs,
-    cwd, // isolates from project's node9.config.json
+    cwd, // avoid loading the repo's own node9.config.json
     env: {
       ...process.env,
       NODE9_NO_AUTO_DAEMON: '1',
@@ -170,6 +175,19 @@ describe('ignored tools fast-path', () => {
     );
     expect(r.status).toBe(0);
     expect(r.stdout).toBe('');
+  });
+
+  it('task* wildcard — task_drop_all_tables is fast-pathed to allow', () => {
+    // "task*" is in ignoredTools; a tool name that looks dangerous but matches
+    // the pattern must still be silently allowed (the pattern is opt-in by the user)
+    const r = runCheck(
+      { tool_name: 'task_drop_all_tables', tool_input: {} },
+      { HOME: tmpHome },
+      tmpHome
+    );
+    expect(r.status).toBe(0);
+    expect(r.stdout).toBe(''); // no block JSON
+    expect(r.stderr).not.toContain('blocked');
   });
 });
 
@@ -413,6 +431,9 @@ describe('audit mode + cloud gating', () => {
   });
 
   it('audit mode + cloud:true + API key → POSTs to /audit endpoint', async () => {
+    // auditLocalAllow is awaited in core.ts before process.exit(0), so by the
+    // time runCheckAsync resolves (process closed) the POST is already complete.
+    // No sleep needed — if it races here, it's a production bug too.
     const r = await runCheckAsync(
       { tool_name: 'bash', tool_input: { command: 'mkfs.ext4 /dev/sda' } },
       { HOME: tmpHome },
@@ -420,8 +441,6 @@ describe('audit mode + cloud gating', () => {
     );
     expect(r.status).toBe(0);
     expect(r.stderr).toContain('[audit]');
-    // Give the server a moment to register the call (auditLocalAllow is awaited)
-    await new Promise((res) => setTimeout(res, 200));
     expect(auditCalls.length).toBeGreaterThan(0);
   });
 
@@ -446,7 +465,6 @@ describe('audit mode + cloud gating', () => {
     );
     expect(r.status).toBe(0);
     expect(r.stderr).toContain('[audit]');
-    await new Promise((res) => setTimeout(res, 200));
     expect(auditCalls.length).toBe(0);
   });
 });
