@@ -31,9 +31,7 @@ async function runReview() {
     }
 
     const truncated = wasTruncated(prDiff);
-    const diffContent = truncated
-      ? prDiff.slice(0, MAX_DIFF_CHARS)
-      : prDiff;
+    const diffContent = truncated ? prDiff.slice(0, MAX_DIFF_CHARS) : prDiff;
 
     const prompt = `You are a senior TypeScript/Node.js engineer reviewing a pull request for Node9 Proxy.
 Node9 Proxy is an execution security layer for AI agents — it intercepts tool calls from Claude Code, Gemini CLI, Cursor, and MCP servers, and asks for human approval before running them.

@@ -10,8 +10,8 @@ on:
       - 'scripts/ai-review.mjs'
 
 permissions:
-  contents: read        # needed for checkout
-  pull-requests: write  # needed to post PR comments
+  contents: read # needed for checkout
+  pull-requests: write # needed to post PR comments
 
 jobs:
   review:
