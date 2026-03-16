@@ -26,12 +26,14 @@ jobs:
           fetch-depth: 0
 
       - name: Install dependencies
-        # Pinned to exact versions to prevent supply-chain drift
-        run: npm install @anthropic-ai/sdk@0.78.0 @octokit/rest@22.0.1
+        # Pinned to exact versions; --ignore-scripts blocks malicious postinstall hooks
+        run: npm install --ignore-scripts @anthropic-ai/sdk@0.78.0 @octokit/rest@22.0.1
 
       - name: Run AI Review
         env:
-          GITHUB_TOKEN: ${{ secrets.AUTO_PR_TOKEN }}
+          # GITHUB_TOKEN is sufficient — permissions block above scopes it correctly.
+          # No need for a broad PAT (AUTO_PR_TOKEN).
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: node scripts/ai-review.mjs
