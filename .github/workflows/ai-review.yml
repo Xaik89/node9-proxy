@@ -26,8 +26,8 @@ jobs:
           fetch-depth: 0
 
       - name: Install dependencies
-        # Pinned to exact versions; --ignore-scripts blocks malicious postinstall hooks
-        run: npm install --ignore-scripts @anthropic-ai/sdk@0.78.0 @octokit/rest@22.0.1
+        # npm ci uses the committed package-lock.json — transitive deps are fully pinned
+        run: npm ci --ignore-scripts
 
       - name: Run AI Review
         env:
