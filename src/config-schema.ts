@@ -127,9 +127,10 @@ export function validateConfig(raw: unknown, filePath: string): string | null {
  * invalid fields removed. Top-level fields that fail validation are dropped so
  * they cannot override valid values from a higher-priority config layer.
  */
-export function sanitizeConfig(
-  raw: unknown
-): { sanitized: Record<string, unknown>; error: string | null } {
+export function sanitizeConfig(raw: unknown): {
+  sanitized: Record<string, unknown>;
+  error: string | null;
+} {
   const result = ConfigFileSchema.safeParse(raw);
   if (result.success) {
     return { sanitized: result.data as Record<string, unknown>, error: null };
