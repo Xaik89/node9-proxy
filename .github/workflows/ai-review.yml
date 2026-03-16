@@ -4,20 +4,30 @@ on:
   pull_request:
     branches: [main]
     paths-ignore:
+      # Intentionally excluded: changes to the review script itself are not
+      # self-reviewed to prevent prompt injection via modified review logic.
       - '.github/workflows/ai-review.yml'
       - 'scripts/ai-review.mjs'
+
+permissions:
+  contents: read        # needed for checkout
+  pull-requests: write  # needed to post PR comments
 
 jobs:
   review:
     name: Claude Code Review
     runs-on: ubuntu-latest
-    if: github.actor != 'github-actions[bot]'
+    # Skip if the PR was opened by the bot or Dependabot
+    if: github.actor != 'github-actions[bot]' && github.actor != 'dependabot[bot]'
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install dependencies
-        run: npm install @anthropic-ai/sdk @octokit/rest
+        # Pinned to exact versions to prevent supply-chain drift
+        run: npm install @anthropic-ai/sdk@0.78.0 @octokit/rest@22.0.1
 
       - name: Run AI Review
         env:
