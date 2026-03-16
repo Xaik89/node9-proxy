@@ -1476,6 +1476,14 @@ export async function authorizeHeadless(
       const initResult = await initNode9SaaS(toolName, args, creds!, meta, riskMetadata);
 
       if (!initResult.pending) {
+        // Shadow mode: allowed through, but warn the developer passively
+        if (initResult.shadowMode) {
+          console.error(chalk.yellow(`\n⚠️  Node9 Shadow Mode: Action allowed, but would have been blocked by company policy.`));
+          if (initResult.shadowReason) {
+            console.error(chalk.dim(`   Reason: ${initResult.shadowReason}\n`));
+          }
+          return { approved: true, checkedBy: 'cloud' };
+        }
         return {
           approved: !!initResult.approved,
           reason:
@@ -1994,6 +2002,8 @@ async function initNode9SaaS(
   approved?: boolean;
   reason?: string;
   remoteApprovalOnly?: boolean;
+  shadowMode?: boolean;
+  shadowReason?: string;
 }> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 10000);
@@ -2026,6 +2036,8 @@ async function initNode9SaaS(
       approved?: boolean;
       reason?: string;
       remoteApprovalOnly?: boolean;
+      shadowMode?: boolean;
+      shadowReason?: string;
     };
   } finally {
     clearTimeout(timeout);
