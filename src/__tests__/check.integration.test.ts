@@ -9,6 +9,8 @@
  * Requirements:
  *   - `npm run build` must be run before these tests (the suite checks for dist/cli.js)
  *   - Tests set NODE9_NO_AUTO_DAEMON=1 to prevent daemon auto-start side effects
+ *   - Tests set NODE9_TESTING=1 to disable interactive approval UI (terminal/browser/native
+ *     racers return early so tests complete without waiting for human input)
  *   - Tests set HOME to a tmp directory per test group to isolate config state
  */
 
@@ -40,12 +42,13 @@ interface RunResult {
  * consistent.
  */
 function runCheck(
-  payload: object,
+  payload: object | string,
   env: Record<string, string> = {},
   cwd = os.tmpdir(),
   timeoutMs = 8000
 ): RunResult {
-  const result = spawnSync(process.execPath, [CLI, 'check', JSON.stringify(payload)], {
+  const payloadArg = typeof payload === 'string' ? payload : JSON.stringify(payload);
+  const result = spawnSync(process.execPath, [CLI, 'check', payloadArg], {
     encoding: 'utf-8',
     timeout: timeoutMs,
     cwd, // avoid loading the repo's own node9.config.json
@@ -67,15 +70,28 @@ function runCheck(
  * Async runner using spawn — required when the test hosts a mock HTTP server
  * in the same process, since spawnSync would block the event loop and prevent
  * the server from handling requests from the child.
+ *
+ * Accepts either an object (serialized to JSON) or a raw string (passed as-is),
+ * allowing tests to exercise the CLI's JSON-parse error path.
  */
 function runCheckAsync(
-  payload: object,
+  payload: object | string,
   env: Record<string, string> = {},
   cwd = os.tmpdir(),
   timeoutMs = 8000
 ): Promise<RunResult> {
+  const payloadArg = typeof payload === 'string' ? payload : JSON.stringify(payload);
   return new Promise((resolve) => {
-    const child = spawn(process.execPath, [CLI, 'check', JSON.stringify(payload)], {
+    // Guard against double-resolve: child.on('close') fires even after child.kill()
+    let resolved = false;
+    const settle = (result: RunResult) => {
+      if (!resolved) {
+        resolved = true;
+        resolve(result);
+      }
+    };
+
+    const child = spawn(process.execPath, [CLI, 'check', payloadArg], {
       cwd,
       env: {
         ...process.env,
@@ -92,12 +108,12 @@ function runCheckAsync(
 
     const timer = setTimeout(() => {
       child.kill();
-      resolve({ status: null, stdout, stderr });
+      settle({ status: null, stdout, stderr });
     }, timeoutMs);
 
     child.on('close', (code) => {
       clearTimeout(timer);
-      resolve({ status: code, stdout, stderr });
+      settle({ status: code, stdout, stderr });
     });
   });
 }
@@ -187,6 +203,22 @@ describe('ignored tools fast-path', () => {
     );
     expect(r.status).toBe(0);
     expect(r.stdout).toBe(''); // no block JSON
+    expect(r.stderr).not.toContain('blocked');
+  });
+
+  it('task* wildcard + dangerous word in input → ignoredTools wins (silently allowed)', () => {
+    // Security note: ignoredTools is an explicit opt-in by the operator. When a tool
+    // matches an ignoredTools pattern, it is fast-pathed BEFORE dangerousWords are
+    // evaluated. This is intentional — ignoredTools means "trust this tool completely".
+    // Operators should not add write-capable or destructive tools to ignoredTools unless
+    // they are certain those tools are safe. The test below documents this precedence.
+    const r = runCheck(
+      { tool_name: 'task_execute', tool_input: { query: 'mkfs.ext4 /dev/sda' } },
+      { HOME: tmpHome },
+      tmpHome
+    );
+    expect(r.status).toBe(0);
+    expect(r.stdout).toBe(''); // no block JSON — ignoredTools took precedence
     expect(r.stderr).not.toContain('blocked');
   });
 });
@@ -425,9 +457,9 @@ describe('audit mode + cloud gating', () => {
     );
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     cleanupHome(tmpHome);
-    mockServer.close();
+    await new Promise<void>((resolve) => mockServer.close(() => resolve()));
   });
 
   it('audit mode + cloud:true + API key → POSTs to /audit endpoint', async () => {
@@ -614,9 +646,9 @@ describe('cloud race engine', () => {
     });
   }
 
-  afterEach(() => {
+  afterEach(async () => {
     cleanupHome(tmpHome);
-    mockServer?.close();
+    if (mockServer) await new Promise<void>((resolve) => mockServer.close(() => resolve()));
   });
 
   it('cloud approves → allowed with checkedBy:cloud', async () => {
@@ -673,7 +705,42 @@ describe('cloud race engine', () => {
       10000
     );
     expect(r.status).toBe(0);
-    const parsed = JSON.parse(r.stdout.trim());
-    expect(parsed.decision).toBe('block');
+    const denied = JSON.parse(r.stdout.trim());
+    expect(denied.decision).toBe('block');
+  });
+});
+
+// ── 10. Malformed payload to `node9 check` ───────────────────────────────────
+
+describe('malformed JSON payload', () => {
+  // The CLI argument is a trust boundary: any process can call `node9 check <arg>`.
+  // The CLI must handle malformed payloads gracefully (no crash, no silent allow).
+
+  it('non-JSON string → exits with non-zero or outputs block/error', () => {
+    const r = runCheck('not-valid-json', {}, os.tmpdir());
+    // Must NOT silently exit 0 with empty stdout (which would mean "allow").
+    const blockedViaJson =
+      r.stdout.trim() !== '' &&
+      (() => {
+        try {
+          return JSON.parse(r.stdout.trim()).decision === 'block';
+        } catch {
+          return false;
+        }
+      })();
+    const hasError = /invalid|error|parse|unexpected/i.test(r.stderr);
+    expect(r.status !== 0 || blockedViaJson || hasError).toBe(true);
+  });
+
+  it('empty string payload → handled gracefully (no crash)', () => {
+    const r = runCheck('', {}, os.tmpdir());
+    // Must not throw an unhandled exception (which would print a stack trace)
+    expect(r.stderr).not.toContain('TypeError');
+    expect(r.stderr).not.toContain('at Object.<anonymous>');
+  });
+
+  it('partial JSON object → handled gracefully (no crash)', () => {
+    const r = runCheck('{"tool_name":"bash"', {}, os.tmpdir());
+    expect(r.stderr).not.toContain('TypeError');
   });
 });
