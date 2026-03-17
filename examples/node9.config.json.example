@@ -14,13 +14,27 @@
     "dangerousWords": ["mkfs", "shred"],
 
     "ignoredTools": [
-      "list_*", "get_*", "read_*", "describe_*",
-      "read", "glob", "grep", "ls", "notebookread",
-      "webfetch", "websearch",
-      "exitplanmode", "enterplanmode",
-      "enterworktree", "exitworktree",
-      "askuserquestion", "agent", "task*",
-      "toolsearch", "mcp__ide__*", "getDiagnostics"
+      "list_*",
+      "get_*",
+      "read_*",
+      "describe_*",
+      "read",
+      "glob",
+      "grep",
+      "ls",
+      "notebookread",
+      "webfetch",
+      "websearch",
+      "exitplanmode",
+      "enterplanmode",
+      "enterworktree",
+      "exitworktree",
+      "askuserquestion",
+      "agent",
+      "task*",
+      "toolsearch",
+      "mcp__ide__*",
+      "getDiagnostics"
     ],
 
     "toolInspection": {
@@ -84,9 +98,24 @@
     ],
 
     "snapshot": {
-      "tools": ["str_replace_based_edit_tool", "write_file", "edit_file", "create_file", "edit", "replace", "write"],
+      "tools": [
+        "str_replace_based_edit_tool",
+        "write_file",
+        "edit_file",
+        "create_file",
+        "edit",
+        "replace",
+        "write"
+      ],
       "onlyPaths": [],
-      "ignorePaths": ["**/node_modules/**", "dist/**", "build/**", ".next/**", "**/*.log", "**/tmp/**"]
+      "ignorePaths": [
+        "**/node_modules/**",
+        "dist/**",
+        "build/**",
+        ".next/**",
+        "**/*.log",
+        "**/tmp/**"
+      ]
     }
   }
 }
