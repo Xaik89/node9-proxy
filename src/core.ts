@@ -588,7 +588,7 @@ export const DEFAULT_CONFIG: Config = {
       {
         name: 'review-git-push',
         tool: 'bash',
-        conditions: [{ field: 'command', op: 'matches', value: '^\\s*git push\\b', flags: 'i' }],
+        conditions: [{ field: 'command', op: 'matches', value: '^\\s*git\\s+push\\b', flags: 'i' }],
         conditionMode: 'all',
         verdict: 'review',
         reason: 'git push sends changes to a shared remote',
@@ -1954,6 +1954,7 @@ export function getConfig(): Config {
       ignorePaths: [...DEFAULT_CONFIG.policy.snapshot.ignorePaths],
     },
   };
+  const mergedEnvironments: Record<string, EnvironmentConfig> = { ...DEFAULT_CONFIG.environments };
 
   const applyLayer = (source: Record<string, unknown> | null) => {
     if (!source) return;
@@ -1984,6 +1985,20 @@ export function getConfig(): Config {
       if (s.onlyPaths) mergedPolicy.snapshot.onlyPaths.push(...s.onlyPaths);
       if (s.ignorePaths) mergedPolicy.snapshot.ignorePaths.push(...s.ignorePaths);
     }
+
+    const envs = (source.environments || {}) as Record<string, unknown>;
+    for (const [envName, envConfig] of Object.entries(envs)) {
+      if (envConfig && typeof envConfig === 'object') {
+        const ec = envConfig as Record<string, unknown>;
+        mergedEnvironments[envName] = {
+          ...mergedEnvironments[envName],
+          // Validate field types before merging — do not blindly spread user input
+          ...(typeof ec.requireApproval === 'boolean'
+            ? { requireApproval: ec.requireApproval }
+            : {}),
+        };
+      }
+    }
   };
 
   applyLayer(globalConfig);
@@ -2001,7 +2016,7 @@ export function getConfig(): Config {
   cachedConfig = {
     settings: mergedSettings,
     policy: mergedPolicy,
-    environments: {},
+    environments: mergedEnvironments,
   };
 
   return cachedConfig;
@@ -2019,6 +2034,24 @@ function tryLoadConfig(filePath: string): Record<string, unknown> | null {
     );
     return null;
   }
+  const SUPPORTED_VERSION = '1.0';
+  const SUPPORTED_MAJOR = SUPPORTED_VERSION.split('.')[0];
+  const fileVersion = (raw as Record<string, unknown>)?.version;
+  if (fileVersion !== undefined) {
+    const vStr = String(fileVersion);
+    const fileMajor = vStr.split('.')[0];
+    if (fileMajor !== SUPPORTED_MAJOR) {
+      process.stderr.write(
+        `\n❌  Node9: Config at ${filePath} has version "${vStr}" — major version is incompatible with this release (expected "${SUPPORTED_VERSION}"). Config will not be loaded.\n\n`
+      );
+      return null;
+    } else if (vStr !== SUPPORTED_VERSION) {
+      process.stderr.write(
+        `\n⚠️  Node9: Config at ${filePath} declares version "${vStr}" — expected "${SUPPORTED_VERSION}". Continuing with best-effort parsing.\n\n`
+      );
+    }
+  }
+
   const { sanitized, error } = sanitizeConfig(raw);
   if (error) {
     process.stderr.write(
