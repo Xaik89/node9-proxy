@@ -2,6 +2,7 @@ import type { SmartRule } from './core';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import crypto from 'crypto';
 
 export interface ShieldDefinition {
   name: string;
@@ -169,7 +170,9 @@ export const SHIELDS: Record<string, ShieldDefinition> = {
           {
             field: 'command',
             // Covers: rm -rf, rm --recursive --force, rm -fr, and home paths including
-            // ~, $HOME, /home/*, /root. Does not rely on whitespace before path.
+            // ~, $HOME, /home/*, /root.
+            // Known bypass vectors not covered: unlink, find -delete, python/node file ops.
+            // This rule is a best-effort heuristic, not a comprehensive sandbox.
             op: 'matches',
             value:
               'rm\\b.*(--recursive|--force|-[a-z]*r[a-z]*|-[a-z]*f[a-z]*).*(-[a-z]*f[a-z]*|-[a-z]*r[a-z]*|--force|--recursive).*(~|\\$HOME|\\/home\\/|\\/root\\/|\\/root$)',
@@ -194,7 +197,7 @@ export const SHIELDS: Record<string, ShieldDefinition> = {
         conditions: [
           {
             field: 'command',
-            // Match /etc/ anywhere in the command, not just after whitespace
+            // Matches /etc/ anywhere in the command string
             op: 'matches',
             value: '\\/etc\\/',
           },
@@ -203,7 +206,9 @@ export const SHIELDS: Record<string, ShieldDefinition> = {
         reason: 'Writing to /etc requires human approval (filesystem shield)',
       },
     ],
-    dangerousWords: ['dd', 'wipefs', 'mkfs'],
+    // dd removed: too common as a legitimate tool (disk imaging, file ops).
+    // wipefs and mkfs are retained as they are rarely legitimate in an agent context.
+    dangerousWords: ['wipefs', 'mkfs'],
   },
 };
 
@@ -237,8 +242,10 @@ export function readActiveShields(): string[] {
         active?: unknown;
       };
       if (Array.isArray(parsed.active)) {
-        // Validate each element is a non-empty string
-        return parsed.active.filter((e): e is string => typeof e === 'string' && e.length > 0);
+        // Validate each element is a non-empty string that refers to a known shield
+        return parsed.active.filter(
+          (e): e is string => typeof e === 'string' && e.length > 0 && e in SHIELDS
+        );
       }
     }
   } catch {}
@@ -248,7 +255,8 @@ export function readActiveShields(): string[] {
 export function writeActiveShields(active: string[]): void {
   const dir = path.dirname(SHIELDS_STATE_FILE);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  const tmp = `${SHIELDS_STATE_FILE}.${process.pid}.tmp`;
+  // Use random suffix to avoid pid collision on concurrent invocations
+  const tmp = `${SHIELDS_STATE_FILE}.${crypto.randomBytes(6).toString('hex')}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify({ active }, null, 2));
   fs.renameSync(tmp, SHIELDS_STATE_FILE);
 }

@@ -24,6 +24,7 @@ import readline from 'readline';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import crypto from 'crypto';
 import { createShadowSnapshot, applyUndo, getSnapshotHistory, computeUndoDiff } from './undo';
 import {
   getShield,
@@ -1421,14 +1422,23 @@ function readRawConfig(): Record<string, unknown> {
     if (fs.existsSync(SHIELD_CONFIG_PATH)) {
       return JSON.parse(fs.readFileSync(SHIELD_CONFIG_PATH, 'utf-8')) as Record<string, unknown>;
     }
-  } catch {}
+  } catch (err) {
+    // Log to stderr so the user knows their config was unreadable — do not silently overwrite
+    console.error(
+      chalk.yellow(
+        `⚠️  Could not read ${SHIELD_CONFIG_PATH}: ${err instanceof Error ? err.message : String(err)}`
+      )
+    );
+    console.error(chalk.yellow('   Shield rules will be added to a fresh config object.\n'));
+  }
   return {};
 }
 
 function writeRawConfig(config: Record<string, unknown>): void {
   const dir = path.dirname(SHIELD_CONFIG_PATH);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  const tmp = `${SHIELD_CONFIG_PATH}.${process.pid}.tmp`;
+  // Random suffix avoids pid collision on concurrent CLI invocations
+  const tmp = `${SHIELD_CONFIG_PATH}.${crypto.randomBytes(6).toString('hex')}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(config, null, 2));
   fs.renameSync(tmp, SHIELD_CONFIG_PATH);
 }
@@ -1449,7 +1459,7 @@ shieldCmd
       return;
     }
     const shield = getShield(name);
-    if (!shield) return; // resolveShieldName guarantees this exists; guard for type safety
+    if (!shield) throw new Error(`Shield "${name}" resolved but not found — this is a bug`);
 
     const config = readRawConfig();
     if (!config.policy || typeof config.policy !== 'object') config.policy = {};
@@ -1492,7 +1502,7 @@ shieldCmd
       return;
     }
     const shield = getShield(name);
-    if (!shield) return;
+    if (!shield) throw new Error(`Shield "${name}" resolved but not found — this is a bug`);
 
     const active = readActiveShields();
     if (!active.includes(name)) {
