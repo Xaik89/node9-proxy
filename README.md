@@ -90,6 +90,11 @@ Security posture is resolved using a strict 5-tier waterfall:
 ## 🚀 Quick Start
 
 ```bash
+# Recommended — via Homebrew (macOS / Linux)
+brew tap node9-ai/node9
+brew install node9
+
+# Or via npm
 npm install -g @node9/proxy
 
 # 1. Setup protection for your favorite agent
@@ -313,6 +318,12 @@ A corporate policy has locked this action. You must click the "Approve" button i
 - [ ] **Execution Sandboxing** (Simulate dangerous commands in a virtual FS before applying)
 - [ ] **Multi-Admin Quorum** (Require 2+ human signatures for high-stakes production actions)
 - [ ] **SOC2 Tamper-proof Audit Trail** (Cryptographically signed, cloud-managed logs)
+
+---
+
+## 🔗 Related
+
+- [node9-python](https://github.com/node9-ai/node9-python) — Python SDK for Node9
 
 ---
 
