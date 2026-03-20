@@ -25,6 +25,13 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { createShadowSnapshot, applyUndo, getSnapshotHistory, computeUndoDiff } from './undo';
+import {
+  getShield,
+  listShields,
+  readActiveShields,
+  writeActiveShields,
+  resolveShieldName,
+} from './shields';
 import { confirm } from '@inquirer/prompts';
 
 const { version } = JSON.parse(
@@ -1401,6 +1408,151 @@ program
     } else {
       console.log(chalk.gray('\nCancelled.\n'));
     }
+  });
+
+// ---------------------------------------------------------------------------
+// node9 shield — manage pre-packaged security rule templates
+// ---------------------------------------------------------------------------
+
+const CONFIG_PATH = path.join(os.homedir(), '.node9', 'config.json');
+
+function readRawConfig(): Record<string, unknown> {
+  try {
+    if (fs.existsSync(CONFIG_PATH)) {
+      return JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf-8')) as Record<string, unknown>;
+    }
+  } catch {}
+  return {};
+}
+
+function writeRawConfig(config: Record<string, unknown>): void {
+  const dir = path.dirname(CONFIG_PATH);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  const tmp = `${CONFIG_PATH}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(config, null, 2));
+  fs.renameSync(tmp, CONFIG_PATH);
+}
+
+const shieldCmd = program
+  .command('shield')
+  .description('Manage pre-packaged security shield templates');
+
+shieldCmd
+  .command('enable <service>')
+  .description('Enable a security shield for a specific service')
+  .action((service: string) => {
+    const name = resolveShieldName(service);
+    if (!name) {
+      console.error(chalk.red(`\n❌ Unknown shield: "${service}"\n`));
+      console.log(`Run ${chalk.cyan('node9 shield list')} to see available shields.\n`);
+      process.exit(1);
+    }
+    const shield = getShield(name)!;
+    const config = readRawConfig();
+    if (!config.policy || typeof config.policy !== 'object') config.policy = {};
+    const policy = config.policy as Record<string, unknown>;
+
+    // Merge smartRules — deduplicate by name prefix
+    const prefix = `shield:${name}:`;
+    const existing = (policy.smartRules as Array<{ name?: string }> | undefined) ?? [];
+    policy.smartRules = [
+      ...existing.filter((r) => !r.name?.startsWith(prefix)),
+      ...shield.smartRules,
+    ];
+
+    // Merge dangerousWords — deduplicated
+    const existingWords = (policy.dangerousWords as string[] | undefined) ?? [];
+    policy.dangerousWords = [...new Set([...existingWords, ...shield.dangerousWords])];
+
+    writeRawConfig(config);
+
+    const active = readActiveShields();
+    if (!active.includes(name)) writeActiveShields([...active, name]);
+
+    console.log(chalk.green(`\n🛡️  Shield "${name}" enabled.`));
+    console.log(chalk.gray(`   Added ${shield.smartRules.length} smart rules.`));
+    if (shield.dangerousWords.length > 0)
+      console.log(chalk.gray(`   Added ${shield.dangerousWords.length} dangerous words.\n`));
+    else console.log('');
+  });
+
+shieldCmd
+  .command('disable <service>')
+  .description('Disable a security shield and remove its rules')
+  .action((service: string) => {
+    const name = resolveShieldName(service);
+    if (!name) {
+      console.error(chalk.red(`\n❌ Unknown shield: "${service}"\n`));
+      console.log(`Run ${chalk.cyan('node9 shield list')} to see available shields.\n`);
+      process.exit(1);
+    }
+    const shield = getShield(name)!;
+
+    if (!fs.existsSync(CONFIG_PATH)) {
+      console.log(chalk.yellow(`\nℹ️  Shield "${name}" is not active.\n`));
+      return;
+    }
+
+    const config = readRawConfig();
+    const policy = (config.policy ?? {}) as Record<string, unknown>;
+
+    // Remove this shield's smartRules
+    const prefix = `shield:${name}:`;
+    const rules = (policy.smartRules as Array<{ name?: string }> | undefined) ?? [];
+    policy.smartRules = rules.filter((r) => !r.name?.startsWith(prefix));
+
+    // Remove dangerousWords, protecting words still needed by other active shields
+    const remaining = readActiveShields().filter((s) => s !== name);
+    const protectedWords = new Set(
+      remaining.flatMap((s) => getShield(s)?.dangerousWords ?? [])
+    );
+    const existingWords = (policy.dangerousWords as string[] | undefined) ?? [];
+    policy.dangerousWords = existingWords.filter(
+      (w) => !shield.dangerousWords.includes(w) || protectedWords.has(w)
+    );
+
+    config.policy = policy;
+    writeRawConfig(config);
+    writeActiveShields(remaining);
+
+    console.log(chalk.green(`\n🛡️  Shield "${name}" disabled.\n`));
+  });
+
+shieldCmd
+  .command('list')
+  .description('Show all available shields')
+  .action(() => {
+    const active = new Set(readActiveShields());
+    console.log(chalk.bold('\n🛡️  Available Shields\n'));
+    for (const shield of listShields()) {
+      const status = active.has(shield.name)
+        ? chalk.green('● enabled')
+        : chalk.gray('○ disabled');
+      console.log(`  ${status}  ${chalk.cyan(shield.name.padEnd(12))} ${shield.description}`);
+      if (shield.aliases.length > 0)
+        console.log(chalk.gray(`              aliases: ${shield.aliases.join(', ')}`));
+    }
+    console.log('');
+  });
+
+shieldCmd
+  .command('status')
+  .description('Show which shields are currently active')
+  .action(() => {
+    const active = readActiveShields();
+    if (active.length === 0) {
+      console.log(chalk.yellow('\nℹ️  No shields are active.\n'));
+      console.log(`Run ${chalk.cyan('node9 shield list')} to see available shields.\n`);
+      return;
+    }
+    console.log(chalk.bold('\n🛡️  Active Shields\n'));
+    for (const name of active) {
+      const shield = getShield(name);
+      if (!shield) continue;
+      console.log(`  ${chalk.green('●')} ${chalk.cyan(name)}`);
+      console.log(chalk.gray(`    ${shield.smartRules.length} smart rules · ${shield.dangerousWords.length} dangerous words`));
+    }
+    console.log('');
   });
 
 process.on('unhandledRejection', (reason) => {
