@@ -1441,7 +1441,7 @@ function writeRawConfig(config: Record<string, unknown>): void {
   fs.mkdirSync(path.dirname(SHIELD_CONFIG_PATH), { recursive: true });
   // Random suffix avoids pid collision on concurrent CLI invocations
   const tmp = `${SHIELD_CONFIG_PATH}.${crypto.randomBytes(6).toString('hex')}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(config, null, 2));
+  fs.writeFileSync(tmp, JSON.stringify(config, null, 2), { mode: 0o600 });
   fs.renameSync(tmp, SHIELD_CONFIG_PATH);
 }
 
@@ -1469,14 +1469,18 @@ shieldCmd
 
     // Merge smartRules — deduplicate by name prefix
     const prefix = `shield:${name}:`;
-    const existing = (policy.smartRules as Array<{ name?: string }> | undefined) ?? [];
+    const existing = Array.isArray(policy.smartRules)
+      ? (policy.smartRules as Array<{ name?: string }>)
+      : [];
     policy.smartRules = [
       ...existing.filter((r) => !r.name?.startsWith(prefix)),
       ...shield.smartRules,
     ];
 
     // Merge dangerousWords — deduplicated
-    const existingWords = (policy.dangerousWords as string[] | undefined) ?? [];
+    const existingWords = Array.isArray(policy.dangerousWords)
+      ? (policy.dangerousWords as string[])
+      : [];
     policy.dangerousWords = [...new Set([...existingWords, ...shield.dangerousWords])];
 
     config.policy = policy;
@@ -1521,6 +1525,7 @@ shieldCmd
     }
 
     const config = readRawConfig() ?? {};
+    const remaining = active.filter((s) => s !== name);
 
     // Only mutate policy if it already exists — avoid creating an empty policy object
     if (config.policy && typeof config.policy === 'object') {
@@ -1528,14 +1533,17 @@ shieldCmd
 
       // Remove this shield's smartRules
       const prefix = `shield:${name}:`;
-      const rules = (policy.smartRules as Array<{ name?: string }> | undefined) ?? [];
+      const rules = Array.isArray(policy.smartRules)
+        ? (policy.smartRules as Array<{ name?: string }>)
+        : [];
       policy.smartRules = rules.filter((r) => !r.name?.startsWith(prefix));
 
       // Remove dangerousWords, protecting words still needed by other active shields
-      const remaining = active.filter((s) => s !== name);
       const protectedWords = new Set(remaining.flatMap((s) => getShield(s)?.dangerousWords ?? []));
       const shieldWords = new Set(shield.dangerousWords);
-      const existingWords = (policy.dangerousWords as string[] | undefined) ?? [];
+      const existingWords = Array.isArray(policy.dangerousWords)
+        ? (policy.dangerousWords as string[])
+        : [];
       policy.dangerousWords = existingWords.filter(
         (w) => !shieldWords.has(w) || protectedWords.has(w)
       );
@@ -1544,7 +1552,6 @@ shieldCmd
       writeRawConfig(config);
     }
 
-    const remaining = active.filter((s) => s !== name);
     writeActiveShields(remaining);
 
     console.log(chalk.green(`\n🛡️  Shield "${name}" disabled.\n`));

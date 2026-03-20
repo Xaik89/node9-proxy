@@ -262,10 +262,10 @@ export function readActiveShields(): string[] {
 }
 
 export function writeActiveShields(active: string[]): void {
-  const dir = path.dirname(SHIELDS_STATE_FILE);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  // mkdirSync is idempotent with recursive:true — avoids existsSync TOCTOU window
+  fs.mkdirSync(path.dirname(SHIELDS_STATE_FILE), { recursive: true });
   // Use random suffix to avoid pid collision on concurrent invocations
   const tmp = `${SHIELDS_STATE_FILE}.${crypto.randomBytes(6).toString('hex')}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify({ active }, null, 2));
+  fs.writeFileSync(tmp, JSON.stringify({ active }, null, 2), { mode: 0o600 });
   fs.renameSync(tmp, SHIELDS_STATE_FILE);
 }

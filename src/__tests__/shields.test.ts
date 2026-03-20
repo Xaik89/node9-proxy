@@ -128,6 +128,29 @@ describe('writeActiveShields', () => {
   });
 });
 
+// ── enable idempotency (deduplication logic) ──────────────────────────────────
+describe('shield enable deduplication', () => {
+  it('merging smart rules twice does not produce duplicates', () => {
+    const shield = SHIELDS.postgres;
+    const prefix = `shield:postgres:`;
+    // Simulate enabling postgres twice by running the merge logic twice
+    let rules: Array<{ name?: string }> = [];
+    for (let i = 0; i < 2; i++) {
+      rules = [...rules.filter((r) => !r.name?.startsWith(prefix)), ...shield.smartRules];
+    }
+    expect(rules.length).toBe(shield.smartRules.length);
+  });
+
+  it('merging dangerous words twice does not produce duplicates', () => {
+    const shield = SHIELDS.filesystem;
+    let words: string[] = [];
+    for (let i = 0; i < 2; i++) {
+      words = [...new Set([...words, ...shield.dangerousWords])];
+    }
+    expect(words.length).toBe(shield.dangerousWords.length);
+  });
+});
+
 // ── filesystem shield rule regexes ────────────────────────────────────────────
 describe('filesystem shield: block-rm-rf-home regex', () => {
   const rule = SHIELDS.filesystem.smartRules.find(
@@ -137,6 +160,7 @@ describe('filesystem shield: block-rm-rf-home regex', () => {
   // Helper: check if ALL conditions match the given command
   function matches(command: string): boolean {
     return rule.conditions.every((c) => {
+      if (c.value === undefined) throw new Error(`Condition on rule "${rule.name}" has no value`);
       const re = new RegExp(c.value, c.flags);
       return re.test(command);
     });
@@ -166,6 +190,7 @@ describe('filesystem shield: review-write-etc regex', () => {
 
   function matches(command: string): boolean {
     return rule.conditions.every((c) => {
+      if (c.value === undefined) throw new Error(`Condition on rule "${rule.name}" has no value`);
       const re = new RegExp(c.value, c.flags);
       return re.test(command);
     });
@@ -190,13 +215,24 @@ describe('shield dangerousWords', () => {
   });
 
   it('disable word-protection: shared words survive when another shield is active', () => {
-    // Simulate: postgres and a hypothetical second shield both have 'dropdb'
-    // The Set-based disable logic should keep 'dropdb' if any other active shield needs it
+    // Simulate disabling a shield whose words overlap with another still-active shield.
+    // shieldWords = words belonging to the shield being disabled
+    // protectedWords = words needed by the remaining active shields
+    const shieldWords = new Set(['dropdb', 'pg_dropcluster']);
+    const protectedWords = new Set(['dropdb']); // hypothetically claimed by a second active shield
+    const existing = ['dropdb', 'pg_dropcluster', 'wipefs'];
+    const result = existing.filter((w) => !shieldWords.has(w) || protectedWords.has(w));
+    // 'dropdb' survives (protected by another shield)
+    // 'pg_dropcluster' is removed (not protected)
+    // 'wipefs' survives (not in shieldWords at all)
+    expect(result).toEqual(['dropdb', 'wipefs']);
+  });
+
+  it('disable word-protection: words unique to the disabled shield are removed', () => {
     const shieldWords = new Set(SHIELDS.postgres.dangerousWords);
-    const protectedWords = new Set(SHIELDS.postgres.dangerousWords); // same shield still "active"
+    const protectedWords = new Set<string>(); // no other active shield needs these words
     const existing = [...SHIELDS.postgres.dangerousWords];
     const result = existing.filter((w) => !shieldWords.has(w) || protectedWords.has(w));
-    // Words protected by another active shield survive
-    expect(result).toEqual(existing);
+    expect(result).toEqual([]);
   });
 });
