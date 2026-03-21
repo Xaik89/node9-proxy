@@ -1459,13 +1459,18 @@ export async function authorizeHeadless(
       meta,
       options
     );
-    await notifyActivity({
-      id: actId,
-      tool: toolName,
-      ts: actTs,
-      status: result.approved ? 'allow' : result.blockedByLabel?.includes('DLP') ? 'dlp' : 'block',
-      label: result.blockedByLabel,
-    });
+    // noApprovalMechanism means no channels were available — the CLI will retry
+    // after auto-starting the daemon. Don't log a false 'block' to the flight
+    // recorder; the retry call will produce the real result notification.
+    if (!result.noApprovalMechanism) {
+      await notifyActivity({
+        id: actId,
+        tool: toolName,
+        ts: actTs,
+        status: result.approved ? 'allow' : result.blockedByLabel?.includes('DLP') ? 'dlp' : 'block',
+        label: result.blockedByLabel,
+      });
+    }
     return result;
   }
   return _authorizeHeadlessCore(toolName, args, allowTerminalFallback, meta, options);
