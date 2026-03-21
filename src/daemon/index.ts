@@ -379,14 +379,10 @@ export function startDaemon(): void {
         };
         pending.set(id, entry);
 
-        // ── Flight Recorder: broadcast every tool call immediately ────────────
-        broadcast('activity', {
-          id,
-          ts: entry.timestamp,
-          tool: toolName,
-          args: redactArgs(args),
-          status: 'pending',
-        });
+        // NOTE: The flight recorder 'activity' event is sent via the Unix socket
+        // by the CLI's notifyActivity() wrapper, which covers ALL tool calls
+        // (including ignored ones). We do NOT broadcast 'activity' here to avoid
+        // duplicate entries in node9 tail and the browser flight recorder.
 
         const browserEnabled = getConfig().settings.approvers?.browser !== false;
         if (browserEnabled) {
@@ -519,10 +515,15 @@ export function startDaemon(): void {
             decision: `trust:${trustDuration}`,
           });
           clearTimeout(entry.timer);
-          if (entry.waiter) entry.waiter('allow');
-          else entry.earlyDecision = 'allow';
-          pending.delete(id);
-          broadcast('remove', { id });
+          if (entry.waiter) {
+            entry.waiter('allow');
+            pending.delete(id);
+            broadcast('remove', { id });
+          } else {
+            entry.earlyDecision = 'allow';
+            broadcast('remove', { id });
+            entry.timer = setTimeout(() => pending.delete(id), 30_000);
+          }
           res.writeHead(200);
           return res.end(JSON.stringify({ ok: true }));
         }
@@ -535,13 +536,22 @@ export function startDaemon(): void {
           decision: resolvedDecision,
         });
         clearTimeout(entry.timer);
-        if (entry.waiter) entry.waiter(resolvedDecision, reason);
-        else {
+
+        if (entry.waiter) {
+          // GET /wait/:id is already connected — respond and clean up now
+          entry.waiter(resolvedDecision, reason);
+          pending.delete(id!);
+          broadcast('remove', { id });
+        } else {
+          // GET /wait/:id hasn't arrived yet — keep entry alive so it can pick up
+          // the early decision. Without this, the long-poll would get a 404 and
+          // cause askDaemon() to return 'deny' even when the user clicked Allow.
           entry.earlyDecision = resolvedDecision;
           entry.earlyReason = reason;
+          broadcast('remove', { id });
+          // Safety cleanup: remove the entry after 30s if GET /wait/:id never comes
+          entry.timer = setTimeout(() => pending.delete(id!), 30_000);
         }
-        pending.delete(id!);
-        broadcast('remove', { id });
         res.writeHead(200);
         return res.end(JSON.stringify({ ok: true }));
       } catch {

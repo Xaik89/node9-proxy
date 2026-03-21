@@ -998,34 +998,49 @@
         empty.style.display = requests.size === 0 ? 'block' : 'none';
       }
 
-      function sendDecision(id, decision, persist) {
+      async function sendDecision(id, decision, persist) {
         const card = document.getElementById('c-' + id);
         if (card) card.style.opacity = '0.5';
-        fetch('/decision/' + id, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'X-Node9-Token': CSRF_TOKEN },
-          body: JSON.stringify({ decision, persist: !!persist }),
-        });
-        setTimeout(() => {
+        try {
+          const res = await fetch('/decision/' + id, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-Node9-Token': CSRF_TOKEN },
+            body: JSON.stringify({ decision, persist: !!persist }),
+          });
+          if (!res.ok) throw new Error('HTTP ' + res.status);
           card?.remove();
           requests.delete(id);
           refresh();
-        }, 200);
+        } catch (err) {
+          // Restore card if request failed so the user can retry
+          if (card) {
+            card.style.opacity = '1';
+            card.style.outline = '2px solid #f87171';
+          }
+          console.error('Node9: decision request failed —', err);
+        }
       }
 
-      function sendTrust(id, duration) {
+      async function sendTrust(id, duration) {
         const card = document.getElementById('c-' + id);
         if (card) card.style.opacity = '0.5';
-        fetch('/decision/' + id, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'X-Node9-Token': CSRF_TOKEN },
-          body: JSON.stringify({ decision: 'trust', trustDuration: duration }),
-        });
-        setTimeout(() => {
+        try {
+          const res = await fetch('/decision/' + id, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-Node9-Token': CSRF_TOKEN },
+            body: JSON.stringify({ decision: 'trust', trustDuration: duration }),
+          });
+          if (!res.ok) throw new Error('HTTP ' + res.status);
           card?.remove();
           requests.delete(id);
           refresh();
-        }, 200);
+        } catch (err) {
+          if (card) {
+            card.style.opacity = '1';
+            card.style.outline = '2px solid #f87171';
+          }
+          console.error('Node9: trust request failed —', err);
+        }
       }
 
       function renderPayload(req) {
