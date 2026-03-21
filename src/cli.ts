@@ -25,6 +25,13 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { createShadowSnapshot, applyUndo, getSnapshotHistory, computeUndoDiff } from './undo';
+import {
+  getShield,
+  listShields,
+  readActiveShields,
+  writeActiveShields,
+  resolveShieldName,
+} from './shields';
 import { confirm } from '@inquirer/prompts';
 
 const { version } = JSON.parse(
@@ -75,6 +82,20 @@ INSTRUCTIONS:
   }
 
   const label = blockedByLabel.toLowerCase();
+
+  if (
+    label.includes('dlp') ||
+    label.includes('secret detected') ||
+    label.includes('credential review')
+  ) {
+    return `NODE9 SECURITY ALERT: A sensitive credential (API key, token, or private key) was found in your tool call arguments.
+CRITICAL INSTRUCTION: Do NOT retry this action.
+REQUIRED ACTIONS:
+1. Remove the hardcoded credential from your command or code.
+2. Use an environment variable or a dedicated secrets manager instead.
+3. Treat the leaked credential as compromised and rotate it immediately.
+Do NOT attempt to bypass this check or pass the credential through another tool.`;
+  }
 
   if (label.includes('sql safety') && label.includes('delete without where')) {
     return `NODE9: Blocked — DELETE without WHERE clause would wipe the entire table.
@@ -1018,7 +1039,16 @@ program
             blockedByContext.toLowerCase().includes('decision');
 
           // 3. Print to the human terminal for visibility
-          console.error(chalk.red(`\n🛑 Node9 blocked "${toolName}"`));
+          if (
+            blockedByContext.includes('DLP') ||
+            blockedByContext.includes('Secret Detected') ||
+            blockedByContext.includes('Credential Review')
+          ) {
+            console.error(chalk.bgRed.white.bold(`\n 🚨 NODE9 DLP ALERT — CREDENTIAL DETECTED `));
+            console.error(chalk.red.bold(`   A sensitive secret was found in the tool arguments!`));
+          } else {
+            console.error(chalk.red(`\n🛑 Node9 blocked "${toolName}"`));
+          }
           console.error(chalk.gray(`   Triggered by: ${blockedByContext}`));
           if (result?.changeHint) console.error(chalk.cyan(`   To change:  ${result.changeHint}`));
           console.error('');
@@ -1401,6 +1431,112 @@ program
     } else {
       console.log(chalk.gray('\nCancelled.\n'));
     }
+  });
+
+// ---------------------------------------------------------------------------
+// node9 shield — manage pre-packaged security rule templates
+// ---------------------------------------------------------------------------
+// Shields are applied dynamically at getConfig() load time by reading
+// ~/.node9/shields.json and merging the catalog rules into the runtime policy.
+// enable/disable only update shields.json — config.json is never touched.
+
+const shieldCmd = program
+  .command('shield')
+  .description('Manage pre-packaged security shield templates');
+
+shieldCmd
+  .command('enable <service>')
+  .description('Enable a security shield for a specific service')
+  .action((service: string) => {
+    const name = resolveShieldName(service);
+    if (!name) {
+      console.error(chalk.red(`\n❌ Unknown shield: "${service}"\n`));
+      console.log(`Run ${chalk.cyan('node9 shield list')} to see available shields.\n`);
+      process.exit(1);
+    }
+    const shield = getShield(name!)!;
+
+    const active = readActiveShields();
+    if (active.includes(name!)) {
+      console.log(chalk.yellow(`\nℹ️  Shield "${name}" is already active.\n`));
+      return;
+    }
+    writeActiveShields([...active, name!]);
+
+    console.log(chalk.green(`\n🛡️  Shield "${name}" enabled.`));
+    console.log(chalk.gray(`   ${shield.smartRules.length} smart rules now active.`));
+    if (shield.dangerousWords.length > 0)
+      console.log(chalk.gray(`   ${shield.dangerousWords.length} dangerous words now active.`));
+    if (name === 'filesystem') {
+      console.log(
+        chalk.yellow(
+          `\n   ⚠️  Note: filesystem rules cover common rm -rf patterns but not all variants.\n` +
+            `      Tools like unlink, find -delete, or language-level file ops are not intercepted.`
+        )
+      );
+    }
+    console.log('');
+  });
+
+shieldCmd
+  .command('disable <service>')
+  .description('Disable a security shield')
+  .action((service: string) => {
+    const name = resolveShieldName(service);
+    if (!name) {
+      console.error(chalk.red(`\n❌ Unknown shield: "${service}"\n`));
+      console.log(`Run ${chalk.cyan('node9 shield list')} to see available shields.\n`);
+      process.exit(1);
+    }
+
+    const active = readActiveShields();
+    if (!active.includes(name!)) {
+      console.log(chalk.yellow(`\nℹ️  Shield "${name}" is not active.\n`));
+      return;
+    }
+
+    writeActiveShields(active.filter((s) => s !== name));
+
+    console.log(chalk.green(`\n🛡️  Shield "${name}" disabled.\n`));
+  });
+
+shieldCmd
+  .command('list')
+  .description('Show all available shields')
+  .action(() => {
+    const active = new Set(readActiveShields());
+    console.log(chalk.bold('\n🛡️  Available Shields\n'));
+    for (const shield of listShields()) {
+      const status = active.has(shield.name) ? chalk.green('● enabled') : chalk.gray('○ disabled');
+      console.log(`  ${status}  ${chalk.cyan(shield.name.padEnd(12))} ${shield.description}`);
+      if (shield.aliases.length > 0)
+        console.log(chalk.gray(`              aliases: ${shield.aliases.join(', ')}`));
+    }
+    console.log('');
+  });
+
+shieldCmd
+  .command('status')
+  .description('Show which shields are currently active')
+  .action(() => {
+    const active = readActiveShields();
+    if (active.length === 0) {
+      console.log(chalk.yellow('\nℹ️  No shields are active.\n'));
+      console.log(`Run ${chalk.cyan('node9 shield list')} to see available shields.\n`);
+      return;
+    }
+    console.log(chalk.bold('\n🛡️  Active Shields\n'));
+    for (const name of active) {
+      const shield = getShield(name);
+      if (!shield) continue;
+      console.log(`  ${chalk.green('●')} ${chalk.cyan(name)}`);
+      console.log(
+        chalk.gray(
+          `    ${shield.smartRules.length} smart rules · ${shield.dangerousWords.length} dangerous words`
+        )
+      );
+    }
+    console.log('');
   });
 
 process.on('unhandledRejection', (reason) => {
