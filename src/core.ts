@@ -1429,9 +1429,10 @@ function notifyActivity(data: {
       const payload = JSON.stringify(data);
       const sock = net.createConnection(ACTIVITY_SOCKET_PATH);
       sock.on('connect', () => {
-        sock.end(payload);
-        sock.on('finish', resolve);
+        // Attach listeners before calling end() so events fired synchronously
+        // on the loopback socket are not missed.
         sock.on('close', resolve);
+        sock.end(payload);
       });
       sock.on('error', resolve); // daemon not running — resolve immediately
     } catch {
@@ -1548,7 +1549,10 @@ async function _authorizeHeadlessCore(
           blockedByLabel: '🚨 Node9 DLP (Secret Detected)',
         };
       }
-      // severity === 'review': fall through to the race engine with a DLP label
+      // severity === 'review': fall through to the race engine with a DLP label.
+      // Write an audit entry now so the DLP flag is traceable even if the race
+      // engine later approves the call without recording why it was intercepted.
+      if (!isManual) appendLocalAudit(toolName, args, 'allow', 'dlp-review-flagged', meta);
       explainableLabel = '🚨 Node9 DLP (Credential Review)';
     }
   }

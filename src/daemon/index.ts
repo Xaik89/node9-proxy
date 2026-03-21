@@ -487,7 +487,7 @@ export function startDaemon(): void {
       if (entry.earlyDecision) {
         clearTimeout(entry.timer); // cancel the 30s cleanup timer set by POST /decision
         pending.delete(id);
-        broadcast('remove', { id });
+        // POST /decision already broadcast 'remove' — don't send a duplicate
         res.writeHead(200, { 'Content-Type': 'application/json' });
         const body: { decision: Decision; reason?: string } = { decision: entry.earlyDecision };
         if (entry.earlyReason) body.reason = entry.earlyReason;
@@ -751,9 +751,18 @@ export function startDaemon(): void {
     fs.unlinkSync(ACTIVITY_SOCKET_PATH);
   } catch {}
 
+  const ACTIVITY_MAX_BYTES = 1024 * 1024; // 1 MB guard against runaway senders
   const unixServer = net.createServer((socket) => {
     const chunks: Buffer<ArrayBuffer>[] = [];
-    socket.on('data', (chunk: Buffer<ArrayBuffer>) => chunks.push(chunk));
+    let bytesReceived = 0;
+    socket.on('data', (chunk: Buffer<ArrayBuffer>) => {
+      bytesReceived += chunk.length;
+      if (bytesReceived > ACTIVITY_MAX_BYTES) {
+        socket.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
     socket.on('end', () => {
       try {
         const data = JSON.parse(Buffer.concat(chunks).toString()) as {

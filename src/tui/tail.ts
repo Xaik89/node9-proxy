@@ -193,7 +193,7 @@ export async function startTail(options: TailOptions = {}): Promise<void> {
 
     if (event === 'activity') {
       // History filter: skip replayed events unless --history requested
-      if (!options.history && data.ts && data.ts < connectionTime) return;
+      if (!options.history && data.ts > 0 && data.ts < connectionTime) return;
 
       // Ring-buffer replay: activity events already have a resolved status — render immediately
       if (data.status && data.status !== 'pending') {
