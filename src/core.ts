@@ -1467,7 +1467,11 @@ export async function authorizeHeadless(
         id: actId,
         tool: toolName,
         ts: actTs,
-        status: result.approved ? 'allow' : result.blockedByLabel?.includes('DLP') ? 'dlp' : 'block',
+        status: result.approved
+          ? 'allow'
+          : result.blockedByLabel?.includes('DLP')
+            ? 'dlp'
+            : 'block',
         label: result.blockedByLabel,
       });
     }
