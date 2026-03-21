@@ -346,6 +346,7 @@ export function startDaemon(): void {
           agent,
           mcpServer,
           riskMetadata,
+          fromCLI = false,
         } = JSON.parse(body);
         const id = randomUUID();
         const entry: PendingEntry = {
@@ -379,10 +380,18 @@ export function startDaemon(): void {
         };
         pending.set(id, entry);
 
-        // NOTE: The flight recorder 'activity' event is sent via the Unix socket
-        // by the CLI's notifyActivity() wrapper, which covers ALL tool calls
-        // (including ignored ones). We do NOT broadcast 'activity' here to avoid
-        // duplicate entries in node9 tail and the browser flight recorder.
+        // Flight recorder: CLI callers already sent 'activity' via the Unix socket
+        // (notifyActivity), so skip it here to avoid duplicate entries. External
+        // callers (non-CLI integrations) set fromCLI=false and need the broadcast.
+        if (!fromCLI) {
+          broadcast('activity', {
+            id,
+            ts: entry.timestamp,
+            tool: toolName,
+            args: redactArgs(args),
+            status: 'pending',
+          });
+        }
 
         const browserEnabled = getConfig().settings.approvers?.browser !== false;
         if (browserEnabled) {
@@ -476,6 +485,7 @@ export function startDaemon(): void {
       const entry = pending.get(id);
       if (!entry) return res.writeHead(404).end();
       if (entry.earlyDecision) {
+        clearTimeout(entry.timer); // cancel the 30s cleanup timer set by POST /decision
         pending.delete(id);
         broadcast('remove', { id });
         res.writeHead(200, { 'Content-Type': 'application/json' });

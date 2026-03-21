@@ -998,48 +998,60 @@
         empty.style.display = requests.size === 0 ? 'block' : 'none';
       }
 
+      function setCardBusy(card, busy) {
+        if (!card) return;
+        card.querySelectorAll('button').forEach((b) => (b.disabled = busy));
+        card.style.opacity = busy ? '0.5' : '1';
+      }
+
+      function showCardError(card, msg) {
+        if (!card) return;
+        card.style.outline = '2px solid #f87171';
+        let err = card.querySelector('.card-error');
+        if (!err) {
+          err = document.createElement('p');
+          err.className = 'card-error';
+          err.style.cssText = 'color:#f87171;font-size:11px;margin:6px 0 0;';
+          card.appendChild(err);
+        }
+        err.textContent = '⚠ ' + msg + ' — please try again or refresh.';
+      }
+
       async function sendDecision(id, decision, persist) {
         const card = document.getElementById('c-' + id);
-        if (card) card.style.opacity = '0.5';
+        setCardBusy(card, true);
         try {
           const res = await fetch('/decision/' + id, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-Node9-Token': CSRF_TOKEN },
             body: JSON.stringify({ decision, persist: !!persist }),
           });
-          if (!res.ok) throw new Error('HTTP ' + res.status);
+          if (!res.ok) throw new Error('Request failed (HTTP ' + res.status + ')');
           card?.remove();
           requests.delete(id);
           refresh();
         } catch (err) {
-          // Restore card if request failed so the user can retry
-          if (card) {
-            card.style.opacity = '1';
-            card.style.outline = '2px solid #f87171';
-          }
-          console.error('Node9: decision request failed —', err);
+          setCardBusy(card, false);
+          showCardError(card, err.message || 'Network error');
         }
       }
 
       async function sendTrust(id, duration) {
         const card = document.getElementById('c-' + id);
-        if (card) card.style.opacity = '0.5';
+        setCardBusy(card, true);
         try {
           const res = await fetch('/decision/' + id, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-Node9-Token': CSRF_TOKEN },
             body: JSON.stringify({ decision: 'trust', trustDuration: duration }),
           });
-          if (!res.ok) throw new Error('HTTP ' + res.status);
+          if (!res.ok) throw new Error('Request failed (HTTP ' + res.status + ')');
           card?.remove();
           requests.delete(id);
           refresh();
         } catch (err) {
-          if (card) {
-            card.style.opacity = '1';
-            card.style.outline = '2px solid #f87171';
-          }
-          console.error('Node9: trust request failed —', err);
+          setCardBusy(card, false);
+          showCardError(card, err.message || 'Network error');
         }
       }
 

@@ -1296,6 +1296,7 @@ async function askDaemon(
         args,
         agent: meta?.agent,
         mcpServer: meta?.mcpServer,
+        fromCLI: true,
         ...(riskMetadata && { riskMetadata }),
       }),
       signal: checkCtrl.signal,
