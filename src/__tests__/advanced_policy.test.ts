@@ -21,9 +21,9 @@ describe('Path-Based Policy (Advanced)', () => {
 
   it('allows "rm -rf node_modules" via built-in allow-rm-safe-paths rule', async () => {
     // No config needed — the built-in advisory rule covers node_modules.
-    expect(
-      (await evaluatePolicy('Bash', { command: 'rm -rf ./node_modules/lodash' })).decision
-    ).toBe('allow');
+    const result = await evaluatePolicy('Bash', { command: 'rm -rf ./node_modules/lodash' });
+    expect(result.decision).toBe('allow');
+    expect(result.ruleName).toBe('allow-rm-safe-paths');
   });
 
   it('reviews "rm -rf src" — not a safe path, caught by built-in review-rm', async () => {
@@ -41,6 +41,7 @@ describe('Path-Based Policy (Advanced)', () => {
       policy: {
         smartRules: [
           {
+            name: 'block-rm-env',
             tool: 'Bash',
             conditions: [{ field: 'command', op: 'matches', value: 'rm.*\\.env' }],
             verdict: 'block',
@@ -52,10 +53,31 @@ describe('Path-Based Policy (Advanced)', () => {
     vi.mocked(fs.existsSync).mockReturnValue(true);
     vi.spyOn(fs, 'readFileSync').mockReturnValue(JSON.stringify(mockConfig));
 
-    // Project block rule fires before the advisory review-rm
-    expect((await evaluatePolicy('Bash', { command: 'rm .env' })).decision).toBe('block');
-    // Safe path still allowed via advisory allow-rm-safe-paths
-    expect((await evaluatePolicy('Bash', { command: 'rm -rf dist/' })).decision).toBe('allow');
+    const result = await evaluatePolicy('Bash', { command: 'rm .env' });
+    expect(result.decision).toBe('block');
+    expect(result.ruleName).toBe('block-rm-env');
+  });
+
+  it('advisory allow-rm-safe-paths still fires after a project block rule (safe path)', async () => {
+    const mockConfig = {
+      policy: {
+        smartRules: [
+          {
+            name: 'block-rm-env',
+            tool: 'Bash',
+            conditions: [{ field: 'command', op: 'matches', value: 'rm.*\\.env' }],
+            verdict: 'block',
+            reason: 'Never delete .env files',
+          },
+        ],
+      },
+    };
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.spyOn(fs, 'readFileSync').mockReturnValue(JSON.stringify(mockConfig));
+
+    const result = await evaluatePolicy('Bash', { command: 'rm -rf dist/' });
+    expect(result.decision).toBe('allow');
+    expect(result.ruleName).toBe('allow-rm-safe-paths');
   });
 
   it('correctly tokenizes and identifies "rm" even with complex shell syntax', async () => {

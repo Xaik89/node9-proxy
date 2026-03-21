@@ -778,7 +778,8 @@ export async function evaluatePolicy(
       (rule) => matchesPattern(toolName, rule.tool) && evaluateSmartConditions(args, rule)
     );
     if (matchedRule) {
-      if (matchedRule.verdict === 'allow') return { decision: 'allow' };
+      if (matchedRule.verdict === 'allow')
+        return { decision: 'allow', ruleName: matchedRule.name ?? matchedRule.tool };
       return {
         decision: matchedRule.verdict,
         blockedByLabel: `Smart Rule: ${matchedRule.name ?? matchedRule.tool}`,
