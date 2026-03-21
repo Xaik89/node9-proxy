@@ -4,6 +4,8 @@ import { confirm } from '@inquirer/prompts';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import net from 'net';
+import { randomUUID } from 'crypto';
 import pm from 'picomatch';
 import { parse } from 'sh-syntax';
 import { askNativePopup, sendDesktopNotification } from './ui/native';
@@ -1404,7 +1406,60 @@ export interface AuthResult {
     | 'audit';
 }
 
+// ── Flight Recorder — fire-and-forget socket notify ──────────────────────────
+const ACTIVITY_SOCKET_PATH =
+  process.platform === 'win32'
+    ? '\\\\.\\pipe\\node9-activity'
+    : path.join(os.tmpdir(), 'node9-activity.sock');
+
+function notifyActivity(data: {
+  id: string;
+  ts: number;
+  tool: string;
+  args?: unknown;
+  status: string;
+  label?: string;
+}): void {
+  try {
+    const payload = JSON.stringify(data);
+    const sock = net.createConnection(ACTIVITY_SOCKET_PATH);
+    sock.on('connect', () => sock.end(payload));
+    sock.on('error', () => {}); // daemon not running — silently skip
+  } catch {}
+}
+
 export async function authorizeHeadless(
+  toolName: string,
+  args: unknown,
+  allowTerminalFallback = false,
+  meta?: { agent?: string; mcpServer?: string },
+  options?: { calledFromDaemon?: boolean }
+): Promise<AuthResult> {
+  // Skip socket notification when called from daemon — daemon already broadcasts via SSE
+  if (!options?.calledFromDaemon) {
+    const actId = randomUUID();
+    const actTs = Date.now();
+    notifyActivity({ id: actId, ts: actTs, tool: toolName, args, status: 'pending' });
+    const result = await _authorizeHeadlessCore(
+      toolName,
+      args,
+      allowTerminalFallback,
+      meta,
+      options
+    );
+    notifyActivity({
+      id: actId,
+      tool: toolName,
+      ts: actTs,
+      status: result.approved ? 'allow' : result.blockedByLabel?.includes('DLP') ? 'dlp' : 'block',
+      label: result.blockedByLabel,
+    });
+    return result;
+  }
+  return _authorizeHeadlessCore(toolName, args, allowTerminalFallback, meta, options);
+}
+
+async function _authorizeHeadlessCore(
   toolName: string,
   args: unknown,
   allowTerminalFallback = false,

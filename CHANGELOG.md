@@ -10,7 +10,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **Flight Recorder — Browser Dashboard:** The browser dashboard (`localhost:7391`) is now a true fixed-viewport 3-column layout. The left column streams every tool call in real-time — appearing immediately as `● PENDING` and resolving to `✓ ALLOW`, `✗ BLOCK`, or `🛡️ DLP` as decisions arrive. The feed scrolls internally and never causes the browser page to scroll. History from the current session is replayed to new browser tabs via an in-memory ring buffer (last 100 events).
+- **`node9 tail` — Terminal Flight Recorder:** New command that streams live agent activity directly to the terminal. Uses a spec-compliant SSE parser (handles TCP fragmentation), filters history floods on connect, and shows a live `● …` pending indicator for slow operations (bash, SQL, agent calls). Auto-starts the daemon if it isn't running. Supports `--history` to replay recent events on connect. Output is pipeable (`node9 tail | grep DLP`).
+- **Shields Panel in Browser Dashboard:** The right sidebar now shows all available shields (postgres, github, aws, filesystem) with live enable/disable toggles. Changes take effect immediately on the next tool call — no daemon restart required. Toggle state is broadcast via SSE to keep multiple open tabs in sync.
+- **Improved Pending Approval Cards:** Approval cards now show an `⚠️ Action Required` header with a live countdown timer that turns red under 15 seconds. Allow/Deny buttons have clearer labels (`✅ Allow this Action` / `🚫 Block this Action`). The deny button uses a softer outlined style to reduce accidental clicks.
+- **DLP Content Scanner:** Node9 now scans every tool call argument for secrets before policy evaluation. Seven built-in patterns cover AWS Access Key IDs, GitHub tokens (`ghp_`, `gho_`, `ghs_`), Slack bot tokens (`xoxb-`), OpenAI API keys, Stripe secret keys, PEM private keys, and Bearer tokens. `block`-severity patterns hard-deny the call immediately; `review`-severity patterns route through the normal race engine. Secrets are redacted to a prefix+suffix sample in all audit logs. Configurable via `policy.dlp.enabled` and `policy.dlp.scanIgnoredTools`.
+- **Shield Templates:** `node9 shield enable <service>` installs a curated rule set for a specific infrastructure service. Available shields: `postgres` (blocks `DROP TABLE`, `TRUNCATE`, `DROP COLUMN`; reviews `GRANT`/`REVOKE`), `github` (blocks `gh repo delete`; reviews remote branch deletion), `aws` (blocks S3 bucket deletion, EC2 termination; reviews IAM and RDS changes), `filesystem` (reviews `chmod 777` and writes to `/etc/`). Manage with `node9 shield enable|disable|list|status`.
 - **Shadow Git Snapshots (Phase 2):** (Coming Soon) Automatic lightweight git commits before AI edits, allowing `node9 undo`.
+
+### Fixed
+
+- **Cursor hook setup:** `node9 addto cursor` no longer attempts to write an unsupported `hooks.json` file. A clear warning is shown explaining that MCP proxy wrapping is the only supported protection mode for Cursor.
+- **Empty shields file warning:** Suppressed a spurious parse warning that appeared on first run when `~/.node9/shields.json` existed but was empty.
+- **`node9 tail` crash on daemon disconnect:** An unhandled `ECONNRESET` error on the readline interface no longer crashes the process — it exits cleanly with `❌ Daemon disconnected.`
 
 ---
 

@@ -2,6 +2,7 @@
 import { UI_HTML_TEMPLATE } from './ui';
 import { RiskMetadata } from '../context-sniper';
 import http from 'http';
+import net from 'net';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -9,6 +10,12 @@ import { spawn } from 'child_process';
 import { randomUUID } from 'crypto';
 import chalk from 'chalk';
 import { authorizeHeadless, getGlobalSettings, getConfig, _resetConfigCache } from '../core';
+import { SHIELDS, readActiveShields, writeActiveShields } from '../shields';
+
+const ACTIVITY_SOCKET_PATH =
+  process.platform === 'win32'
+    ? '\\\\.\\pipe\\node9-activity'
+    : path.join(os.tmpdir(), 'node9-activity.sock');
 
 export const DAEMON_PORT = 7391;
 export const DAEMON_HOST = '127.0.0.1';
@@ -154,6 +161,10 @@ let abandonTimer: ReturnType<typeof setTimeout> | null = null;
 let daemonServer: http.Server | null = null;
 let hadBrowserClient = false; // true once at least one SSE client has connected
 
+// ── Flight Recorder ring buffer — replayed to new SSE clients on connect ──
+const ACTIVITY_RING_SIZE = 100;
+const activityRing: { event: string; data: unknown }[] = [];
+
 function abandonPending() {
   abandonTimer = null;
   pending.forEach((entry, id) => {
@@ -176,6 +187,21 @@ function abandonPending() {
 }
 
 function broadcast(event: string, data: unknown) {
+  // Buffer activity events so late-joining browsers get history
+  if (event === 'activity') {
+    activityRing.push({ event, data });
+    if (activityRing.length > ACTIVITY_RING_SIZE) activityRing.shift();
+  } else if (event === 'activity-result') {
+    // Patch the status in the ring buffer so replayed history is up-to-date
+    const { id, status, label } = data as { id: string; status: string; label?: string };
+    for (let i = activityRing.length - 1; i >= 0; i--) {
+      if ((activityRing[i].data as { id: string }).id === id) {
+        Object.assign(activityRing[i].data as object, { status, label });
+        break;
+      }
+    }
+  }
+
   const msg = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
   sseClients.forEach((client) => {
     try {
@@ -235,8 +261,10 @@ export function startDaemon(): void {
 
   // ── Graceful Idle Timeout (Fixes Task 0.4) ──────────────────────────────
   const IDLE_TIMEOUT_MS = 12 * 60 * 60 * 1000; // 12 hours
-  let idleTimer: NodeJS.Timeout;
+  const watchMode = process.env.NODE9_WATCH_MODE === '1';
+  let idleTimer: NodeJS.Timeout | undefined;
   function resetIdleTimer() {
+    if (watchMode) return; // Watch mode — never idle-timeout
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
       if (autoStarted) {
@@ -287,6 +315,10 @@ export function startDaemon(): void {
         })}\n\n`
       );
       res.write(`event: decisions\ndata: ${JSON.stringify(readPersistentDecisions())}\n\n`);
+      // Replay recent activity history so late-joining browsers see the feed
+      for (const item of activityRing) {
+        res.write(`event: ${item.event}\ndata: ${JSON.stringify(item.data)}\n\n`);
+      }
       return req.on('close', () => {
         sseClients.delete(res);
         if (sseClients.size === 0 && pending.size > 0) {
@@ -346,6 +378,16 @@ export function startDaemon(): void {
           }, AUTO_DENY_MS),
         };
         pending.set(id, entry);
+
+        // ── Flight Recorder: broadcast every tool call immediately ────────────
+        broadcast('activity', {
+          id,
+          ts: entry.timestamp,
+          tool: toolName,
+          args: redactArgs(args),
+          status: 'pending',
+        });
+
         const browserEnabled = getConfig().settings.approvers?.browser !== false;
         if (browserEnabled) {
           broadcast('add', {
@@ -385,6 +427,17 @@ export function startDaemon(): void {
             // If no background channels were available (no cloud, no native),
             // leave the entry alive so the browser dashboard can decide.
             if (result.noApprovalMechanism) return;
+
+            // ── Flight Recorder: update the feed item with the final verdict ──
+            broadcast('activity-result', {
+              id,
+              status: result.approved
+                ? 'allow'
+                : result.blockedByLabel?.includes('DLP')
+                  ? 'dlp'
+                  : 'block',
+              label: result.blockedByLabel,
+            });
 
             clearTimeout(e.timer);
             const decision: Decision = result.approved ? 'allow' : 'deny';
@@ -593,6 +646,44 @@ export function startDaemon(): void {
       return res.end(JSON.stringify(getAuditHistory()));
     }
 
+    if (req.method === 'GET' && pathname === '/shields') {
+      const active = readActiveShields();
+      const shields = Object.values(SHIELDS).map((s) => ({
+        name: s.name,
+        description: s.description,
+        active: active.includes(s.name),
+      }));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ shields }));
+    }
+
+    if (req.method === 'POST' && pathname === '/shields') {
+      if (!validToken(req)) return res.writeHead(403).end();
+      try {
+        const { name, active } = JSON.parse(await readBody(req)) as {
+          name: string;
+          active: boolean;
+        };
+        if (!SHIELDS[name]) return res.writeHead(400).end();
+        const current = readActiveShields();
+        const updated = active
+          ? [...new Set([...current, name])]
+          : current.filter((n) => n !== name);
+        writeActiveShields(updated);
+        _resetConfigCache();
+        const shieldsPayload = Object.values(SHIELDS).map((s) => ({
+          name: s.name,
+          description: s.description,
+          active: updated.includes(s.name),
+        }));
+        broadcast('shields-status', { shields: shieldsPayload });
+        res.writeHead(200);
+        return res.end(JSON.stringify({ ok: true }));
+      } catch {
+        res.writeHead(400).end();
+      }
+    }
+
     res.writeHead(404).end();
   });
 
@@ -628,6 +719,56 @@ export function startDaemon(): void {
       { mode: 0o600 }
     );
     console.log(chalk.green(`🛡️  Node9 Guard LIVE: http://127.0.0.1:${DAEMON_PORT}`));
+  });
+
+  // ── Flight Recorder — Unix socket for all tool call activity ─────────────
+  if (watchMode) {
+    console.log(chalk.cyan('🛰️  Flight Recorder active — daemon will not idle-timeout'));
+  }
+
+  // Clean up stale socket file from previous run
+  try {
+    fs.unlinkSync(ACTIVITY_SOCKET_PATH);
+  } catch {}
+
+  const unixServer = net.createServer((socket) => {
+    const chunks: Buffer<ArrayBuffer>[] = [];
+    socket.on('data', (chunk: Buffer<ArrayBuffer>) => chunks.push(chunk));
+    socket.on('end', () => {
+      try {
+        const data = JSON.parse(Buffer.concat(chunks).toString()) as {
+          id: string;
+          ts: number;
+          tool: string;
+          args?: unknown;
+          status: string;
+          label?: string;
+        };
+        if (data.status === 'pending') {
+          broadcast('activity', {
+            id: data.id,
+            ts: data.ts,
+            tool: data.tool,
+            args: redactArgs(data.args),
+            status: 'pending',
+          });
+        } else {
+          broadcast('activity-result', {
+            id: data.id,
+            status: data.status,
+            label: data.label,
+          });
+        }
+      } catch {}
+    });
+    socket.on('error', () => {});
+  });
+
+  unixServer.listen(ACTIVITY_SOCKET_PATH);
+  process.on('exit', () => {
+    try {
+      fs.unlinkSync(ACTIVITY_SOCKET_PATH);
+    } catch {}
   });
 }
 

@@ -899,14 +899,32 @@ program
   .argument('[action]', 'start | stop | status (default: start)')
   .option('-b, --background', 'Start the daemon in the background (detached)')
   .option('-o, --openui', 'Start in background and open browser')
+  .option(
+    '-w, --watch',
+    'Start daemon + open browser, stay alive permanently (Flight Recorder mode)'
+  )
   .action(
-    async (action: string | undefined, options: { background?: boolean; openui?: boolean }) => {
+    async (
+      action: string | undefined,
+      options: { background?: boolean; openui?: boolean; watch?: boolean }
+    ) => {
       const cmd = (action ?? 'start').toLowerCase();
       if (cmd === 'stop') return stopDaemon();
       if (cmd === 'status') return daemonStatus();
       if (cmd !== 'start' && action !== undefined) {
         console.error(chalk.red(`Unknown daemon action: "${action}". Use: start | stop | status`));
         process.exit(1);
+      }
+
+      if (options.watch) {
+        process.env.NODE9_WATCH_MODE = '1';
+        // Open browser shortly after daemon binds to its port
+        setTimeout(() => {
+          openBrowserLocal();
+          console.log(chalk.cyan(`🛰️  Flight Recorder: http://${DAEMON_HOST}:${DAEMON_PORT}/`));
+        }, 600);
+        startDaemon(); // foreground — keeps process alive
+        return;
       }
 
       if (options.openui) {
@@ -937,7 +955,17 @@ program
     }
   );
 
-// 6. CHECK (Internal Hook - Upgraded with AI Negotiation Loop)
+// 6. TAIL
+program
+  .command('tail')
+  .description('Stream live agent activity to the terminal')
+  .option('--history', 'Include recent history on connect', false)
+  .action(async (options: { history?: boolean }) => {
+    const { startTail } = await import('./tui/tail.js');
+    await startTail(options);
+  });
+
+// 7. CHECK (Internal Hook - Upgraded with AI Negotiation Loop)
 program
   .command('check')
   .description('Hook handler — evaluates a tool call before execution')

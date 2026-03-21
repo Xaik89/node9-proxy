@@ -24,6 +24,11 @@
         margin: 0;
         padding: 0;
       }
+      html,
+      body {
+        height: 100%;
+        overflow: hidden;
+      }
       body {
         background: var(--bg);
         color: var(--text);
@@ -31,16 +36,17 @@
           'Inter',
           -apple-system,
           sans-serif;
-        min-height: 100vh;
       }
 
       .shell {
-        max-width: 1000px;
+        max-width: 1440px;
+        height: 100vh;
         margin: 0 auto;
-        padding: 32px 24px 48px;
+        padding: 16px 20px 16px;
         display: grid;
         grid-template-rows: auto 1fr;
-        gap: 24px;
+        gap: 16px;
+        overflow: hidden;
       }
       header {
         display: flex;
@@ -77,9 +83,10 @@
 
       .body {
         display: grid;
-        grid-template-columns: 1fr 272px;
-        gap: 20px;
-        align-items: start;
+        grid-template-columns: 360px 1fr 270px;
+        gap: 16px;
+        min-height: 0;
+        overflow: hidden;
       }
 
       .warning-banner {
@@ -99,6 +106,10 @@
 
       .main {
         min-width: 0;
+        min-height: 0;
+        overflow-y: auto;
+        scrollbar-width: thin;
+        scrollbar-color: var(--border) transparent;
       }
       .section-title {
         font-size: 11px;
@@ -129,13 +140,63 @@
         background: var(--card);
         border: 1px solid var(--border);
         border-radius: 14px;
-        padding: 24px;
-        margin-bottom: 16px;
+        padding: 20px;
+        margin-bottom: 14px;
         box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
         animation: pop 0.35s cubic-bezier(0.175, 0.885, 0.32, 1.275);
       }
       .card.slack-viewer {
         border-color: rgba(83, 155, 245, 0.3);
+      }
+      .card-header {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 12px;
+        padding-bottom: 12px;
+        border-bottom: 1px solid var(--border);
+      }
+      .card-header-icon {
+        font-size: 16px;
+      }
+      .card-header-title {
+        font-size: 12px;
+        font-weight: 700;
+        color: var(--text-bright);
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+      }
+      .card-timer {
+        margin-left: auto;
+        font-size: 11px;
+        font-family: 'Fira Code', monospace;
+        color: var(--muted);
+        background: rgba(48, 54, 61, 0.6);
+        padding: 2px 8px;
+        border-radius: 5px;
+      }
+      .card-timer.urgent {
+        color: var(--danger);
+        background: rgba(201, 60, 55, 0.1);
+      }
+      .btn-allow {
+        background: var(--success);
+        color: #fff;
+        grid-column: span 2;
+        font-size: 14px;
+        padding: 13px 14px;
+      }
+      .btn-deny {
+        background: rgba(201, 60, 55, 0.15);
+        color: #e5534b;
+        border: 1px solid rgba(201, 60, 55, 0.3);
+        grid-column: span 2;
+      }
+      .btn-deny:hover:not(:disabled) {
+        background: var(--danger);
+        color: #fff;
+        border-color: transparent;
+        filter: none;
       }
       @keyframes pop {
         from {
@@ -344,24 +405,178 @@
         cursor: not-allowed;
       }
 
+      .flight-col {
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+        overflow: hidden;
+      }
+      .flight-panel {
+        flex: 1;
+        min-height: 0;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+      }
       .sidebar {
         display: flex;
         flex-direction: column;
         gap: 12px;
-        position: sticky;
-        top: 24px;
+        min-height: 0;
+        overflow-y: auto;
+        scrollbar-width: thin;
+        scrollbar-color: var(--border) transparent;
       }
       .panel {
         background: var(--panel);
         border: 1px solid var(--border);
         border-radius: 12px;
-        padding: 16px;
+        padding: 14px;
       }
+      /* ── Flight Recorder ───────────────────────────────────────────────── */
+      #activity-feed {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        margin-top: 4px;
+        flex: 1;
+        min-height: 0;
+        overflow-y: auto;
+        scrollbar-width: thin;
+        scrollbar-color: var(--border) transparent;
+      }
+      .feed-row {
+        display: grid;
+        grid-template-columns: 58px 20px 1fr 48px;
+        align-items: start;
+        gap: 6px;
+        background: rgba(22, 27, 34, 0.6);
+        border: 1px solid var(--border);
+        padding: 7px 10px;
+        border-radius: 7px;
+        font-size: 11px;
+        animation: frSlideIn 0.15s ease-out;
+        transition: background 0.1s;
+        cursor: default;
+      }
+      .feed-row:hover {
+        background: rgba(30, 38, 48, 0.9);
+        border-color: rgba(83, 155, 245, 0.2);
+      }
+      @keyframes frSlideIn {
+        from {
+          opacity: 0;
+          transform: translateX(-4px);
+        }
+        to {
+          opacity: 1;
+          transform: none;
+        }
+      }
+      .feed-ts {
+        color: var(--muted);
+        font-family: monospace;
+        font-size: 9px;
+      }
+      .feed-icon {
+        text-align: center;
+        font-size: 13px;
+      }
+      .feed-content {
+        min-width: 0;
+        color: var(--text-bright);
+        word-break: break-all;
+      }
+      .feed-args {
+        display: block;
+        color: var(--muted);
+        font-family: monospace;
+        margin-top: 2px;
+        font-size: 10px;
+        word-break: break-all;
+      }
+      .feed-badge {
+        text-align: right;
+        font-weight: 700;
+        font-size: 9px;
+        letter-spacing: 0.03em;
+      }
+      .fr-pending {
+        color: var(--muted);
+      }
+      .fr-allow {
+        color: #57ab5a;
+      }
+      .fr-block {
+        color: var(--danger);
+      }
+      .fr-dlp {
+        color: var(--primary);
+        animation: frBlink 1s infinite;
+      }
+      @keyframes frBlink {
+        50% {
+          opacity: 0.4;
+        }
+      }
+      .fr-dlp-row {
+        border-color: var(--primary) !important;
+      }
+      .feed-clear-btn {
+        background: transparent;
+        border: none;
+        color: var(--muted);
+        font-size: 10px;
+        padding: 0;
+        cursor: pointer;
+        margin-left: auto;
+        font-family: inherit;
+        font-weight: 500;
+        transition: color 0.15s;
+      }
+      .feed-clear-btn:hover {
+        color: var(--text);
+        filter: none;
+        transform: none;
+      }
+      /* ── Shields ────────────────────────────────────────────────────────── */
+      .shield-row {
+        display: flex;
+        align-items: flex-start;
+        gap: 10px;
+        padding: 8px 0;
+        border-bottom: 1px solid var(--border);
+      }
+      .shield-row:last-child {
+        border-bottom: none;
+        padding-bottom: 0;
+      }
+      .shield-row:first-child {
+        padding-top: 0;
+      }
+      .shield-info {
+        flex: 1;
+        min-width: 0;
+      }
+      .shield-name {
+        font-size: 12px;
+        color: var(--text-bright);
+        font-weight: 600;
+        font-family: 'Fira Code', monospace;
+      }
+      .shield-desc {
+        font-size: 10px;
+        color: var(--muted);
+        margin-top: 2px;
+        line-height: 1.4;
+      }
+
       .panel-title {
         font-size: 12px;
         font-weight: 700;
         color: var(--text-bright);
         margin-bottom: 12px;
+        flex-shrink: 0;
         display: flex;
         align-items: center;
         gap: 6px;
@@ -369,8 +584,8 @@
       .setting-row {
         display: flex;
         align-items: flex-start;
-        gap: 12px;
-        margin-bottom: 12px;
+        gap: 10px;
+        margin-bottom: 8px;
       }
       .setting-row:last-child {
         margin-bottom: 0;
@@ -379,20 +594,21 @@
         flex: 1;
       }
       .setting-label {
-        font-size: 12px;
+        font-size: 11px;
         color: var(--text-bright);
-        margin-bottom: 3px;
+        margin-bottom: 2px;
+        font-weight: 600;
       }
       .setting-desc {
-        font-size: 11px;
+        font-size: 10px;
         color: var(--muted);
-        line-height: 1.5;
+        line-height: 1.4;
       }
       .toggle {
         position: relative;
         display: inline-block;
-        width: 40px;
-        height: 22px;
+        width: 34px;
+        height: 19px;
         flex-shrink: 0;
         margin-top: 1px;
       }
@@ -412,8 +628,8 @@
       .slider:before {
         content: '';
         position: absolute;
-        width: 16px;
-        height: 16px;
+        width: 13px;
+        height: 13px;
         left: 3px;
         bottom: 3px;
         background: #fff;
@@ -424,7 +640,7 @@
         background: var(--success);
       }
       input:checked + .slider:before {
-        transform: translateX(18px);
+        transform: translateX(15px);
       }
       input:disabled + .slider {
         opacity: 0.4;
@@ -583,12 +799,17 @@
         border: 1px solid var(--border);
       }
 
-      @media (max-width: 680px) {
+      @media (max-width: 960px) {
+        .body {
+          grid-template-columns: 1fr 220px;
+        }
+        .flight-col {
+          display: none;
+        }
+      }
+      @media (max-width: 640px) {
         .body {
           grid-template-columns: 1fr;
-        }
-        .sidebar {
-          position: static;
         }
       }
     </style>
@@ -602,6 +823,19 @@
       </header>
 
       <div class="body">
+        <div class="flight-col">
+          <div class="panel flight-panel">
+            <div class="panel-title">
+              🛰️ Flight Recorder
+              <span style="font-weight: 400; color: var(--muted); font-size: 11px">live</span>
+              <button class="feed-clear-btn" onclick="clearFeed()">clear</button>
+            </div>
+            <div id="activity-feed">
+              <span class="decisions-empty">Waiting for agent activity…</span>
+            </div>
+          </div>
+        </div>
+
         <div class="main">
           <div id="warnBanner" class="warning-banner">
             ⚠️ Auto-start is off — daemon started manually. Run "node9 daemon stop" to stop it, or
@@ -683,6 +917,11 @@
           </div>
 
           <div class="panel">
+            <div class="panel-title">🛡️ Active Shields</div>
+            <div id="shieldsList"><span class="decisions-empty">Loading…</span></div>
+          </div>
+
+          <div class="panel">
             <div class="panel-title">📋 Persistent Decisions</div>
             <div id="decisionsList"><span class="decisions-empty">None yet.</span></div>
           </div>
@@ -727,14 +966,23 @@
 
       function updateDenyButton(id, timestamp) {
         const btn = document.querySelector('#c-' + id + ' .btn-deny');
+        const timer = document.querySelector('#timer-' + id);
         if (!btn) return;
         const elapsed = Date.now() - timestamp;
         const remaining = Math.max(0, Math.ceil((autoDenyMs - elapsed) / 1000));
         if (remaining <= 0) {
-          btn.textContent = 'Auto-Denying...';
+          btn.textContent = '⏳ Auto-Denying…';
           btn.disabled = true;
+          if (timer) {
+            timer.textContent = 'auto-deny';
+            timer.className = 'card-timer urgent';
+          }
         } else {
-          btn.textContent = 'Block Action (' + remaining + 's)';
+          btn.textContent = '🚫 Block this Action';
+          if (timer) {
+            timer.textContent = remaining + 's';
+            timer.className = 'card-timer' + (remaining < 15 ? ' urgent' : '');
+          }
           setTimeout(() => updateDenyButton(id, timestamp), 1000);
         }
       }
@@ -828,16 +1076,21 @@
         const mcpLabel = req.mcpServer ? esc(req.mcpServer) : null;
         const dis = isSlack ? 'disabled' : '';
         card.innerHTML = `
+        <div class="card-header">
+          <span class="card-header-icon">${isSlack ? '⚡' : '⚠️'}</span>
+          <span class="card-header-title">${isSlack ? 'Awaiting Cloud Approval' : 'Action Required'}</span>
+          <span class="card-timer" id="timer-${req.id}">${autoDenyMs > 0 ? Math.ceil(autoDenyMs / 1000) + 's' : ''}</span>
+        </div>
         <div class="source-row">
           <span class="agent-badge">${agentLabel}</span>
           ${mcpLabel ? `<span class="source-arrow">→</span><span class="mcp-badge">mcp::${mcpLabel}</span>` : ''}
         </div>
         <div class="tool-chip">${esc(req.toolName)}</div>
-        ${isSlack ? '<div class="slack-indicator">⚡ Awaiting Slack approval — view only</div>' : ''}
+        ${isSlack ? '<div class="slack-indicator">⚡ Awaiting Cloud approval — view only</div>' : ''}
         ${renderPayload(req)}
         <div class="actions" id="act-${req.id}">
-          <button class="btn-allow" onclick="sendDecision('${req.id}','allow',false)" ${dis}>Approve Execution</button>
-          <button class="btn-deny"  onclick="sendDecision('${req.id}','deny',false)"  ${dis}>Block Action</button>
+          <button class="btn-allow" onclick="sendDecision('${req.id}','allow',false)" ${dis}>✅ Allow this Action</button>
+          <button class="btn-deny"  onclick="sendDecision('${req.id}','deny',false)"  ${dis}>🚫 Block this Action</button>
           <div class="trust-row${trustEnabled ? ' show' : ''}" id="tr-${req.id}">
             <button class="btn-trust" onclick="sendTrust('${req.id}','30m')" ${dis}>⏱ Trust 30m</button>
             <button class="btn-trust" onclick="sendTrust('${req.id}','1h')"  ${dis}>⏱ Trust 1h</button>
@@ -897,8 +1150,83 @@
         ev.addEventListener('slack-status', (e) => {
           applySlackStatus(JSON.parse(e.data));
         });
+        ev.addEventListener('shields-status', (e) => {
+          renderShields(JSON.parse(e.data).shields);
+        });
+
+        // ── Flight Recorder ────────────────────────────────────────────────
+        ev.addEventListener('activity', (e) => {
+          const data = JSON.parse(e.data);
+          const feed = document.getElementById('activity-feed');
+          // Remove placeholder on first item
+          const placeholder = feed.querySelector('.decisions-empty');
+          if (placeholder) placeholder.remove();
+
+          const time = new Date(data.ts).toLocaleTimeString([], {
+            hour12: false,
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+          });
+          const icon = frIcon(data.tool);
+          const argsStr = JSON.stringify(data.args ?? {});
+          const argsPreview = esc(argsStr.length > 120 ? argsStr.slice(0, 120) + '…' : argsStr);
+
+          const row = document.createElement('div');
+          row.className = 'feed-row';
+          row.id = 'fr-' + data.id;
+          row.innerHTML = `
+            <span class="feed-ts">${time}</span>
+            <span class="feed-icon">${icon}</span>
+            <span class="feed-content"><strong>${esc(data.tool)}</strong><span class="feed-args">${argsPreview}</span></span>
+            <span class="feed-badge fr-pending">●</span>
+          `;
+          feed.prepend(row);
+          if (feed.children.length > 100) feed.lastChild.remove();
+        });
+
+        ev.addEventListener('activity-result', (e) => {
+          const { id, status, label } = JSON.parse(e.data);
+          const row = document.getElementById('fr-' + id);
+          if (!row) return;
+          const badge = row.querySelector('.feed-badge');
+          if (status === 'allow') {
+            badge.textContent = 'ALLOW';
+            badge.className = 'feed-badge fr-allow';
+          } else if (status === 'dlp') {
+            badge.textContent = '🛡️ DLP';
+            badge.className = 'feed-badge fr-dlp';
+            row.classList.add('fr-dlp-row');
+          } else {
+            badge.textContent = 'BLOCK';
+            badge.className = 'feed-badge fr-block';
+          }
+        });
       }
       connect();
+
+      const FR_ICONS = {
+        bash: '💻',
+        read: '📖',
+        edit: '✏️',
+        write: '✏️',
+        glob: '📂',
+        grep: '🔍',
+        agent: '🤖',
+        search: '🔍',
+        sql: '🗄️',
+        query: '🗄️',
+        list: '📂',
+        delete: '🗑️',
+        web: '🌐',
+      };
+      function frIcon(tool) {
+        const t = (tool || '').toLowerCase();
+        for (const [k, v] of Object.entries(FR_ICONS)) {
+          if (t.includes(k)) return v;
+        }
+        return '🛠️';
+      }
 
       function saveSetting(key, value) {
         fetch('/settings', {
@@ -988,6 +1316,49 @@
           document.getElementById('warnBanner').classList.remove('show');
         }
       }
+
+      function clearFeed() {
+        const feed = document.getElementById('activity-feed');
+        feed.innerHTML = '<span class="decisions-empty">Feed cleared.</span>';
+      }
+
+      function renderShields(shields) {
+        const list = document.getElementById('shieldsList');
+        if (!shields || shields.length === 0) {
+          list.innerHTML = '<span class="decisions-empty">No shields available.</span>';
+          return;
+        }
+        list.innerHTML = shields
+          .map(
+            (s) => `
+          <div class="shield-row">
+            <div class="shield-info">
+              <div class="shield-name">${esc(s.name)}</div>
+              <div class="shield-desc">${esc(s.description)}</div>
+            </div>
+            <label class="toggle">
+              <input type="checkbox" ${s.active ? 'checked' : ''}
+                onchange="toggleShield('${esc(s.name)}', this.checked)" />
+              <span class="slider"></span>
+            </label>
+          </div>
+        `
+          )
+          .join('');
+      }
+
+      function toggleShield(name, active) {
+        fetch('/shields', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Node9-Token': CSRF_TOKEN },
+          body: JSON.stringify({ name, active }),
+        }).catch(() => {});
+      }
+
+      fetch('/shields')
+        .then((r) => r.json())
+        .then(({ shields }) => renderShields(shields))
+        .catch(() => {});
 
       function renderDecisions(decisions) {
         const dl = document.getElementById('decisionsList');
