@@ -774,4 +774,18 @@ describe('removefrom command', () => {
     expect(result.stderr).toContain('Unknown target');
     expect(result.stderr).toContain('vscode');
   });
+
+  it('exits with code 0 for a valid target (claude) even when nothing to remove', () => {
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'node9-removefrom-'));
+    try {
+      const result = spawnSync(process.execPath, [CLI, 'removefrom', 'claude'], {
+        encoding: 'utf-8',
+        timeout: 5000,
+        env: { ...process.env, NODE9_TESTING: '1', HOME: tmpHome },
+      });
+      expect(result.status).toBe(0);
+    } finally {
+      fs.rmSync(tmpHome, { recursive: true });
+    }
+  });
 });

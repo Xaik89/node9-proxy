@@ -397,6 +397,23 @@ describe('teardownGemini', () => {
     teardownGemini();
     expect(writtenTo(settingsPath)).toBeNull();
   });
+
+  it('removes only node9 matchers and preserves non-node9 matchers in the same event', () => {
+    withExistingFile(settingsPath, {
+      hooks: {
+        BeforeTool: [
+          { matcher: '.*', hooks: [{ command: '/usr/bin/node9 check' }] },
+          { matcher: '.*', hooks: [{ command: '/other/tool run' }] },
+        ],
+      },
+    });
+
+    teardownGemini();
+
+    const written = writtenTo(settingsPath);
+    expect(written.hooks.BeforeTool).toHaveLength(1);
+    expect(written.hooks.BeforeTool[0].hooks[0].command).toBe('/other/tool run');
+  });
 });
 
 // ── teardownCursor ────────────────────────────────────────────────────────────
