@@ -103,12 +103,16 @@ function writeJson(filePath: string, data: unknown): void {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+// Matches hook commands written by node9 in any of these forms:
+//   node9 check                     (global install, NODE9_TESTING)
+//   /path/to/node9 check            (global install, full path)
+//   /path/to/node /path/to/cli.js check  (npm link / local install)
+// The word-boundary prefix (?:^|[\s/\\]) prevents false matches on
+// binaries that merely contain "node9" as a substring (e.g. mynode9).
 function isNode9Hook(cmd: string | undefined): boolean {
-  return !!(
-    cmd?.includes('node9 check') ||
-    cmd?.includes('cli.js check') ||
-    cmd?.includes('node9 log') ||
-    cmd?.includes('cli.js log')
+  if (!cmd) return false;
+  return (
+    /(?:^|[\s/\\])node9 (?:check|log)/.test(cmd) || /(?:^|[\s/\\])cli\.js (?:check|log)/.test(cmd)
   );
 }
 

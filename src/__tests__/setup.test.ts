@@ -398,6 +398,19 @@ describe('teardownGemini', () => {
     expect(writtenTo(settingsPath)).toBeNull();
   });
 
+  it('also matches legacy double-node hook format', () => {
+    withExistingFile(settingsPath, {
+      hooks: {
+        BeforeTool: [{ matcher: '.*', hooks: [{ command: '/usr/bin/node /usr/bin/node9 check' }] }],
+      },
+    });
+
+    teardownGemini();
+
+    const written = writtenTo(settingsPath);
+    expect(written.hooks.BeforeTool).toBeUndefined();
+  });
+
   it('removes only node9 matchers and preserves non-node9 matchers in the same event', () => {
     withExistingFile(settingsPath, {
       hooks: {
