@@ -2,7 +2,14 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import fs from 'fs';
 import os from 'os';
-import { setupClaude, setupGemini, setupCursor } from '../setup.js';
+import {
+  setupClaude,
+  setupGemini,
+  setupCursor,
+  teardownClaude,
+  teardownGemini,
+  teardownCursor,
+} from '../setup.js';
 
 vi.mock('@inquirer/prompts', () => ({ confirm: vi.fn() }));
 
@@ -229,6 +236,137 @@ describe('setupCursor', () => {
     confirm.mockResolvedValue(false);
 
     await setupCursor();
+    expect(writtenTo(mcpPath)).toBeNull();
+  });
+});
+
+// ── teardownClaude ────────────────────────────────────────────────────────────
+
+describe('teardownClaude', () => {
+  const hooksPath = '/mock/home/.claude/settings.json';
+  const mcpPath = '/mock/home/.claude.json';
+
+  it('removes node9 PreToolUse and PostToolUse hook matchers', () => {
+    withExistingFile(hooksPath, {
+      hooks: {
+        PreToolUse: [
+          { matcher: '.*', hooks: [{ type: 'command', command: '/usr/bin/node9 check' }] },
+          { matcher: '.*', hooks: [{ type: 'command', command: '/other/tool run' }] },
+        ],
+        PostToolUse: [
+          { matcher: '.*', hooks: [{ type: 'command', command: '/usr/bin/node9 log' }] },
+        ],
+      },
+    });
+
+    teardownClaude();
+
+    const written = writtenTo(hooksPath);
+    // node9 check matcher removed; other tool preserved
+    expect(written.hooks.PreToolUse).toHaveLength(1);
+    expect(written.hooks.PreToolUse[0].hooks[0].command).toBe('/other/tool run');
+    // PostToolUse fully removed — key deleted
+    expect(written.hooks.PostToolUse).toBeUndefined();
+  });
+
+  it('also matches legacy double-node hook format', () => {
+    withExistingFile(hooksPath, {
+      hooks: {
+        PreToolUse: [
+          {
+            matcher: '.*',
+            hooks: [
+              { type: 'command', command: '/usr/bin/node /usr/bin/node9 check', timeout: 60 },
+            ],
+          },
+        ],
+      },
+    });
+
+    teardownClaude();
+
+    const written = writtenTo(hooksPath);
+    expect(written.hooks.PreToolUse).toBeUndefined();
+  });
+
+  it('unwraps node9-wrapped MCP servers in .claude.json', () => {
+    withExistingFile(mcpPath, {
+      mcpServers: {
+        myServer: { command: 'node9', args: ['npx', '-y', 'some-mcp'] },
+        other: { command: 'python', args: ['server.py'] },
+      },
+    });
+
+    teardownClaude();
+
+    const written = writtenTo(mcpPath);
+    expect(written.mcpServers.myServer.command).toBe('npx');
+    expect(written.mcpServers.myServer.args).toEqual(['-y', 'some-mcp']);
+    // Non-node9 server untouched
+    expect(written.mcpServers.other.command).toBe('python');
+  });
+
+  it('does nothing when settings.json has no node9 hooks', () => {
+    withExistingFile(hooksPath, {
+      hooks: {
+        PreToolUse: [{ matcher: '.*', hooks: [{ type: 'command', command: '/other/tool run' }] }],
+      },
+    });
+
+    teardownClaude();
+    // No write — nothing changed
+    expect(writtenTo(hooksPath)).toBeNull();
+  });
+});
+
+// ── teardownGemini ────────────────────────────────────────────────────────────
+
+describe('teardownGemini', () => {
+  const settingsPath = '/mock/home/.gemini/settings.json';
+
+  it('removes node9 BeforeTool and AfterTool hook matchers', () => {
+    withExistingFile(settingsPath, {
+      hooks: {
+        BeforeTool: [{ matcher: '.*', hooks: [{ command: '/usr/bin/node9 check' }] }],
+        AfterTool: [{ matcher: '.*', hooks: [{ command: '/usr/bin/node9 log' }] }],
+      },
+    });
+
+    teardownGemini();
+
+    const written = writtenTo(settingsPath);
+    expect(written.hooks.BeforeTool).toBeUndefined();
+    expect(written.hooks.AfterTool).toBeUndefined();
+  });
+
+  it('does nothing when file does not exist', () => {
+    // existsSync returns false (default beforeEach state)
+    teardownGemini();
+    expect(writtenTo(settingsPath)).toBeNull();
+  });
+});
+
+// ── teardownCursor ────────────────────────────────────────────────────────────
+
+describe('teardownCursor', () => {
+  const mcpPath = '/mock/home/.cursor/mcp.json';
+
+  it('unwraps node9-wrapped MCP servers', () => {
+    withExistingFile(mcpPath, {
+      mcpServers: {
+        brave: { command: 'node9', args: ['npx', 'server-brave'] },
+      },
+    });
+
+    teardownCursor();
+
+    const written = writtenTo(mcpPath);
+    expect(written.mcpServers.brave.command).toBe('npx');
+    expect(written.mcpServers.brave.args).toEqual(['server-brave']);
+  });
+
+  it('does nothing when file does not exist', () => {
+    teardownCursor();
     expect(writtenTo(mcpPath)).toBeNull();
   });
 });

@@ -454,8 +454,7 @@ program
     // 1. Stop the daemon
     console.log(chalk.bold('Stopping daemon...'));
     try {
-      const { stopDaemon } = await import('./daemon/index.js');
-      await stopDaemon();
+      stopDaemon();
       console.log(chalk.green('  ✅ Daemon stopped'));
     } catch {
       console.log(chalk.blue('  ℹ️  Daemon was not running'));
@@ -1212,7 +1211,7 @@ program
           if (daemonReady) {
             const retry = await authorizeHeadless(toolName, toolInput, false, meta);
             if (retry.approved) {
-              if (retry.checkedBy && process.env.NODE9_DEBUG)
+              if (retry.checkedBy && process.env.NODE9_DEBUG === '1')
                 process.stderr.write(`✓ node9 [${retry.checkedBy}]: "${toolName}" allowed\n`);
               process.exit(0);
             }
