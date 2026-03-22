@@ -20,13 +20,18 @@ vi.mock('child_process', () => ({ spawn: vi.fn() }));
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/** Build a minimal mock http.ClientRequest that immediately calls the
- *  supplied handler, simulating the network outcome for --clear tests. */
+/** Replace http.request with a mock that:
+ *  - captures the response callback via mockImplementationOnce so `callbacks.respond`
+ *    can invoke it with a synthetic IncomingMessage (no fragile mock.calls lookup)
+ *  - exposes timeout/error triggers through the same `callbacks` object
+ *  - calls the test-supplied `handler` when req.end() fires, giving the handler
+ *    a chance to drive whichever scenario it needs */
 function mockHttpRequest(
   handler: (
     req: {
       setTimeout: ReturnType<typeof vi.fn>;
       on: ReturnType<typeof vi.fn>;
+      once: ReturnType<typeof vi.fn>;
       end: ReturnType<typeof vi.fn>;
     },
     callbacks: {
@@ -35,36 +40,47 @@ function mockHttpRequest(
       timeout?: () => void;
     }
   ) => void
-): {
-  respond?: (statusCode: number) => void;
-  error?: (code: string) => void;
-  timeout?: () => void;
-} {
-  const callbacks: {
-    respond?: (statusCode: number) => void;
-    error?: (code: string) => void;
-    timeout?: () => void;
-  } = {};
+): void {
+  vi.spyOn(http, 'request').mockImplementationOnce((...args: unknown[]) => {
+    // Capture the response callback that tail.ts passes as the 2nd argument
+    const resCallback = args[1] as ((res: unknown) => void) | undefined;
 
-  const mockReq: Record<string, ReturnType<typeof vi.fn>> = {
-    setTimeout: vi.fn((_ms: number, cb: () => void) => {
-      callbacks.timeout = cb;
-    }),
-    on: vi.fn((event: string, cb: (err?: NodeJS.ErrnoException) => void) => {
-      if (event === 'error')
-        callbacks.error = (code: string) => cb(Object.assign(new Error(), { code }));
-    }),
-    once: vi.fn((event: string, cb: (err?: NodeJS.ErrnoException) => void) => {
-      if (event === 'error')
-        callbacks.error = (code: string) => cb(Object.assign(new Error(), { code }));
-    }),
-    end: vi.fn(),
-    destroy: vi.fn(),
-  };
-  mockReq.end.mockImplementation(() => handler(mockReq as never, callbacks));
+    const callbacks: {
+      respond?: (statusCode: number) => void;
+      error?: (code: string) => void;
+      timeout?: () => void;
+    } = {};
 
-  vi.spyOn(http, 'request').mockReturnValueOnce(mockReq as unknown as http.ClientRequest);
-  return callbacks;
+    const mockReq: Record<string, ReturnType<typeof vi.fn>> = {
+      setTimeout: vi.fn((_ms: number, cb: () => void) => {
+        callbacks.timeout = cb;
+      }),
+      on: vi.fn(),
+      once: vi.fn((event: string, cb: (err?: NodeJS.ErrnoException) => void) => {
+        if (event === 'error')
+          callbacks.error = (code: string) => cb(Object.assign(new Error(), { code }));
+      }),
+      end: vi.fn(),
+      destroy: vi.fn(),
+    };
+
+    // Wire up respond: builds a minimal IncomingMessage-like object and invokes
+    // the real response callback captured above — no mock.calls lookup needed.
+    callbacks.respond = (statusCode: number) => {
+      const mockRes = {
+        statusCode,
+        resume: vi.fn(),
+        on: vi.fn((event: string, endHandler: () => void) => {
+          if (event === 'end') endHandler();
+        }),
+      };
+      resCallback?.(mockRes);
+    };
+
+    mockReq.end.mockImplementation(() => handler(mockReq as never, callbacks));
+
+    return mockReq as unknown as http.ClientRequest;
+  });
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -77,21 +93,8 @@ describe('startTail --clear error handling', () => {
   });
 
   it('resolves without throwing when daemon returns 200', async () => {
-    mockHttpRequest((_req, _cb) => {
-      // Simulate daemon responding with 200
-      const mockRes = {
-        statusCode: 200,
-        resume: vi.fn(),
-        on: vi.fn((event: string, handler: () => void) => {
-          if (event === 'end') handler();
-        }),
-      };
-      // http.request callback receives the response
-      const requestSpy = vi.mocked(http.request);
-      const requestCallback = requestSpy.mock.calls[0]?.[1] as
-        | ((res: typeof mockRes) => void)
-        | undefined;
-      requestCallback?.(mockRes);
+    mockHttpRequest((_req, cb) => {
+      cb.respond?.(200);
     });
 
     const { startTail } = await import('../tui/tail.js');
@@ -117,19 +120,8 @@ describe('startTail --clear error handling', () => {
   });
 
   it('throws with HTTP status when daemon returns non-2xx', async () => {
-    mockHttpRequest((_req, _cb) => {
-      const mockRes = {
-        statusCode: 500,
-        resume: vi.fn(),
-        on: vi.fn((event: string, handler: () => void) => {
-          if (event === 'end') handler();
-        }),
-      };
-      const requestSpy = vi.mocked(http.request);
-      const requestCallback = requestSpy.mock.calls[0]?.[1] as
-        | ((res: typeof mockRes) => void)
-        | undefined;
-      requestCallback?.(mockRes);
+    mockHttpRequest((_req, cb) => {
+      cb.respond?.(500);
     });
 
     const { startTail } = await import('../tui/tail.js');

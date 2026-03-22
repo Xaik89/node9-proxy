@@ -137,15 +137,15 @@ export async function startTail(options: TailOptions = {}): Promise<void> {
       const req = http.request(
         { method: 'POST', hostname: '127.0.0.1', port, path: '/events/clear' },
         (res) => {
-          res.resume();
           const status = res.statusCode ?? 0;
-          // Non-2xx: surface the HTTP status so the user knows what went wrong
+          // Attach 'end' before resume() so the event is never missed on fast responses
           res.on('end', () =>
             resolve({
               ok: status >= 200 && status < 300,
               code: status >= 200 && status < 300 ? undefined : `HTTP ${status}`,
             })
           );
+          res.resume();
         }
       );
       req.setTimeout(2000, () => {
