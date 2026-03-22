@@ -42,7 +42,9 @@ function mockHttpRequest(
   ) => void
 ): void {
   vi.spyOn(http, 'request').mockImplementationOnce((...args: unknown[]) => {
-    // Capture the response callback that tail.ts passes as the 2nd argument
+    // tail.ts always uses the 2-arg form: http.request(options, callback).
+    // If the call signature ever changes to 3-arg (url, options, callback),
+    // update this index from 1 to 2.
     const resCallback = args[1] as ((res: unknown) => void) | undefined;
 
     const callbacks: {
@@ -95,6 +97,15 @@ describe('startTail --clear error handling', () => {
   it('resolves without throwing when daemon returns 200', async () => {
     mockHttpRequest((_req, cb) => {
       cb.respond?.(200);
+    });
+
+    const { startTail } = await import('../tui/tail.js');
+    await expect(startTail({ clear: true })).resolves.toBeUndefined();
+  });
+
+  it('resolves without throwing for any 2xx status (e.g. 299)', async () => {
+    mockHttpRequest((_req, cb) => {
+      cb.respond?.(299);
     });
 
     const { startTail } = await import('../tui/tail.js');
