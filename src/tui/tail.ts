@@ -148,6 +148,9 @@ export async function startTail(options: TailOptions = {}): Promise<void> {
           res.resume();
         }
       );
+      // Register error handler before setTimeout so it is always in place before
+      // any path that calls req.destroy() (timeout or caller abort).
+      req.once('error', (err: NodeJS.ErrnoException) => resolve({ ok: false, code: err.code }));
       req.setTimeout(2000, () => {
         // resolve() before destroy() so the promise settles as ETIMEDOUT first.
         // destroy() may then emit an error event, but req.once ensures the
@@ -155,7 +158,6 @@ export async function startTail(options: TailOptions = {}): Promise<void> {
         resolve({ ok: false, code: 'ETIMEDOUT' });
         req.destroy();
       });
-      req.once('error', (err: NodeJS.ErrnoException) => resolve({ ok: false, code: err.code }));
       req.end();
     });
     if (result.ok) {

@@ -90,6 +90,7 @@ function mockHttpRequest(
 describe('startTail --clear error handling', () => {
   beforeEach(() => {
     vi.resetModules();
+    vi.clearAllMocks();
     // ensureDaemon: make the health-check fetch succeed so we reach the --clear logic
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true }));
   });
@@ -121,13 +122,16 @@ describe('startTail --clear error handling', () => {
     await expect(startTail({ clear: true })).rejects.toThrow(/not running/i);
   });
 
-  it('throws with ETIMEDOUT message when daemon hangs', async () => {
-    mockHttpRequest((_req, cb) => {
+  it('throws with ETIMEDOUT message when daemon hangs and destroys the request', async () => {
+    let capturedReq: { destroy: ReturnType<typeof vi.fn> } | undefined;
+    mockHttpRequest((req, cb) => {
+      capturedReq = req;
       cb.timeout?.();
     });
 
     const { startTail } = await import('../tui/tail.js');
     await expect(startTail({ clear: true })).rejects.toThrow(/did not respond/i);
+    expect(capturedReq?.destroy).toHaveBeenCalledOnce();
   });
 
   it('throws with HTTP status when daemon returns non-2xx', async () => {
