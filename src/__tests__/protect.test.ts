@@ -26,10 +26,14 @@ beforeEach(() => {
 /** Grant approval for a tool via a persistent decision file (no HITL needed). */
 function setPersistentDecision(toolName: string, decision: 'allow' | 'deny') {
   const decisionsPath = '/mock/home/.node9/decisions.json';
-  existsSpy.mockImplementation((p) => String(p) === decisionsPath);
-  readSpy.mockImplementation((p) =>
-    String(p) === decisionsPath ? JSON.stringify({ [toolName]: decision }) : ''
-  );
+  const globalPath = '/mock/home/.node9/config.json';
+  existsSpy.mockImplementation((p) => String(p) === decisionsPath || String(p) === globalPath);
+  readSpy.mockImplementation((p) => {
+    if (String(p) === decisionsPath) return JSON.stringify({ [toolName]: decision });
+    if (String(p) === globalPath)
+      return JSON.stringify({ settings: { mode: 'standard', approvalTimeoutMs: 0 } });
+    return '';
+  });
 }
 
 describe('protect()', () => {

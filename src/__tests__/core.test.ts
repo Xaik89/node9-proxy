@@ -83,7 +83,12 @@ function mockBothConfigs(projectConfig: object, globalConfig: object) {
  *  and noApprovalMechanism tests work correctly. */
 function mockNoNativeConfig(extra?: object) {
   mockGlobalConfig({
-    settings: { approvers: { native: false }, ...(extra as Record<string, unknown>) },
+    settings: {
+      mode: 'standard',
+      approvalTimeoutMs: 0,
+      approvers: { native: false },
+      ...(extra as Record<string, unknown>),
+    },
   });
 }
 
@@ -171,10 +176,14 @@ describe('standard mode — dangerous word detection', () => {
 describe('persistent decision approval', () => {
   function setPersistentDecision(toolName: string, decision: 'allow' | 'deny') {
     const decisionsPath = path.join('/mock/home', '.node9', 'decisions.json');
-    existsSpy.mockImplementation((p) => String(p) === decisionsPath);
-    readSpy.mockImplementation((p) =>
-      String(p) === decisionsPath ? JSON.stringify({ [toolName]: decision }) : ''
-    );
+    const globalPath = path.join('/mock/home', '.node9', 'config.json');
+    existsSpy.mockImplementation((p) => [decisionsPath, globalPath].includes(String(p)));
+    readSpy.mockImplementation((p) => {
+      if (String(p) === decisionsPath) return JSON.stringify({ [toolName]: decision });
+      if (String(p) === globalPath)
+        return JSON.stringify({ settings: { mode: 'standard', approvalTimeoutMs: 0 } });
+      return '';
+    });
   }
 
   it('returns true when persistent decision is allow', async () => {
@@ -406,7 +415,7 @@ describe('global config (~/.node9/config.json)', () => {
 
 describe('authorizeHeadless', () => {
   it('returns approved:true for safe tools', async () => {
-    expect(await authorizeHeadless('list_users', {})).toEqual({ approved: true });
+    expect(await authorizeHeadless('list_users', {})).toMatchObject({ approved: true });
   });
 
   it('returns approved:false with noApprovalMechanism when no API key', async () => {
@@ -507,10 +516,14 @@ describe('authorizeHeadless — persistent decisions', () => {
 
   it('blocks without API when persistent decision is "deny"', async () => {
     const decisionsPath = path.join('/mock/home', '.node9', 'decisions.json');
-    existsSpy.mockImplementation((p) => String(p) === decisionsPath);
-    readSpy.mockImplementation((p) =>
-      String(p) === decisionsPath ? JSON.stringify({ mkfs_disk: 'deny' }) : ''
-    );
+    const globalPath = path.join('/mock/home', '.node9', 'config.json');
+    existsSpy.mockImplementation((p) => String(p) === decisionsPath || String(p) === globalPath);
+    readSpy.mockImplementation((p) => {
+      if (String(p) === decisionsPath) return JSON.stringify({ mkfs_disk: 'deny' });
+      if (String(p) === globalPath)
+        return JSON.stringify({ settings: { mode: 'standard', approvalTimeoutMs: 0 } });
+      return '';
+    });
     const result = await authorizeHeadless('mkfs_disk', {});
     expect(result.approved).toBe(false);
     expect(result.reason).toMatch(/always deny/i);
@@ -809,6 +822,7 @@ describe('evaluatePolicy — smart rules', () => {
 describe('authorizeHeadless — smart rule hard block', () => {
   it('returns approved:false without invoking race engine for block verdict', async () => {
     mockProjectConfig({
+      settings: { mode: 'standard', approvalTimeoutMs: 0 },
       policy: {
         smartRules: [
           {

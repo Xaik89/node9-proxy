@@ -61,6 +61,7 @@ export const ConfigFileSchema = z
         enableUndo: z.boolean().optional(),
         enableHookLogDebug: z.boolean().optional(),
         approvalTimeoutMs: z.number().nonnegative().optional(),
+        flightRecorder: z.boolean().optional(),
         approvers: z
           .object({
             native: z.boolean().optional(),

@@ -6,7 +6,7 @@ import net from 'net';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { spawn } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
 import { randomUUID } from 'crypto';
 import chalk from 'chalk';
 import { authorizeHeadless, getGlobalSettings, getConfig, _resetConfigCache } from '../core';
@@ -667,6 +667,12 @@ export function startDaemon(): void {
       }
     }
 
+    if (req.method === 'POST' && pathname === '/events/clear') {
+      activityRing.length = 0;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ ok: true }));
+    }
+
     if (req.method === 'GET' && pathname === '/audit') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify(getAuditHistory()));
@@ -716,24 +722,60 @@ export function startDaemon(): void {
 
   daemonServer = server;
 
-  // ── Port Conflict Resolution (Fixes Task 0.2) ───────────────────────────
+  // ── Port Conflict Resolution ─────────────────────────────────────────────
   server.on('error', (e: NodeJS.ErrnoException) => {
     if (e.code === 'EADDRINUSE') {
       try {
         if (fs.existsSync(DAEMON_PID_FILE)) {
           const { pid } = JSON.parse(fs.readFileSync(DAEMON_PID_FILE, 'utf-8'));
           process.kill(pid, 0); // Throws if process is dead
-          // If we reach here, a legitimate daemon is running. Safely exit.
+          // Legitimate daemon running with PID file. Safely exit.
           return process.exit(0);
         }
       } catch {
-        // Zombie PID detected. Clean up and resurrect server.
+        // Zombie PID in file — clean up and retry listen.
         try {
           fs.unlinkSync(DAEMON_PID_FILE);
         } catch {}
         server.listen(DAEMON_PORT, DAEMON_HOST);
         return;
       }
+
+      // No PID file but port is in use — orphaned daemon from a previous run.
+      // Do an HTTP health check; if healthy, recover the PID file and exit 0.
+      fetch(`http://${DAEMON_HOST}:${DAEMON_PORT}/settings`, {
+        signal: AbortSignal.timeout(1000),
+      })
+        .then((res) => {
+          if (res.ok) {
+            // Port is healthy. Try to find the listening PID via ss and write the PID file.
+            try {
+              const r = spawnSync('ss', ['-Htnp', `sport = :${DAEMON_PORT}`], {
+                encoding: 'utf8',
+                timeout: 1000,
+              });
+              const match = r.stdout?.match(/pid=(\d+)/);
+              if (match) {
+                const orphanPid = parseInt(match[1], 10);
+                process.kill(orphanPid, 0); // Verify still alive
+                atomicWriteSync(
+                  DAEMON_PID_FILE,
+                  JSON.stringify({ pid: orphanPid, port: DAEMON_PORT, internalToken, autoStarted }),
+                  { mode: 0o600 }
+                );
+              }
+            } catch {}
+            process.exit(0);
+          } else {
+            // Unhealthy — try to reclaim the port.
+            server.listen(DAEMON_PORT, DAEMON_HOST);
+          }
+        })
+        .catch(() => {
+          // Not reachable — try to reclaim the port.
+          server.listen(DAEMON_PORT, DAEMON_HOST);
+        });
+      return;
     }
     console.error(chalk.red('\n🛑 Node9 Daemon Error:'), e.message);
     process.exit(1);
@@ -824,13 +866,25 @@ export function stopDaemon(): void {
 }
 
 export function daemonStatus(): void {
-  if (!fs.existsSync(DAEMON_PID_FILE))
-    return console.log(chalk.yellow('Node9 daemon: not running'));
-  try {
-    const { pid } = JSON.parse(fs.readFileSync(DAEMON_PID_FILE, 'utf-8'));
-    process.kill(pid, 0);
-    console.log(chalk.green('Node9 daemon: running'));
-  } catch {
-    console.log(chalk.yellow('Node9 daemon: not running (stale PID)'));
+  if (fs.existsSync(DAEMON_PID_FILE)) {
+    try {
+      const { pid } = JSON.parse(fs.readFileSync(DAEMON_PID_FILE, 'utf-8'));
+      process.kill(pid, 0);
+      console.log(chalk.green('Node9 daemon: running'));
+      return;
+    } catch {
+      console.log(chalk.yellow('Node9 daemon: not running (stale PID)'));
+      return;
+    }
+  }
+  // No PID file — check if port is actually in use (orphaned daemon)
+  const r = spawnSync('ss', ['-Htnp', `sport = :${DAEMON_PORT}`], {
+    encoding: 'utf8',
+    timeout: 500,
+  });
+  if (r.status === 0 && (r.stdout ?? '').includes(`:${DAEMON_PORT}`)) {
+    console.log(chalk.yellow('Node9 daemon: running (no PID file — orphaned)'));
+  } else {
+    console.log(chalk.yellow('Node9 daemon: not running'));
   }
 }
