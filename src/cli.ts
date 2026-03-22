@@ -444,9 +444,7 @@ program
     try {
       fn!();
     } catch (err) {
-      console.error(
-        chalk.red(`  ⚠️  Failed: ${err instanceof Error ? err.message : String(err)}`)
-      );
+      console.error(chalk.red(`  ⚠️  Failed: ${err instanceof Error ? err.message : String(err)}`));
       process.exit(1);
     }
     console.log(chalk.gray('\n  Restart the agent for changes to take effect.'));
