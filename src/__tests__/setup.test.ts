@@ -352,6 +352,18 @@ describe('teardownClaude', () => {
     expect(writtenTo(mcpPath)).toBeNull();
   });
 
+  it('does not throw when settings.json contains malformed JSON', () => {
+    vi.mocked(fs.existsSync).mockImplementation((p) => String(p) === hooksPath);
+    vi.mocked(fs.readFileSync).mockImplementation((p) => {
+      if (String(p) === hooksPath) return 'not valid json {{{';
+      throw new Error('not found');
+    });
+
+    // readJson catches the parse error and returns null — teardown is a no-op
+    expect(() => teardownClaude()).not.toThrow();
+    expect(writtenTo(hooksPath)).toBeNull();
+  });
+
   it('does nothing when settings.json exists but hooks key is absent', () => {
     // File exists but has no hooks section (e.g. only mcpServers configured)
     withExistingFile(hooksPath, { someOtherKey: true });

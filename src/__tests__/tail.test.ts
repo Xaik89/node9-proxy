@@ -151,6 +151,15 @@ describe('startTail --clear error handling', () => {
     await expect(startTail({ clear: true })).rejects.toThrow(/HTTP 500/);
   });
 
+  it('throws for 3xx status (boundary: 300 is not a success)', async () => {
+    mockHttpRequest((_req, cb) => {
+      cb.respond?.(300);
+    });
+
+    const { startTail } = await import('../tui/tail.js');
+    await expect(startTail({ clear: true })).rejects.toThrow(/HTTP 300/);
+  });
+
   it('throws with error code for unrecognised network errors (e.g. ECONNRESET)', async () => {
     mockHttpRequest((_req, cb) => {
       cb.error?.('ECONNRESET');

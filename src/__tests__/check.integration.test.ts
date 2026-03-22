@@ -761,7 +761,7 @@ describe('malformed JSON payload', () => {
   });
 });
 
-// ── removefrom CLI wiring ─────────────────────────────────────────────────────
+// ── removefrom command ────────────────────────────────────────────────────────
 
 describe('removefrom command', () => {
   // Use a minimal env to avoid leaking CI secrets into subprocess invocations.
