@@ -149,10 +149,11 @@ export async function startTail(options: TailOptions = {}): Promise<void> {
         }
       );
       req.setTimeout(2000, () => {
-        // destroy() may fire the error listener once more (ECONNRESET) after this
-        // resolves — req.once ensures the listener is already gone by then.
-        req.destroy();
+        // resolve() before destroy() so the promise settles as ETIMEDOUT first.
+        // destroy() may then emit an error event, but req.once ensures the
+        // listener has already been consumed and won't call resolve() again.
         resolve({ ok: false, code: 'ETIMEDOUT' });
+        req.destroy();
       });
       req.once('error', (err: NodeJS.ErrnoException) => resolve({ ok: false, code: err.code }));
       req.end();
