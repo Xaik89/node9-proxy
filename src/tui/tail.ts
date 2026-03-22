@@ -87,20 +87,22 @@ function renderPending(activity: ActivityItem): void {
 }
 
 async function ensureDaemon(): Promise<number> {
-  // Already running — just read the port
+  // Read the port from PID file if it exists, then verify the daemon is alive
+  let pidPort: number | null = null;
   if (fs.existsSync(PID_FILE)) {
     try {
       const { port } = JSON.parse(fs.readFileSync(PID_FILE, 'utf-8')) as { port: number };
-      return port;
+      pidPort = port;
     } catch {}
   }
 
-  // No PID file — check if an orphaned daemon is already listening on the port
+  // Health check — covers both PID-file and orphaned daemon cases
+  const checkPort = pidPort ?? DAEMON_PORT;
   try {
-    const res = await fetch(`http://127.0.0.1:${DAEMON_PORT}/settings`, {
+    const res = await fetch(`http://127.0.0.1:${checkPort}/settings`, {
       signal: AbortSignal.timeout(500),
     });
-    if (res.ok) return DAEMON_PORT;
+    if (res.ok) return checkPort;
   } catch {}
 
   // Not running — start it in the background
