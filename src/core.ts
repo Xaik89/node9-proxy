@@ -4,6 +4,8 @@ import { confirm } from '@inquirer/prompts';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import net from 'net';
+import { randomUUID } from 'crypto';
 import pm from 'picomatch';
 import { parse } from 'sh-syntax';
 import { askNativePopup, sendDesktopNotification } from './ui/native';
@@ -1275,7 +1277,8 @@ async function askDaemon(
   args: unknown,
   meta?: { agent?: string; mcpServer?: string },
   signal?: AbortSignal,
-  riskMetadata?: RiskMetadata
+  riskMetadata?: RiskMetadata,
+  activityId?: string
 ): Promise<'allow' | 'deny' | 'abandoned'> {
   const base = `http://${DAEMON_HOST}:${DAEMON_PORT}`;
 
@@ -1294,6 +1297,12 @@ async function askDaemon(
         args,
         agent: meta?.agent,
         mcpServer: meta?.mcpServer,
+        fromCLI: true,
+        // Pass the flight-recorder ID so the daemon uses the same UUID for
+        // activity-result as the CLI used for the pending activity event.
+        // Without this, the two UUIDs never match and tail.ts never resolves
+        // the pending item.
+        activityId,
         ...(riskMetadata && { riskMetadata }),
       }),
       signal: checkCtrl.signal,
@@ -1404,12 +1413,83 @@ export interface AuthResult {
     | 'audit';
 }
 
+// ── Flight Recorder — fire-and-forget socket notify ──────────────────────────
+const ACTIVITY_SOCKET_PATH =
+  process.platform === 'win32'
+    ? '\\\\.\\pipe\\node9-activity'
+    : path.join(os.tmpdir(), 'node9-activity.sock');
+
+// Returns a Promise so callers can await socket flush before process.exit().
+// Without await, process.exit(0) kills the socket mid-connect for fast-passing
+// tools (Read, Glob, Grep, etc.), making them invisible in node9 tail.
+function notifyActivity(data: {
+  id: string;
+  ts: number;
+  tool: string;
+  args?: unknown;
+  status: string;
+  label?: string;
+}): Promise<void> {
+  return new Promise<void>((resolve) => {
+    try {
+      const payload = JSON.stringify(data);
+      const sock = net.createConnection(ACTIVITY_SOCKET_PATH);
+      sock.on('connect', () => {
+        // Attach listeners before calling end() so events fired synchronously
+        // on the loopback socket are not missed.
+        sock.on('close', resolve);
+        sock.end(payload);
+      });
+      sock.on('error', resolve); // daemon not running — resolve immediately
+    } catch {
+      resolve();
+    }
+  });
+}
+
 export async function authorizeHeadless(
   toolName: string,
   args: unknown,
   allowTerminalFallback = false,
   meta?: { agent?: string; mcpServer?: string },
   options?: { calledFromDaemon?: boolean }
+): Promise<AuthResult> {
+  // Skip socket notification when called from daemon — daemon already broadcasts via SSE
+  if (!options?.calledFromDaemon) {
+    const actId = randomUUID();
+    const actTs = Date.now();
+    await notifyActivity({ id: actId, ts: actTs, tool: toolName, args, status: 'pending' });
+    const result = await _authorizeHeadlessCore(toolName, args, allowTerminalFallback, meta, {
+      ...options,
+      activityId: actId,
+    });
+    // noApprovalMechanism means no channels were available — the CLI will retry
+    // after auto-starting the daemon. Don't log a false 'block' to the flight
+    // recorder; the retry call will produce the real result notification.
+    if (!result.noApprovalMechanism) {
+      await notifyActivity({
+        id: actId,
+        tool: toolName,
+        ts: actTs,
+        status: result.approved
+          ? 'allow'
+          : result.blockedByLabel?.includes('DLP')
+            ? 'dlp'
+            : 'block',
+        label: result.blockedByLabel,
+      });
+    }
+    return result;
+  }
+  return _authorizeHeadlessCore(toolName, args, allowTerminalFallback, meta, options);
+}
+
+async function _authorizeHeadlessCore(
+  toolName: string,
+  args: unknown,
+  allowTerminalFallback = false,
+  meta?: { agent?: string; mcpServer?: string },
+  options?: { calledFromDaemon?: boolean; activityId?: string }
 ): Promise<AuthResult> {
   if (process.env.NODE9_PAUSED === '1') return { approved: true, checkedBy: 'paused' };
   const pauseState = checkPause();
@@ -1472,7 +1552,10 @@ export async function authorizeHeadless(
           blockedByLabel: '🚨 Node9 DLP (Secret Detected)',
         };
       }
-      // severity === 'review': fall through to the race engine with a DLP label
+      // severity === 'review': fall through to the race engine with a DLP label.
+      // Write an audit entry now so the DLP flag is traceable even if the race
+      // engine later approves the call without recording why it was intercepted.
+      if (!isManual) appendLocalAudit(toolName, args, 'allow', 'dlp-review-flagged', meta);
       explainableLabel = '🚨 Node9 DLP (Credential Review)';
     }
   }
@@ -1750,7 +1833,14 @@ export async function authorizeHeadless(
             console.error(chalk.cyan(`   URL → http://${DAEMON_HOST}:${DAEMON_PORT}/\n`));
           }
 
-          const daemonDecision = await askDaemon(toolName, args, meta, signal, riskMetadata);
+          const daemonDecision = await askDaemon(
+            toolName,
+            args,
+            meta,
+            signal,
+            riskMetadata,
+            options?.activityId
+          );
           if (daemonDecision === 'abandoned') throw new Error('Abandoned');
 
           const isApproved = daemonDecision === 'allow';
@@ -2027,7 +2117,10 @@ export function getConfig(): Config {
     for (const rule of shield.smartRules) {
       if (!existingRuleNames.has(rule.name)) mergedPolicy.smartRules.push(rule);
     }
-    for (const word of shield.dangerousWords) mergedPolicy.dangerousWords.push(word);
+    const existingWords = new Set(mergedPolicy.dangerousWords);
+    for (const word of shield.dangerousWords) {
+      if (!existingWords.has(word)) mergedPolicy.dangerousWords.push(word);
+    }
   }
 
   // Advisory rm rules are always appended last so user-defined rules (project/global/shield)

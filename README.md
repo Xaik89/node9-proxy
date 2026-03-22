@@ -40,6 +40,36 @@ Node9 initiates a **Concurrent Race** across all enabled channels. The first cha
 - **Cloud (Slack):** Remote asynchronous approval for team governance.
 - **Terminal:** Classic `[Y/n]` prompt for manual proxy usage and SSH sessions.
 
+### 🛰️ Flight Recorder — See Everything, Instantly
+
+Node9 records every tool call your AI agent makes in real-time — no polling, no log files, no refresh. Two ways to watch:
+
+**Browser Dashboard** (`node9 daemon start` → `localhost:7391`)
+
+A live 3-column dashboard. The left column streams every tool call as it happens, updating in-place from `● PENDING` to `✓ ALLOW` or `✗ BLOCK`. The center handles pending approvals. The right sidebar controls shields and persistent decisions — all without ever causing a browser scrollbar.
+
+**Terminal** (`node9 tail`)
+
+A split-pane friendly stream for terminal-first developers and SSH sessions:
+
+```bash
+node9 tail                # live events only
+node9 tail --history      # replay recent history then go live
+node9 tail | grep DLP     # filter to DLP blocks only
+```
+
+```
+🛰️  Node9 tail  → localhost:7391
+Showing live events. Press Ctrl+C to exit.
+
+21:06:58 📖 Read            {"file_path":"src/core.ts"}            ✓ ALLOW
+21:06:59 🔍 Grep            {"pattern":"authorizeHeadless"}        ✓ ALLOW
+21:07:01 💻 Bash            {"command":"npm run build"}            ✓ ALLOW
+21:07:04 💻 Bash            {"command":"curl … Bearer sk-ant-…"}   ✗ BLOCK 🛡️ DLP
+```
+
+`node9 tail` auto-starts the daemon if it isn't running — no setup step needed.
+
 ### 🧠 AI Negotiation Loop
 
 Node9 doesn't just "cut the wire." When a command is blocked, it injects a **Structured Negotiation Prompt** back into the AI's context window. This teaches the AI why it was stopped and instructs it to pivot to a safer alternative.
@@ -99,12 +129,51 @@ Node9 has two layers of protection. You get Layer 1 automatically. Layer 2 is on
 
 Built into the binary. Zero configuration required. Protects the tools every developer uses.
 
-| What it protects | Example blocked action                                  |
-| :--------------- | :------------------------------------------------------ |
-| **Git**          | `git push --force`, `git reset --hard`, `git clean -fd` |
-| **Shell**        | `curl ... \| bash`, `sudo` commands                     |
-| **SQL**          | `DELETE` / `UPDATE` without a `WHERE` clause            |
-| **Filesystem**   | `rm -rf` targeting home directory                       |
+| What it protects  | Example blocked action                                  |
+| :---------------- | :------------------------------------------------------ |
+| **Git**           | `git push --force`, `git reset --hard`, `git clean -fd` |
+| **Shell**         | `curl ... \| bash`, `sudo` commands                     |
+| **SQL**           | `DELETE` / `UPDATE` without a `WHERE` clause            |
+| **Filesystem**    | `rm -rf` targeting home directory                       |
+| **Secrets (DLP)** | AWS keys, GitHub tokens, Stripe keys, PEM private keys  |
+
+### 🔍 DLP — Content Scanner (Always On)
+
+Node9 scans **every tool call argument** for secrets before the command reaches your agent. If a credential is detected, Node9 hard-blocks the action, redacts the secret in the audit log, and injects a negotiation prompt telling the AI what went wrong.
+
+**Built-in patterns:**
+
+| Pattern           | Severity | Prefix format               |
+| :---------------- | :------- | :-------------------------- |
+| AWS Access Key ID | `block`  | `AKIA` + 16 chars           |
+| GitHub Token      | `block`  | `ghp_`, `gho_`, `ghs_`      |
+| Slack Bot Token   | `block`  | `xoxb-`                     |
+| OpenAI API Key    | `block`  | `sk-` + 20+ chars           |
+| Stripe Secret Key | `block`  | `sk_live_` / `sk_test_`     |
+| PEM Private Key   | `block`  | `-----BEGIN PRIVATE KEY---` |
+| Bearer Token      | `review` | `Authorization: Bearer ...` |
+
+`block` = hard deny, no approval prompt. `review` = routed through the normal race engine for human approval.
+
+Secrets are **never logged in full** — the audit trail stores only a redacted sample (`AKIA****MPLE`).
+
+**Config knobs** (in `node9.config.json` or `~/.node9/config.json`):
+
+```json
+{
+  "policy": {
+    "dlp": {
+      "enabled": true,
+      "scanIgnoredTools": true
+    }
+  }
+}
+```
+
+| Key                    | Default | Description                                                        |
+| :--------------------- | :------ | :----------------------------------------------------------------- |
+| `dlp.enabled`          | `true`  | Master switch — disable to turn off all DLP scanning               |
+| `dlp.scanIgnoredTools` | `true`  | Also scan tools in `ignoredTools` (e.g. `web_search`, `read_file`) |
 
 ### Layer 2 — Shields (Opt-in, Per Service)
 
@@ -251,6 +320,7 @@ Use `node9 explain <tool> <args>` to dry-run any tool call and see exactly which
 | `node9 status`                | Show current protection status and active rules                                       |
 | `node9 doctor`                | Health check — verifies binaries, config, credentials, and all agent hooks            |
 | `node9 shield <cmd>`          | Manage shields (`enable`, `disable`, `list`, `status`)                                |
+| `node9 tail [--history]`      | Stream live agent activity to the terminal (auto-starts daemon if needed)             |
 | `node9 explain <tool> [args]` | Trace the policy waterfall for a given tool call (dry-run, no approval prompt)        |
 | `node9 undo [--steps N]`      | Revert the last N AI file edits using shadow Git snapshots                            |
 | `node9 check`                 | Called by agent hooks; evaluates a pending tool call and exits 0 (allow) or 1 (block) |
@@ -318,7 +388,8 @@ A corporate policy has locked this action. You must click the "Approve" button i
 - [x] **Shadow Git Snapshots** (1-click Undo for AI hallucinations)
 - [x] **Identity-Aware Execution** (Differentiates between Human vs. AI risk levels)
 - [x] **Shield Templates** (`node9 shield enable <service>` — one-click protection for Postgres, GitHub, AWS)
-- [ ] **Content Scanner / DLP** (Detect and block secrets like AWS keys and Bearer tokens in-flight)
+- [x] **Content Scanner / DLP** (Detect and block secrets like AWS keys and Bearer tokens in-flight)
+- [x] **Flight Recorder** (Real-time activity stream in browser dashboard and `node9 tail` terminal view)
 - [ ] **Universal MCP Gateway** (Standalone security tunnel for LangChain, CrewAI, and any agent without native hooks)
 - [ ] **Cursor & Windsurf Hook** (Native hook support for AI-first IDEs)
 - [ ] **VS Code Extension** (Approval requests in a native sidebar — no more OS popups)
