@@ -6,6 +6,7 @@ import path from 'path';
 import os from 'os';
 import net from 'net';
 import { randomUUID } from 'crypto';
+import { spawnSync } from 'child_process';
 import pm from 'picomatch';
 import { parse } from 'sh-syntax';
 import { askNativePopup, sendDesktopNotification } from './ui/native';
@@ -271,7 +272,8 @@ export function evaluateSmartConditions(args: unknown, rule: SmartRule): boolean
       case 'matchesGlob':
         return val !== null && cond.value ? pm.isMatch(val, cond.value) : false;
       case 'notMatchesGlob':
-        return val !== null && cond.value ? !pm.isMatch(val, cond.value) : true;
+        // Missing value → treat as misconfigured rule; fail closed (false) rather than open (true)
+        return val !== null && cond.value ? !pm.isMatch(val, cond.value) : false;
       default:
         return false;
     }
@@ -430,12 +432,14 @@ interface EnvironmentConfig {
 }
 
 interface Config {
+  version?: string;
   settings: {
     mode: string;
     autoStartDaemon?: boolean;
     enableUndo?: boolean;
     enableHookLogDebug?: boolean;
     approvalTimeoutMs?: number;
+    flightRecorder?: boolean;
     approvers: { native: boolean; browser: boolean; cloud: boolean; terminal: boolean };
     environment?: string;
   };
@@ -485,13 +489,15 @@ export const DANGEROUS_WORDS = [
 
 // 2. The Master Default Config
 export const DEFAULT_CONFIG: Config = {
+  version: '1.0',
   settings: {
-    mode: 'standard',
+    mode: 'audit',
     autoStartDaemon: true,
     enableUndo: true, // 🔥 ALWAYS TRUE BY DEFAULT for the safety net
-    enableHookLogDebug: false,
-    approvalTimeoutMs: 0, // 0 = disabled; set e.g. 30000 for 30-second auto-deny
-    approvers: { native: true, browser: true, cloud: true, terminal: true },
+    enableHookLogDebug: true,
+    approvalTimeoutMs: 30000, // 30-second auto-deny timeout
+    flightRecorder: true,
+    approvers: { native: true, browser: true, cloud: false, terminal: true },
   },
   policy: {
     sandboxPaths: ['/tmp/**', '**/sandbox/**', '**/test-results/**'],
@@ -712,7 +718,7 @@ export function getGlobalSettings(): {
       >;
       const settings = (parsed.settings as Record<string, unknown>) || {};
       return {
-        mode: (settings.mode as string) || 'standard',
+        mode: (settings.mode as string) || 'audit',
         autoStartDaemon: settings.autoStartDaemon !== false,
         slackEnabled: settings.slackEnabled !== false,
         enableTrustSessions: settings.enableTrustSessions === true,
@@ -721,7 +727,7 @@ export function getGlobalSettings(): {
     }
   } catch {}
   return {
-    mode: 'standard',
+    mode: 'audit',
     autoStartDaemon: true,
     slackEnabled: true,
     enableTrustSessions: false,
@@ -1247,13 +1253,27 @@ const DAEMON_PORT = 7391;
 const DAEMON_HOST = '127.0.0.1';
 
 export function isDaemonRunning(): boolean {
+  const pidFile = path.join(os.homedir(), '.node9', 'daemon.pid');
+
+  if (fs.existsSync(pidFile)) {
+    // PID file present — trust it: live PID → running, dead PID → not running
+    try {
+      const { pid, port } = JSON.parse(fs.readFileSync(pidFile, 'utf-8'));
+      if (port !== DAEMON_PORT) return false;
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // No PID file — port check catches orphaned daemons (PID file was lost)
   try {
-    const pidFile = path.join(os.homedir(), '.node9', 'daemon.pid');
-    if (!fs.existsSync(pidFile)) return false;
-    const { pid, port } = JSON.parse(fs.readFileSync(pidFile, 'utf-8'));
-    if (port !== DAEMON_PORT) return false;
-    process.kill(pid, 0);
-    return true;
+    const r = spawnSync('ss', ['-Htnp', `sport = :${DAEMON_PORT}`], {
+      encoding: 'utf8',
+      timeout: 500,
+    });
+    return r.status === 0 && (r.stdout ?? '').includes(`:${DAEMON_PORT}`);
   } catch {
     return false;
   }

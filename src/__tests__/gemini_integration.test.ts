@@ -34,7 +34,12 @@ function mockConfig(config: MockConfig) {
   readSpy.mockImplementation((p) => {
     if (String(p) === globalPath) {
       return JSON.stringify({
-        settings: { mode: 'standard', approvers: { native: false }, ...config.settings },
+        settings: {
+          mode: 'standard',
+          approvalTimeoutMs: 0,
+          approvers: { native: false },
+          ...config.settings,
+        },
         policy: {
           dangerousWords: DANGEROUS_WORDS, // Use defaults!
           ignoredTools: [],

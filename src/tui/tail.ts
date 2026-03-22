@@ -51,6 +51,7 @@ interface ResultItem {
 
 export interface TailOptions {
   history?: boolean;
+  clear?: boolean;
 }
 
 function formatBase(activity: ActivityItem): string {
@@ -94,6 +95,14 @@ async function ensureDaemon(): Promise<number> {
     } catch {}
   }
 
+  // No PID file — check if an orphaned daemon is already listening on the port
+  try {
+    const res = await fetch(`http://127.0.0.1:${DAEMON_PORT}/settings`, {
+      signal: AbortSignal.timeout(500),
+    });
+    if (res.ok) return DAEMON_PORT;
+  } catch {}
+
   // Not running — start it in the background
   console.log(chalk.dim('🛡️  Starting Node9 daemon...'));
   const child = spawn(process.execPath, [process.argv[1], 'daemon'], {
@@ -106,15 +115,11 @@ async function ensureDaemon(): Promise<number> {
   // Wait up to 5s for it to be ready
   for (let i = 0; i < 20; i++) {
     await new Promise((r) => setTimeout(r, 250));
-    if (!fs.existsSync(PID_FILE)) continue;
     try {
       const res = await fetch(`http://127.0.0.1:${DAEMON_PORT}/settings`, {
         signal: AbortSignal.timeout(500),
       });
-      if (res.ok) {
-        const { port } = JSON.parse(fs.readFileSync(PID_FILE, 'utf-8')) as { port: number };
-        return port;
-      }
+      if (res.ok) return DAEMON_PORT;
     } catch {}
   }
 
@@ -125,11 +130,27 @@ async function ensureDaemon(): Promise<number> {
 export async function startTail(options: TailOptions = {}): Promise<void> {
   const port = await ensureDaemon();
 
+  if (options.clear) {
+    await new Promise<void>((resolve) => {
+      const req = http.request(
+        { method: 'POST', hostname: '127.0.0.1', port, path: '/events/clear' },
+        (res) => {
+          res.resume();
+          res.on('end', resolve);
+        }
+      );
+      req.on('error', resolve);
+      req.end();
+    });
+  }
+
   const connectionTime = Date.now();
   const pending = new Map<string, ActivityItem>();
 
   console.log(chalk.cyan.bold(`\n🛰️  Node9 tail  `) + chalk.dim(`→ localhost:${port}`));
-  if (options.history) {
+  if (options.clear) {
+    console.log(chalk.dim('History cleared. Showing live events. Press Ctrl+C to exit.\n'));
+  } else if (options.history) {
     console.log(chalk.dim('Showing history + live events. Press Ctrl+C to exit.\n'));
   } else {
     console.log(

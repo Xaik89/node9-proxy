@@ -30,7 +30,14 @@ function mockNoNativeConfig(extra?: Record<string, unknown>) {
   existsSpy.mockImplementation((p) => String(p) === globalPath);
   readSpy.mockImplementation((p) =>
     String(p) === globalPath
-      ? JSON.stringify({ settings: { approvers: { native: false }, ...extra } })
+      ? JSON.stringify({
+          settings: {
+            mode: 'standard',
+            approvalTimeoutMs: 0,
+            approvers: { native: false },
+            ...extra,
+          },
+        })
       : ''
   );
 }
@@ -94,7 +101,7 @@ describe('getGlobalSettings', () => {
     readSpy.mockImplementation((p) => (String(p) === globalPath ? 'not json' : ''));
     const s = getGlobalSettings();
     expect(s.autoStartDaemon).toBe(true);
-    expect(s.mode).toBe('standard');
+    expect(s.mode).toBe('audit');
   });
 });
 
@@ -151,11 +158,15 @@ describe('autoStartDaemon: false — blocks without daemon when no TTY', () => {
 
   it('blocks via persistent deny decision (deterministic, no HITL)', async () => {
     const decisionsPath = path.join('/mock/home', '.node9', 'decisions.json');
-    existsSpy.mockImplementation((p) => String(p) === decisionsPath);
-    readSpy.mockImplementation((p) =>
+    const globalPath = path.join('/mock/home', '.node9', 'config.json');
+    existsSpy.mockImplementation((p) => [decisionsPath, globalPath].includes(String(p)));
+    readSpy.mockImplementation((p) => {
       // Use mkfs_disk — contains mkfs (in DANGEROUS_WORDS) so triggers review
-      String(p) === decisionsPath ? JSON.stringify({ mkfs_disk: 'deny' }) : ''
-    );
+      if (String(p) === decisionsPath) return JSON.stringify({ mkfs_disk: 'deny' });
+      if (String(p) === globalPath)
+        return JSON.stringify({ settings: { mode: 'standard', approvalTimeoutMs: 0 } });
+      return '';
+    });
 
     const result = await authorizeHeadless('mkfs_disk', {});
     expect(result.approved).toBe(false);
@@ -180,7 +191,9 @@ describe('daemon abandon fallthrough', () => {
     readSpy.mockImplementation((p) => {
       if (String(p) === pidPath) return JSON.stringify({ pid: process.pid, port: 7391 });
       if (String(p) === globalPath)
-        return JSON.stringify({ settings: { approvers: { native: false } } });
+        return JSON.stringify({
+          settings: { mode: 'standard', approvalTimeoutMs: 0, approvers: { native: false } },
+        });
       return '';
     });
 

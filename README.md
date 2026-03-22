@@ -284,29 +284,35 @@ Use `node9 explain <tool> <args>` to dry-run any tool call and see exactly which
 
 ```json
 {
+  "version": "1.0",
   "settings": {
-    "mode": "standard",
+    "mode": "audit",
     "enableUndo": true,
+    "flightRecorder": true,
     "approvalTimeoutMs": 30000,
     "approvers": {
       "native": true,
       "browser": true,
-      "cloud": true,
+      "cloud": false,
       "terminal": true
     }
   }
 }
 ```
 
-| Key                  | Default      | Description                                                  |
-| :------------------- | :----------- | :----------------------------------------------------------- |
-| `mode`               | `"standard"` | `standard` \| `strict` \| `audit`                            |
-| `enableUndo`         | `true`       | Take git snapshots before every AI file edit                 |
-| `approvalTimeoutMs`  | `0`          | Auto-deny after N ms if no human responds (0 = wait forever) |
-| `approvers.native`   | `true`       | OS-native popup                                              |
-| `approvers.browser`  | `true`       | Browser dashboard (`node9 daemon`)                           |
-| `approvers.cloud`    | `true`       | Slack / SaaS approval                                        |
-| `approvers.terminal` | `true`       | `[Y/n]` prompt in terminal                                   |
+| Key                  | Default   | Description                                                                     |
+| :------------------- | :-------- | :------------------------------------------------------------------------------ |
+| `mode`               | `"audit"` | `audit` (log-only) \| `standard` (approve/block) \| `strict` (deny by default)  |
+| `enableUndo`         | `true`    | Take git snapshots before every AI file edit                                    |
+| `flightRecorder`     | `true`    | Record tool call activity to the flight recorder ring buffer for the browser UI |
+| `approvalTimeoutMs`  | `30000`   | Auto-deny after N ms if no human responds (`0` = wait forever)                  |
+| `approvers.native`   | `true`    | OS-native popup                                                                 |
+| `approvers.browser`  | `true`    | Browser dashboard (`node9 daemon`)                                              |
+| `approvers.cloud`    | `false`   | Slack / SaaS approval — requires `node9 login`; opt-in only                     |
+| `approvers.terminal` | `true`    | `[Y/n]` prompt in terminal                                                      |
+
+> **Tip — choosing a mode:**
+> Start with the default `audit` to observe what your agent does without blocking anything. Once you understand its behaviour, switch to `standard` (blocks dangerous commands with human approval) or `strict` (denies anything not explicitly allowed) in your `~/.node9/config.json` or project `node9.config.json`.
 
 ---
 
@@ -369,13 +375,16 @@ Verdict: BLOCK  (dangerous word: rm -rf)
 ## 🔧 Troubleshooting
 
 **`node9 check` exits immediately / Claude is never blocked**
-Node9 fails open by design to prevent breaking your agent. Check debug logs: `NODE9_DEBUG=1 claude`.
+Node9 fails open by design to prevent breaking your agent. Check debug logs: `NODE9_DEBUG=1 claude`. Also verify you are in `standard` or `strict` mode — the default `audit` mode approves everything and only logs.
 
 **Terminal prompt never appears during Claude/Gemini sessions**
 Interactive agents run hooks in a "Headless" subprocess. You **must** enable `native: true` or `browser: true` in your config to see approval prompts.
 
 **"Blocked by Organization (SaaS)"**
 A corporate policy has locked this action. You must click the "Approve" button in your company's Slack channel to proceed.
+
+**`node9 tail --history` says "Daemon failed to start" even though the daemon is running**
+This can happen when the daemon's PID file (`~/.node9/daemon.pid`) is missing — for example after a crash or a botched restart left a daemon running without a PID file. Node9 now detects this automatically: it performs an HTTP health probe and a live port check before deciding the daemon is gone. If you hit this on an older version, run `node9 daemon stop` then `node9 daemon -b` to create a clean PID file.
 
 ---
 

@@ -300,6 +300,7 @@ describe('dangerous words', () => {
       settings: {
         mode: 'standard',
         autoStartDaemon: false,
+        approvalTimeoutMs: 0,
         approvers: { native: false, browser: false, cloud: false, terminal: false },
       },
       policy: {
@@ -346,6 +347,7 @@ describe('no approval mechanism', () => {
       settings: {
         mode: 'standard',
         autoStartDaemon: false,
+        approvalTimeoutMs: 0,
         approvers: { native: false, browser: false, cloud: false, terminal: false },
       },
       policy: {

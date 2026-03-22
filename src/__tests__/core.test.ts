@@ -28,6 +28,7 @@ vi.mock('child_process', () => ({
       if (event === 'close') cb(1);
     }),
   }),
+  spawnSync: vi.fn().mockReturnValue({ status: 1, stdout: '', stderr: '' }),
 }));
 
 // 5. NOW we import core AFTER the mocks are registered!
@@ -83,7 +84,12 @@ function mockBothConfigs(projectConfig: object, globalConfig: object) {
  *  and noApprovalMechanism tests work correctly. */
 function mockNoNativeConfig(extra?: object) {
   mockGlobalConfig({
-    settings: { approvers: { native: false }, ...(extra as Record<string, unknown>) },
+    settings: {
+      mode: 'standard',
+      approvalTimeoutMs: 0,
+      approvers: { native: false },
+      ...(extra as Record<string, unknown>),
+    },
   });
 }
 
@@ -171,10 +177,14 @@ describe('standard mode — dangerous word detection', () => {
 describe('persistent decision approval', () => {
   function setPersistentDecision(toolName: string, decision: 'allow' | 'deny') {
     const decisionsPath = path.join('/mock/home', '.node9', 'decisions.json');
-    existsSpy.mockImplementation((p) => String(p) === decisionsPath);
-    readSpy.mockImplementation((p) =>
-      String(p) === decisionsPath ? JSON.stringify({ [toolName]: decision }) : ''
-    );
+    const globalPath = path.join('/mock/home', '.node9', 'config.json');
+    existsSpy.mockImplementation((p) => [decisionsPath, globalPath].includes(String(p)));
+    readSpy.mockImplementation((p) => {
+      if (String(p) === decisionsPath) return JSON.stringify({ [toolName]: decision });
+      if (String(p) === globalPath)
+        return JSON.stringify({ settings: { mode: 'standard', approvalTimeoutMs: 0 } });
+      return '';
+    });
   }
 
   it('returns true when persistent decision is allow', async () => {
@@ -406,7 +416,7 @@ describe('global config (~/.node9/config.json)', () => {
 
 describe('authorizeHeadless', () => {
   it('returns approved:true for safe tools', async () => {
-    expect(await authorizeHeadless('list_users', {})).toEqual({ approved: true });
+    expect(await authorizeHeadless('list_users', {})).toMatchObject({ approved: true });
   });
 
   it('returns approved:false with noApprovalMechanism when no API key', async () => {
@@ -429,6 +439,43 @@ describe('authorizeHeadless', () => {
       })
     );
     const result = await authorizeHeadless('mkfs_db', { id: 1 });
+    expect(result.approved).toBe(true);
+  });
+});
+
+// ── DLP wiring: evaluatePolicy → authorizeHeadless ───────────────────────────
+// Verifies that a DLP-blocked tool call propagates through the full stack and
+// results in approved:false — not just that scanArgs() returns a match.
+
+describe('DLP wiring — authorizeHeadless blocks on detected secret', () => {
+  // Fake AWS key split to avoid GitHub secret scanner flagging this test file
+  const FAKE_AWS_KEY = 'AKIA' + 'IOSFODNN7' + 'EXAMPLE';
+
+  it('authorizeHeadless returns approved:false when args contain an AWS key', async () => {
+    mockNoNativeConfig();
+    const result = await authorizeHeadless('bash', { command: `aws s3 cp --key ${FAKE_AWS_KEY}` });
+    expect(result.approved).toBe(false);
+    expect(result.reason).toMatch(/DATA LOSS PREVENTION/i);
+  });
+
+  it('reason includes the pattern name and redacted sample', async () => {
+    mockNoNativeConfig();
+    const result = await authorizeHeadless('bash', { command: `aws s3 cp --key ${FAKE_AWS_KEY}` });
+    expect(result.reason).toContain('AWS Access Key ID');
+    // Secret must be redacted — raw key must not appear in the reason string
+    expect(result.reason).not.toContain(FAKE_AWS_KEY);
+  });
+
+  it('DLP scan is skipped for ignored tools when scanIgnoredTools is false', async () => {
+    mockGlobalConfig({
+      settings: { mode: 'standard', approvalTimeoutMs: 0, approvers: { native: false } },
+      policy: {
+        ignoredTools: ['read_file'],
+        dlp: { enabled: true, scanIgnoredTools: false },
+      },
+    });
+    // read_file is in ignoredTools and scanIgnoredTools:false — DLP must not block it
+    const result = await authorizeHeadless('read_file', { content: `key=${FAKE_AWS_KEY}` });
     expect(result.approved).toBe(true);
   });
 });
@@ -507,10 +554,14 @@ describe('authorizeHeadless — persistent decisions', () => {
 
   it('blocks without API when persistent decision is "deny"', async () => {
     const decisionsPath = path.join('/mock/home', '.node9', 'decisions.json');
-    existsSpy.mockImplementation((p) => String(p) === decisionsPath);
-    readSpy.mockImplementation((p) =>
-      String(p) === decisionsPath ? JSON.stringify({ mkfs_disk: 'deny' }) : ''
-    );
+    const globalPath = path.join('/mock/home', '.node9', 'config.json');
+    existsSpy.mockImplementation((p) => String(p) === decisionsPath || String(p) === globalPath);
+    readSpy.mockImplementation((p) => {
+      if (String(p) === decisionsPath) return JSON.stringify({ mkfs_disk: 'deny' });
+      if (String(p) === globalPath)
+        return JSON.stringify({ settings: { mode: 'standard', approvalTimeoutMs: 0 } });
+      return '';
+    });
     const result = await authorizeHeadless('mkfs_disk', {});
     expect(result.approved).toBe(false);
     expect(result.reason).toMatch(/always deny/i);
@@ -809,6 +860,7 @@ describe('evaluatePolicy — smart rules', () => {
 describe('authorizeHeadless — smart rule hard block', () => {
   it('returns approved:false without invoking race engine for block verdict', async () => {
     mockProjectConfig({
+      settings: { mode: 'standard', approvalTimeoutMs: 0 },
       policy: {
         smartRules: [
           {
@@ -1128,7 +1180,7 @@ describe('shouldSnapshot', () => {
 
 describe('isDaemonRunning', () => {
   it('returns false when PID file does not exist', () => {
-    // existsSpy returns false (set in beforeEach)
+    // existsSpy returns false (set in beforeEach); spawnSync mock returns status:1 (no match)
     expect(isDaemonRunning()).toBe(false);
   });
 
@@ -1149,5 +1201,34 @@ describe('isDaemonRunning', () => {
       String(p) === pidPath ? JSON.stringify({ pid: process.pid, port: 7391 }) : ''
     );
     expect(isDaemonRunning()).toBe(true);
+  });
+
+  it('returns true when no PID file but ss detects orphaned daemon on port', async () => {
+    const { spawnSync: mockSpawnSync } = await import('child_process');
+    vi.mocked(mockSpawnSync).mockReturnValueOnce({
+      status: 0,
+      stdout: 'LISTEN 0 128 127.0.0.1:7391 0.0.0.0:* users:(("node",pid=12345,fd=18))',
+      stderr: '',
+      pid: 0,
+      output: [],
+      signal: null,
+      error: undefined,
+    });
+    // existsSpy already returns false (set in beforeEach)
+    expect(isDaemonRunning()).toBe(true);
+  });
+
+  it('returns false when no PID file and ss finds nothing on port', async () => {
+    const { spawnSync: mockSpawnSync } = await import('child_process');
+    vi.mocked(mockSpawnSync).mockReturnValueOnce({
+      status: 0,
+      stdout: '',
+      stderr: '',
+      pid: 0,
+      output: [],
+      signal: null,
+      error: undefined,
+    });
+    expect(isDaemonRunning()).toBe(false);
   });
 });
