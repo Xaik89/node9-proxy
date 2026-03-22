@@ -1124,7 +1124,9 @@ program
         const result = await authorizeHeadless(toolName, toolInput, false, meta);
 
         if (result.approved) {
-          if (result.checkedBy)
+          // Only write to stderr in debug mode — Claude Code treats any stderr
+          // output as a hook error regardless of exit code (see GitHub issue).
+          if (result.checkedBy && process.env.NODE9_DEBUG === '1')
             process.stderr.write(`✓ node9 [${result.checkedBy}]: "${toolName}" allowed\n`);
           process.exit(0);
         }
@@ -1142,7 +1144,7 @@ program
           if (daemonReady) {
             const retry = await authorizeHeadless(toolName, toolInput, false, meta);
             if (retry.approved) {
-              if (retry.checkedBy)
+              if (retry.checkedBy && process.env.NODE9_DEBUG)
                 process.stderr.write(`✓ node9 [${retry.checkedBy}]: "${toolName}" allowed\n`);
               process.exit(0);
             }
