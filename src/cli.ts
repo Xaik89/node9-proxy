@@ -963,7 +963,12 @@ program
   .option('--clear', 'Clear the history buffer and exit (does not stream)', false)
   .action(async (options: { history?: boolean; clear?: boolean }) => {
     const { startTail } = await import('./tui/tail.js');
-    await startTail(options);
+    try {
+      await startTail(options);
+    } catch (err) {
+      console.error(chalk.red(`❌ ${err instanceof Error ? err.message : String(err)}`));
+      process.exit(1);
+    }
   });
 
 // 7. CHECK (Internal Hook - Upgraded with AI Negotiation Loop)

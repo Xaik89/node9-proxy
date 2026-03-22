@@ -160,14 +160,11 @@ export async function startTail(options: TailOptions = {}): Promise<void> {
     if (result.ok) {
       console.log(chalk.green('✓ Flight Recorder buffer cleared.'));
     } else if (result.code === 'ECONNREFUSED') {
-      console.error(chalk.red('❌ Daemon is not running. Start it with: node9 daemon start'));
-      process.exit(1);
+      throw new Error('Daemon is not running. Start it with: node9 daemon start');
     } else if (result.code === 'ETIMEDOUT') {
-      console.error(chalk.red('❌ Daemon did not respond in time. Try: node9 daemon restart'));
-      process.exit(1);
+      throw new Error('Daemon did not respond in time. Try: node9 daemon restart');
     } else {
-      console.error(chalk.red(`❌ Failed to clear buffer (${result.code ?? 'unknown error'})`));
-      process.exit(1);
+      throw new Error(`Failed to clear buffer (${result.code ?? 'unknown error'})`);
     }
     return;
   }
