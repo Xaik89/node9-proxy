@@ -141,7 +141,10 @@ export async function startTail(options: TailOptions = {}): Promise<void> {
           const status = res.statusCode ?? 0;
           // Non-2xx: surface the HTTP status so the user knows what went wrong
           res.on('end', () =>
-            resolve({ ok: status >= 200 && status < 300, code: status >= 200 && status < 300 ? undefined : `HTTP ${status}` })
+            resolve({
+              ok: status >= 200 && status < 300,
+              code: status >= 200 && status < 300 ? undefined : `HTTP ${status}`,
+            })
           );
         }
       );
