@@ -28,6 +28,7 @@ vi.mock('child_process', () => ({
       if (event === 'close') cb(1);
     }),
   }),
+  spawnSync: vi.fn().mockReturnValue({ status: 1, stdout: '', stderr: '' }),
 }));
 
 // 5. NOW we import core AFTER the mocks are registered!
@@ -1142,7 +1143,7 @@ describe('shouldSnapshot', () => {
 
 describe('isDaemonRunning', () => {
   it('returns false when PID file does not exist', () => {
-    // existsSpy returns false (set in beforeEach)
+    // existsSpy returns false (set in beforeEach); spawnSync mock returns status:1 (no match)
     expect(isDaemonRunning()).toBe(false);
   });
 
@@ -1163,5 +1164,34 @@ describe('isDaemonRunning', () => {
       String(p) === pidPath ? JSON.stringify({ pid: process.pid, port: 7391 }) : ''
     );
     expect(isDaemonRunning()).toBe(true);
+  });
+
+  it('returns true when no PID file but ss detects orphaned daemon on port', async () => {
+    const { spawnSync: mockSpawnSync } = await import('child_process');
+    vi.mocked(mockSpawnSync).mockReturnValueOnce({
+      status: 0,
+      stdout: 'LISTEN 0 128 127.0.0.1:7391 0.0.0.0:* users:(("node",pid=12345,fd=18))',
+      stderr: '',
+      pid: 0,
+      output: [],
+      signal: null,
+      error: undefined,
+    });
+    // existsSpy already returns false (set in beforeEach)
+    expect(isDaemonRunning()).toBe(true);
+  });
+
+  it('returns false when no PID file and ss finds nothing on port', async () => {
+    const { spawnSync: mockSpawnSync } = await import('child_process');
+    vi.mocked(mockSpawnSync).mockReturnValueOnce({
+      status: 0,
+      stdout: '',
+      stderr: '',
+      pid: 0,
+      output: [],
+      signal: null,
+      error: undefined,
+    });
+    expect(isDaemonRunning()).toBe(false);
   });
 });
