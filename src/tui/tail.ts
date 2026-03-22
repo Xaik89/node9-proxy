@@ -131,14 +131,17 @@ export async function startTail(options: TailOptions = {}): Promise<void> {
   const port = await ensureDaemon();
 
   if (options.clear) {
-    let ok = false;
-    try {
-      const res = await fetch(`http://127.0.0.1:${port}/events/clear`, {
-        method: 'POST',
-        signal: AbortSignal.timeout(2000),
-      });
-      ok = res.ok;
-    } catch {}
+    const ok = await new Promise<boolean>((resolve) => {
+      const req = http.request(
+        { method: 'POST', hostname: '127.0.0.1', port, path: '/events/clear' },
+        (res) => {
+          res.resume();
+          res.on('end', () => resolve(res.statusCode === 200));
+        }
+      );
+      req.on('error', () => resolve(false));
+      req.end();
+    });
     if (ok) {
       console.log(chalk.green('✓ Flight Recorder buffer cleared.'));
     } else {
