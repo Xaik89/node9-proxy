@@ -138,9 +138,14 @@ export async function startTail(options: TailOptions = {}): Promise<void> {
         { method: 'POST', hostname: '127.0.0.1', port, path: '/events/clear' },
         (res) => {
           res.resume();
-          res.on('end', () => resolve({ ok: res.statusCode === 200 }));
+          const status = res.statusCode ?? 0;
+          res.on('end', () => resolve({ ok: status >= 200 && status < 300 }));
         }
       );
+      req.setTimeout(2000, () => {
+        req.destroy();
+        resolve({ ok: false, code: 'ETIMEDOUT' });
+      });
       req.on('error', (err: NodeJS.ErrnoException) => resolve({ ok: false, code: err.code }));
       req.end();
     });
@@ -148,6 +153,9 @@ export async function startTail(options: TailOptions = {}): Promise<void> {
       console.log(chalk.green('✓ Flight Recorder buffer cleared.'));
     } else if (result.code === 'ECONNREFUSED') {
       console.error(chalk.red('❌ Daemon is not running. Start it with: node9 daemon start'));
+      process.exit(1);
+    } else if (result.code === 'ETIMEDOUT') {
+      console.error(chalk.red('❌ Daemon did not respond in time. Try: node9 daemon restart'));
       process.exit(1);
     } else {
       console.error(chalk.red(`❌ Failed to clear buffer (${result.code ?? 'unknown error'})`));
