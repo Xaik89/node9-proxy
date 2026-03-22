@@ -764,11 +764,16 @@ describe('malformed JSON payload', () => {
 // ── removefrom CLI wiring ─────────────────────────────────────────────────────
 
 describe('removefrom command', () => {
+  // Use a minimal env to avoid leaking CI secrets into subprocess invocations.
+  // PATH is required so Node.js can resolve its own binary; everything else is
+  // explicitly set to control test behaviour.
+  const minimalEnv = { PATH: process.env.PATH ?? '', NODE9_TESTING: '1' };
+
   it('exits with code 1 and prints error for unknown target', () => {
     const result = spawnSync(process.execPath, [CLI, 'removefrom', 'vscode'], {
       encoding: 'utf-8',
       timeout: 5000,
-      env: { ...process.env, NODE9_TESTING: '1' },
+      env: minimalEnv,
     });
     expect(result.status).toBe(1);
     expect(result.stderr).toContain('Unknown target');
@@ -782,7 +787,7 @@ describe('removefrom command', () => {
         const result = spawnSync(process.execPath, [CLI, 'removefrom', target], {
           encoding: 'utf-8',
           timeout: 5000,
-          env: { ...process.env, NODE9_TESTING: '1', HOME: tmpHome },
+          env: { ...minimalEnv, HOME: tmpHome },
         });
         expect(result.status).toBe(0);
       } finally {
