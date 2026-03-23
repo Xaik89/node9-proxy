@@ -598,7 +598,7 @@ export const DEFAULT_CONFIG: Config = {
           {
             field: 'command',
             op: 'matches',
-            value: 'git\\b.*\\bpush\\b.*(--force|--force-with-lease|-f\\b)',
+            value: '^\\s*git\\b.*\\bpush\\b.*(--force|--force-with-lease|-f\\b)',
             flags: 'i',
           },
         ],
@@ -613,7 +613,7 @@ export const DEFAULT_CONFIG: Config = {
           {
             field: 'command',
             op: 'matches',
-            value: 'git\\b.*\\bpush\\b(?!.*(-f\\b|--force|--force-with-lease))',
+            value: '^\\s*git\\b.*\\bpush\\b(?!.*(-f\\b|--force|--force-with-lease))',
             flags: 'i',
           },
         ],
@@ -629,7 +629,7 @@ export const DEFAULT_CONFIG: Config = {
             field: 'command',
             op: 'matches',
             value:
-              'git\\b.*(reset\\s+--hard|clean\\s+-[fdxX]|\\brebase\\b|tag\\s+-d|branch\\s+-[dD])',
+              '^\\s*git\\b.*(reset\\s+--hard|clean\\s+-[fdxX]|\\brebase\\b|tag\\s+-d|branch\\s+-[dD])',
             flags: 'i',
           },
         ],
