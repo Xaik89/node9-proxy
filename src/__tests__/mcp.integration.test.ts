@@ -13,6 +13,10 @@
  */
 
 import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
+
+// echo is a shell builtin on Windows — the proxy tests that spawn /usr/bin/echo
+// via `node9 echo` only work on Linux/macOS where echo is an executable on PATH.
+const itUnix = it.skipIf(process.platform === 'win32');
 import { spawnSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
@@ -60,9 +64,9 @@ describe('proxy command — stdout must stay clean for stdio protocols (MCP / JS
     cleanupDir(tmpHome);
   });
 
-  it('banner goes to stderr; stdout contains only the child process output', () => {
-    // Note: uses the external /usr/bin/echo (resolved via `which`), not a shell builtin.
-    // This test is Linux/macOS only — Windows echo is a shell builtin and not spawnable.
+  itUnix('banner goes to stderr; stdout contains only the child process output', () => {
+    // Uses the external /usr/bin/echo resolved via PATH — not a shell builtin.
+    // Skipped on Windows where echo is a builtin and cannot be spawned directly.
     const result = spawnSync(process.execPath, [CLI, 'echo', 'hello-mcp-test'], {
       encoding: 'utf-8',
       timeout: 8000,
@@ -79,25 +83,28 @@ describe('proxy command — stdout must stay clean for stdio protocols (MCP / JS
     expect(result.stderr).toContain('Node9 Proxy Active');
   });
 
-  it('stdout is valid JSON when the child writes JSON — banner does not corrupt the stream', () => {
-    // Simulate a minimal JSON-RPC response from an MCP server
-    const jsonRpcResponse = '{"jsonrpc":"2.0","id":1,"result":{"ok":true}}';
+  itUnix(
+    'stdout is valid JSON when the child writes JSON — banner does not corrupt the stream',
+    () => {
+      // Simulate a minimal JSON-RPC response from an MCP server
+      const jsonRpcResponse = '{"jsonrpc":"2.0","id":1,"result":{"ok":true}}';
 
-    const result = spawnSync(process.execPath, [CLI, 'echo', jsonRpcResponse], {
-      encoding: 'utf-8',
-      timeout: 8000,
-      cwd: os.tmpdir(),
-      env: { ...process.env, ...BASE_ENV, HOME: tmpHome },
-    });
+      const result = spawnSync(process.execPath, [CLI, 'echo', jsonRpcResponse], {
+        encoding: 'utf-8',
+        timeout: 8000,
+        cwd: os.tmpdir(),
+        env: { ...process.env, ...BASE_ENV, HOME: tmpHome },
+      });
 
-    expect(result.error).toBeUndefined();
-    expect(result.status).toBe(0);
-    // Pre-assertion: non-empty stdout before attempting JSON.parse (better diagnostics)
-    expect(result.stdout.trim()).toBeTruthy();
-    // stdout must parse as valid JSON — banner injection would break this
-    const parsed: unknown = JSON.parse(result.stdout.trim());
-    expect(parsed).toMatchObject({ jsonrpc: '2.0', id: 1 });
-  });
+      expect(result.error).toBeUndefined();
+      expect(result.status).toBe(0);
+      // Pre-assertion: non-empty stdout before attempting JSON.parse (better diagnostics)
+      expect(result.stdout.trim()).toBeTruthy();
+      // stdout must parse as valid JSON — banner injection would break this
+      const parsed: unknown = JSON.parse(result.stdout.trim());
+      expect(parsed).toMatchObject({ jsonrpc: '2.0', id: 1 });
+    }
+  );
 });
 
 // ── 2. Log command cross-cwd audit write ──────────────────────────────────────
@@ -240,6 +247,9 @@ describe('log command — audit.log written when payload.cwd differs from proces
         env: { ...process.env, ...BASE_ENV, HOME: corruptHome },
       });
       expect(r.error).toBeUndefined();
+      // Exit code must be 0: the log command always exits 0 even on internal errors
+      // so Claude/Gemini don't treat the already-completed tool call as failed.
+      // The audit write happens before getConfig(), so it succeeds regardless.
       expect(r.status).toBe(0);
 
       // audit.log must exist and contain the entry despite the corrupt config
