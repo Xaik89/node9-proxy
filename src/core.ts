@@ -2142,11 +2142,14 @@ export function listCredentialProfiles(): string[] {
   return [];
 }
 
-export function getConfig(): Config {
-  if (cachedConfig) return cachedConfig;
+export function getConfig(cwd?: string): Config {
+  // When an explicit cwd is provided (hook commands passing payload.cwd), skip
+  // the cache entirely — each project directory may have its own node9.config.json,
+  // and we must not pollute the ambient cache used by the interactive CLI.
+  if (!cwd && cachedConfig) return cachedConfig;
 
   const globalPath = path.join(os.homedir(), '.node9', 'config.json');
-  const projectPath = path.join(process.cwd(), 'node9.config.json');
+  const projectPath = path.join(cwd ?? process.cwd(), 'node9.config.json');
 
   const globalConfig = tryLoadConfig(globalPath);
   const projectConfig = tryLoadConfig(projectPath);
@@ -2257,13 +2260,17 @@ export function getConfig(): Config {
   mergedPolicy.snapshot.onlyPaths = [...new Set(mergedPolicy.snapshot.onlyPaths)];
   mergedPolicy.snapshot.ignorePaths = [...new Set(mergedPolicy.snapshot.ignorePaths)];
 
-  cachedConfig = {
+  const result: Config = {
     settings: mergedSettings,
     policy: mergedPolicy,
     environments: mergedEnvironments,
   };
 
-  return cachedConfig;
+  // Only populate the cache when using the ambient cwd — explicit cwd calls are
+  // per-project and must not overwrite the cached interactive-CLI config.
+  if (!cwd) cachedConfig = result;
+
+  return result;
 }
 
 function tryLoadConfig(filePath: string): Record<string, unknown> | null {

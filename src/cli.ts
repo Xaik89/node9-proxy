@@ -10,7 +10,6 @@ import {
   pauseNode9,
   resumeNode9,
   getConfig,
-  _resetConfigCache,
   explainPolicy,
   shouldSnapshot,
 } from './core';
@@ -1124,20 +1123,9 @@ program
           process.exit(0);
         }
 
-        // Change to the project cwd from the hook payload BEFORE loading config,
-        // so getConfig() finds the correct node9.config.json for that project.
-        if (payload.cwd) {
-          try {
-            process.chdir(payload.cwd);
-            // Crucial: Reset the config cache so we look for node9.config.json
-            // in the project folder we just moved into.
-            _resetConfigCache();
-          } catch {
-            // ignore if cwd doesn't exist
-          }
-        }
-
-        const config = getConfig();
+        // Pass payload.cwd directly to getConfig() instead of mutating process.chdir —
+        // process.chdir is process-global and would race with concurrent hook invocations.
+        const config = getConfig(payload.cwd ?? undefined);
 
         // Debug logging — controlled by Env Var OR new Settings config
         if (process.env.NODE9_DEBUG === '1' || config.settings.enableHookLogDebug) {
@@ -1348,17 +1336,9 @@ program
           cwd?: string;
         };
 
-        // Mirror check command: change to project cwd before getConfig() so the
-        // correct node9.config.json is loaded. Without this, getConfig() reads the
-        // wrong project config (the node9 binary's cwd, not the agent's project).
-        if (payload.cwd) {
-          try {
-            process.chdir(payload.cwd);
-            _resetConfigCache();
-          } catch {
-            // ignore if cwd doesn't exist
-          }
-        }
+        // Pass payload.cwd directly to getConfig() instead of mutating process.chdir —
+        // process.chdir is process-global and would race with concurrent hook invocations.
+        const config = getConfig(payload.cwd ?? undefined);
 
         // Handle both Claude (tool_name) and Gemini (name)
         const tool = sanitize(payload.tool_name ?? payload.name ?? 'unknown');
@@ -1377,16 +1357,16 @@ program
           fs.mkdirSync(path.dirname(logPath), { recursive: true });
         fs.appendFileSync(logPath, JSON.stringify(entry) + '\n');
 
-        const config = getConfig();
-
         // PostToolUse snapshot is a fallback for tools not covered by PreToolUse.
         // Uses the same configurable snapshot policy.
         if (shouldSnapshot(tool, {}, config)) {
           await createShadowSnapshot('unknown', {}, config.policy.snapshot.ignorePaths);
         }
       } catch (err) {
-        // Surface failures — silent swallow here masked audit.log gaps for MCP tools
-        if (process.env.NODE9_DEBUG === '1' || getConfig().settings.enableHookLogDebug) {
+        // Surface failures — silent swallow here masked audit.log gaps for MCP tools.
+        // Do NOT call getConfig() here — if it caused the original error, calling it
+        // again re-throws and hides the real message.
+        if (process.env.NODE9_DEBUG === '1') {
           const debugPath = path.join(os.homedir(), '.node9', 'hook-debug.log');
           const msg = err instanceof Error ? err.message : String(err);
           try {
