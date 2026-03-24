@@ -71,6 +71,7 @@
     "commander": "^14.0.3",
     "execa": "^9.6.1",
     "picomatch": "^4.0.3",
+    "safe-regex2": "^5.1.0",
     "sh-syntax": "^0.5.8",
     "zod": "^3.25.76"
   },

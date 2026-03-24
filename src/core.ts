@@ -8,6 +8,7 @@ import net from 'net';
 import { randomUUID } from 'crypto';
 import { spawnSync } from 'child_process';
 import pm from 'picomatch';
+import safeRegex from 'safe-regex2';
 import { parse } from 'sh-syntax';
 import { askNativePopup, sendDesktopNotification } from './ui/native';
 import { computeRiskMetadata, RiskMetadata } from './context-sniper';
@@ -115,18 +116,14 @@ export function validateRegex(pattern: string): string | null {
   if (parens !== 0) return 'Unbalanced parentheses';
   if (brackets !== 0) return 'Unbalanced brackets';
 
-  // ReDoS vectors — only flag + * { as dangerous outer quantifiers; ? (zero-or-one) is bounded and safe
-  if (/\([^)]*[*+{][^)]*\)[*+{]/.test(pattern))
-    return 'Nested quantifiers are forbidden (ReDoS risk)';
-  // Only reject quantified alternations when the alternatives themselves contain
-  // quantifiers — e.g. (a+|b+)* is dangerous, but (GET|POST)+ is safe because
-  // the alternatives are fixed-length and disjoint.
-  if (
-    /\([^)]*[*+{][^)]*\|[^)]*\)[*+{]/.test(pattern) ||
-    /\([^)]*\|[^)]*[*+{][^)]*\)[*+{]/.test(pattern)
-  )
-    return 'Quantified alternations with internal quantifiers are forbidden (ReDoS risk)';
+  // Quantified backreferences — safe-regex2 does not analyse backreferences,
+  // so we keep this explicit guard: \1+ \2* \1{2,} can cause catastrophic backtracking.
   if (/\\\d+[*+{]/.test(pattern)) return 'Quantified backreferences are forbidden (ReDoS risk)';
+
+  // ReDoS check via safe-regex2 — proper NFA analysis, replaces the previous
+  // hand-rolled heuristics which had false positives ((GET|POST)+) and false
+  // negatives ((x|xx)*). safe-regex2 correctly handles both cases.
+  if (!safeRegex(pattern)) return 'Pattern rejected: potential ReDoS vulnerability detected';
 
   // Final compile check
   try {

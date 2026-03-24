@@ -343,19 +343,19 @@ describe('flag-secrets-access — multi-field matching', () => {
               field: 'file_path',
               op: 'matches',
               value:
-                '(^|[/\\\\])(\\.env(\\.\\w+)?$|\\.pem$|\\.key$|id_rsa|credentials\\.json|secrets?\\.json)',
+                '(^|[/\\\\])(\\.env($|\\.[a-zA-Z0-9_]+)|\\.pem$|\\.key$|id_rsa|credentials\\.json|secrets?\\.json)',
             },
             {
               field: 'path',
               op: 'matches',
               value:
-                '(^|[/\\\\])(\\.env(\\.\\w+)?$|\\.pem$|\\.key$|id_rsa|credentials\\.json|secrets?\\.json)',
+                '(^|[/\\\\])(\\.env($|\\.[a-zA-Z0-9_]+)|\\.pem$|\\.key$|id_rsa|credentials\\.json|secrets?\\.json)',
             },
             {
               field: 'filename',
               op: 'matches',
               value:
-                '(^|[/\\\\])(\\.env(\\.\\w+)?$|\\.pem$|\\.key$|id_rsa|credentials\\.json|secrets?\\.json)',
+                '(^|[/\\\\])(\\.env($|\\.[a-zA-Z0-9_]+)|\\.pem$|\\.key$|id_rsa|credentials\\.json|secrets?\\.json)',
             },
           ],
           conditionMode: 'any',
