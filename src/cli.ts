@@ -1229,7 +1229,7 @@ program
         // the state prior to this change. Snapshotting after (PostToolUse)
         // captures the changed state, making undo a no-op.
         if (shouldSnapshot(toolName, toolInput, config)) {
-          await createShadowSnapshot(toolName, toolInput);
+          await createShadowSnapshot(toolName, toolInput, config.policy.snapshot.ignorePaths);
         }
 
         // Pass to Headless authorization
@@ -1368,7 +1368,7 @@ program
         // PostToolUse snapshot is a fallback for tools not covered by PreToolUse.
         // Uses the same configurable snapshot policy.
         if (shouldSnapshot(tool, {}, config)) {
-          await createShadowSnapshot();
+          await createShadowSnapshot('unknown', {}, config.policy.snapshot.ignorePaths);
         }
       } catch {
         /* ignore */
