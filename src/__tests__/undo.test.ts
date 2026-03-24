@@ -820,4 +820,41 @@ describe('applyUndo', () => {
     expect(restoreEnv?.GIT_DIR).toContain('.node9/snapshots');
     expect(restoreEnv?.GIT_WORK_TREE).toBe('/mock/project');
   });
+
+  it('returns false when ls-tree exits non-zero (prevents empty-set mass delete)', () => {
+    const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    vi.mocked(fs.readdirSync).mockReturnValue([]);
+    mockSpawn.mockImplementation((_cmd, args) => {
+      const a = (args ?? []) as string[];
+      if (a.includes('rev-parse') && a.includes('--git-dir')) return spawnResult('/shadow\n', 0);
+      if (a.includes('restore')) return spawnResult('', 0);
+      if (a.includes('ls-tree')) return spawnResult('', 1); // ls-tree fails
+      return spawnResult('', 0);
+    });
+    // Must return false rather than deleting every file in the working tree
+    expect(applyUndo('abc123', '/mock/project')).toBe(false);
+    expect(vi.mocked(fs.unlinkSync)).not.toHaveBeenCalled();
+    expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining('ls-tree failed'));
+    stderrSpy.mockRestore();
+  });
+
+  it('returns false when ls-tree exits 0 with empty stdout (mass-delete footgun)', () => {
+    // ls-tree status 0 + empty stdout → snapshotFiles would be empty set →
+    // every tracked file would be deleted. The empty-set guard catches this case.
+    const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    vi.mocked(fs.readdirSync).mockReturnValue([]);
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    mockSpawn.mockImplementation((_cmd, args) => {
+      const a = (args ?? []) as string[];
+      if (a.includes('rev-parse') && a.includes('--git-dir')) return spawnResult('/shadow\n', 0);
+      if (a.includes('restore')) return spawnResult('', 0);
+      if (a.includes('ls-tree')) return spawnResult('', 0); // exits 0 but no files
+      if (a.includes('--others')) return spawnResult('', 0);
+      return spawnResult('src/app.ts\n', 0); // one tracked file that would be mass-deleted
+    });
+    expect(applyUndo('abc123', '/mock/project')).toBe(false);
+    expect(vi.mocked(fs.unlinkSync)).not.toHaveBeenCalled();
+    expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining('no files'));
+    stderrSpy.mockRestore();
+  });
 });

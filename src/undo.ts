@@ -356,9 +356,24 @@ export function applyUndo(hash: string, cwd?: string): boolean {
       env,
       timeout: GIT_TIMEOUT,
     });
+    // Guard: if ls-tree fails, snapshotFiles would be empty and every file
+    // in the working tree would be deleted. Abort instead.
+    if (lsTree.status !== 0) {
+      // Always warn — this is an unexpected git failure, not normal flow.
+      // A silent false return is impossible to diagnose in production.
+      process.stderr.write(`[Node9] applyUndo: git ls-tree failed for hash ${hash}\n`);
+      return false;
+    }
     const snapshotFiles = new Set(
       lsTree.stdout?.toString().trim().split('\n').filter(Boolean) ?? []
     );
+    // Guard: an empty snapshot set means ls-tree produced no output despite exit 0 —
+    // proceeding would delete every file in the working tree. Abort instead.
+    // A legitimately empty project snapshot cannot occur in normal node9 usage.
+    if (snapshotFiles.size === 0) {
+      process.stderr.write(`[Node9] applyUndo: ls-tree returned no files for hash ${hash}\n`);
+      return false;
+    }
 
     const tracked =
       spawnSync('git', ['ls-files'], { cwd: dir, env, timeout: GIT_TIMEOUT })

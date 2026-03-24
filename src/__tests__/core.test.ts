@@ -994,6 +994,33 @@ describe('evaluateSmartConditions — matchesGlob operator', () => {
     expect(result.decision).not.toBe('block');
   });
 
+  it('notMatchesGlob — absent field fails closed (attacker cannot omit field to satisfy allow rule)', async () => {
+    // Security invariant: notMatchesGlob with a missing field returns false (fail closed).
+    // An attacker omitting file_path must NOT satisfy a notMatchesGlob allow rule.
+    // Rule authors needing "pass when field absent" should pair with a 'notExists' condition.
+    //
+    // Uses 'delete_file' (contains dangerous word 'delete') so the tool is normally
+    // blocked. The allow rule only fires when the condition passes — absent field must NOT
+    // be enough to trigger it.
+    mockProjectConfig({
+      policy: {
+        dangerousWords: ['delete'],
+        smartRules: [
+          {
+            name: 'allow-non-node-modules',
+            tool: 'delete_file',
+            conditions: [{ field: 'file_path', op: 'notMatchesGlob', value: '**/node_modules/**' }],
+            conditionMode: 'all',
+            verdict: 'allow',
+          },
+        ],
+      },
+    });
+    // file_path absent → notMatchesGlob returns false → allow rule does NOT fire → blocked
+    const result = await evaluatePolicy('delete_file', {});
+    expect(result.decision).not.toBe('allow');
+  });
+
   it('notMatchesGlob allows when the path does NOT match the glob', async () => {
     mockProjectConfig({
       policy: {
@@ -1271,12 +1298,25 @@ describe('validateRegex', () => {
     expect(validateRegex('')).not.toBeNull();
   });
 
+  it('rejects structurally malformed patterns (compile check before safe-regex2)', () => {
+    // These must still be caught after the manual parser was removed.
+    // new RegExp() is now called first, guaranteeing invalid syntax is rejected
+    // before the pattern reaches safe-regex2.
+    expect(validateRegex('((unclosed')).not.toBeNull();
+    expect(validateRegex('[unclosed')).not.toBeNull();
+    expect(validateRegex('*invalid')).not.toBeNull(); // quantifier with nothing before it
+  });
+
   it('rejects patterns exceeding max length', () => {
     expect(validateRegex('a'.repeat(101))).not.toBeNull();
   });
 
-  it('rejects patterns flagged as dangerous by safe-regex2 (NFA analysis)', () => {
-    expect(validateRegex('(a+)+')).not.toBeNull();
+  it('rejects ReDoS patterns — syntactically valid but caught by safe-regex2 NFA analysis', () => {
+    // These patterns compile fine (new RegExp() succeeds), confirming safe-regex2
+    // still runs after the compile-first reorder and correctly rejects them.
+    expect(() => new RegExp('(a+)+')).not.toThrow(); // compile step passes
+    expect(validateRegex('(a+)+')).not.toBeNull(); // safe-regex2 still rejects it
+
     expect(validateRegex('(a*)*')).not.toBeNull();
     expect(validateRegex('([a-z]+){2,}')).not.toBeNull();
   });

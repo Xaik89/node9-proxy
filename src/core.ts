@@ -84,53 +84,23 @@ export function validateRegex(pattern: string): string | null {
   if (!pattern) return 'Pattern is required';
   if (pattern.length > MAX_REGEX_LENGTH) return `Pattern exceeds max length of ${MAX_REGEX_LENGTH}`;
 
-  // Structural balance (tracks escape sequences and char class scope)
-  let parens = 0,
-    brackets = 0,
-    isEscaped = false,
-    inCharClass = false;
-  for (let i = 0; i < pattern.length; i++) {
-    const char = pattern[i];
-    if (isEscaped) {
-      isEscaped = false;
-      continue;
-    }
-    if (char === '\\') {
-      isEscaped = true;
-      continue;
-    }
-    if (char === '[' && !inCharClass) {
-      inCharClass = true;
-      brackets++;
-      continue;
-    }
-    if (char === ']' && inCharClass) {
-      inCharClass = false;
-      brackets--;
-      continue;
-    }
-    if (inCharClass) continue;
-    if (char === '(') parens++;
-    else if (char === ')') parens--;
+  // Compile check first — rejects structurally invalid patterns (unbalanced parens,
+  // bad escapes, etc.) before they reach safe-regex2, which may misanalyse them.
+  try {
+    new RegExp(pattern);
+  } catch (e) {
+    return `Invalid regex syntax: ${(e as Error).message}`;
   }
-  if (parens !== 0) return 'Unbalanced parentheses';
-  if (brackets !== 0) return 'Unbalanced brackets';
 
   // Quantified backreferences — safe-regex2 does not analyse backreferences,
   // so we keep this explicit guard: \1+ \2* \1{2,} can cause catastrophic backtracking.
+  // \d+ matches multi-digit group numbers (\10, \11, …) correctly.
   if (/\\\d+[*+{]/.test(pattern)) return 'Quantified backreferences are forbidden (ReDoS risk)';
 
   // ReDoS check via safe-regex2 — proper NFA analysis, replaces the previous
   // hand-rolled heuristics which had false positives ((GET|POST)+) and false
   // negatives ((x|xx)*). safe-regex2 correctly handles both cases.
   if (!safeRegex(pattern)) return 'Pattern rejected: potential ReDoS vulnerability detected';
-
-  // Final compile check
-  try {
-    new RegExp(pattern);
-  } catch (e) {
-    return `Invalid regex syntax: ${(e as Error).message}`;
-  }
 
   return null;
 }
@@ -375,7 +345,11 @@ export function evaluateSmartConditions(args: unknown, rule: SmartRule): boolean
       case 'matchesGlob':
         return val !== null && cond.value ? pm.isMatch(val, cond.value) : false;
       case 'notMatchesGlob':
-        // Missing value → treat as misconfigured rule; fail closed (false) rather than open (true)
+        // Both absent field AND missing pattern → fail closed.
+        // For a security tool, fail-closed is the safer default: an attacker
+        // omitting a field must not satisfy a notMatchesGlob allow rule.
+        // Rule authors who need "pass when field absent" should add an explicit
+        // 'notExists' condition paired with 'notMatchesGlob'.
         return val !== null && cond.value ? !pm.isMatch(val, cond.value) : false;
       default:
         return false;
@@ -2168,11 +2142,18 @@ export function listCredentialProfiles(): string[] {
   return [];
 }
 
-export function getConfig(): Config {
-  if (cachedConfig) return cachedConfig;
+export function getConfig(cwd?: string): Config {
+  // When an explicit cwd is provided (hook commands passing payload.cwd), skip
+  // the cache entirely — each project directory may have its own node9.config.json,
+  // and we must not pollute the ambient cache used by the interactive CLI.
+  if (!cwd && cachedConfig) return cachedConfig;
 
   const globalPath = path.join(os.homedir(), '.node9', 'config.json');
-  const projectPath = path.join(process.cwd(), 'node9.config.json');
+  // If cwd doesn't exist on disk, tryLoadConfig returns null and the project
+  // config layer is simply skipped — global config + defaults are used instead.
+  // This is intentional: a nonexistent cwd (e.g. deleted project, stale hook)
+  // must not crash; it falls back gracefully to the global config.
+  const projectPath = path.join(cwd ?? process.cwd(), 'node9.config.json');
 
   const globalConfig = tryLoadConfig(globalPath);
   const projectConfig = tryLoadConfig(projectPath);
@@ -2283,13 +2264,17 @@ export function getConfig(): Config {
   mergedPolicy.snapshot.onlyPaths = [...new Set(mergedPolicy.snapshot.onlyPaths)];
   mergedPolicy.snapshot.ignorePaths = [...new Set(mergedPolicy.snapshot.ignorePaths)];
 
-  cachedConfig = {
+  const result: Config = {
     settings: mergedSettings,
     policy: mergedPolicy,
     environments: mergedEnvironments,
   };
 
-  return cachedConfig;
+  // Only populate the cache when using the ambient cwd — explicit cwd calls are
+  // per-project and must not overwrite the cached interactive-CLI config.
+  if (!cwd) cachedConfig = result;
+
+  return result;
 }
 
 function tryLoadConfig(filePath: string): Record<string, unknown> | null {

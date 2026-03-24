@@ -10,7 +10,6 @@ import {
   pauseNode9,
   resumeNode9,
   getConfig,
-  _resetConfigCache,
   explainPolicy,
   shouldSnapshot,
 } from './core';
@@ -215,7 +214,8 @@ async function runProxy(targetCommand: string) {
     if (stdout) executable = stdout.trim();
   } catch {}
 
-  console.log(chalk.green(`🚀 Node9 Proxy Active: Monitoring [${targetCommand}]`));
+  // stderr only — stdout must stay clean for stdio protocols (JSON-RPC, MCP)
+  console.error(chalk.green(`🚀 Node9 Proxy Active: Monitoring [${targetCommand}]`));
 
   // Spawn the MCP Server / Shell command
   const child = spawn(executable, args, {
@@ -1123,20 +1123,9 @@ program
           process.exit(0);
         }
 
-        // Change to the project cwd from the hook payload BEFORE loading config,
-        // so getConfig() finds the correct node9.config.json for that project.
-        if (payload.cwd) {
-          try {
-            process.chdir(payload.cwd);
-            // Crucial: Reset the config cache so we look for node9.config.json
-            // in the project folder we just moved into.
-            _resetConfigCache();
-          } catch {
-            // ignore if cwd doesn't exist
-          }
-        }
-
-        const config = getConfig();
+        // Pass payload.cwd directly to getConfig() instead of mutating process.chdir —
+        // process.chdir is process-global and would race with concurrent hook invocations.
+        const config = getConfig(payload.cwd || undefined);
 
         // Debug logging — controlled by Env Var OR new Settings config
         if (process.env.NODE9_DEBUG === '1' || config.settings.enableHookLogDebug) {
@@ -1344,12 +1333,15 @@ program
           name?: string;
           tool_input?: unknown;
           args?: unknown;
+          cwd?: string;
         };
 
         // Handle both Claude (tool_name) and Gemini (name)
         const tool = sanitize(payload.tool_name ?? payload.name ?? 'unknown');
         const rawInput = payload.tool_input ?? payload.args ?? {};
 
+        // Audit write FIRST — before any config load that could fail.
+        // A config error must never silently skip the audit entry.
         const entry = {
           ts: new Date().toISOString(),
           tool: tool,
@@ -1363,15 +1355,41 @@ program
           fs.mkdirSync(path.dirname(logPath), { recursive: true });
         fs.appendFileSync(logPath, JSON.stringify(entry) + '\n');
 
-        const config = getConfig();
+        // Validate cwd is absolute before passing to getConfig() — prevents path
+        // traversal via a crafted hook payload (e.g. cwd: "../../../../etc").
+        // A relative or empty cwd falls back to ambient process.cwd().
+        const safeCwd =
+          typeof payload.cwd === 'string' && path.isAbsolute(payload.cwd) ? payload.cwd : undefined;
+
+        // Config load and snapshot run AFTER the audit write — a config failure
+        // here is non-fatal and must not retroactively gap the audit trail above.
+        const config = getConfig(safeCwd);
 
         // PostToolUse snapshot is a fallback for tools not covered by PreToolUse.
         // Uses the same configurable snapshot policy.
         if (shouldSnapshot(tool, {}, config)) {
           await createShadowSnapshot('unknown', {}, config.policy.snapshot.ignorePaths);
         }
-      } catch {
-        /* ignore */
+      } catch (err) {
+        // Always write to hook-debug.log — this catch guards the audit trail, so
+        // silent failures here directly create audit gaps. Do NOT call getConfig()
+        // here: if it caused the original error, calling it again re-throws and
+        // hides the real message.
+        const msg = err instanceof Error ? err.message : String(err);
+        // Emit to stderr so the failure surfaces in the tool output stream — operators
+        // should not need to proactively check hook-debug.log to learn of audit gaps.
+        process.stderr.write(`[Node9] audit log error: ${msg}\n`);
+        const debugPath = path.join(os.homedir(), '.node9', 'hook-debug.log');
+        try {
+          fs.appendFileSync(debugPath, `[${new Date().toISOString()}] LOG_ERROR: ${msg}\n`);
+        } catch {
+          /* if we can't write the debug log, nothing we can do */
+        }
+        // Intentional: exit(0) even on audit failure. Returning a non-zero code
+        // here would cause Claude/Gemini to treat the *tool call itself* as failed,
+        // which is incorrect — the tool already ran. The tradeoff is that the hook
+        // host sees success even when audit.log was not written; the error is
+        // surfaced on stderr and in hook-debug.log for operator visibility.
       }
       process.exit(0);
     };
