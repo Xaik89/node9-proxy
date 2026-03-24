@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import fs from 'fs';
 import os from 'os';
+import path from 'path';
 
 // ── Mock child_process BEFORE importing undo (hoisted by vitest) ─────────────
 vi.mock('child_process', () => ({
@@ -8,7 +9,7 @@ vi.mock('child_process', () => ({
   spawn: vi.fn().mockReturnValue({ unref: vi.fn() }),
 }));
 
-import { spawnSync } from 'child_process';
+import { spawnSync, spawn } from 'child_process';
 import {
   createShadowSnapshot,
   getLatestSnapshot,
@@ -187,9 +188,6 @@ describe('getShadowRepoDir', () => {
   });
 });
 
-// helper — import path for basename
-import path from 'path';
-
 // ── createShadowSnapshot ──────────────────────────────────────────────────────
 
 describe('createShadowSnapshot', () => {
@@ -352,6 +350,67 @@ describe('createShadowSnapshot', () => {
     // Index file must still be cleaned up — the finally block must fire on failure
     const unlinkCalls = vi.mocked(fs.unlinkSync).mock.calls.map(([p]) => String(p));
     expect(unlinkCalls.some((p) => p.includes('index_'))).toBe(true);
+  });
+
+  it('calls unref() on the git gc background process', async () => {
+    // GC fires when stack.length % 5 === 0 (checked before MAX_SNAPSHOTS eviction).
+    // 4 existing + 1 new = 5 → 5 % 5 === 0 → GC fires.
+    withShadowRepo(true);
+    const existing = Array.from({ length: 4 }, (_, i) => ({
+      hash: `hash${i}`,
+      tool: 'edit',
+      argsSummary: `f${i}.ts`,
+      cwd: '/p',
+      timestamp: i * 1000,
+    }));
+    vi.mocked(fs.readFileSync).mockImplementation((p) => {
+      const s = String(p);
+      if (s.endsWith('project-path.txt')) return '/mock/project';
+      if (s.endsWith('snapshots.json')) return JSON.stringify(existing);
+      return '';
+    });
+    vi.mocked(fs.existsSync).mockImplementation((p) => String(p).endsWith('snapshots.json'));
+    mockGitSuccess('treeGC', 'commitGC');
+
+    await createShadowSnapshot('edit', {});
+
+    // spawn (not spawnSync) should have been called for gc --auto
+    const mockSpawnFn = vi.mocked(spawn);
+    expect(mockSpawnFn).toHaveBeenCalled();
+    const gcCall = mockSpawnFn.mock.calls.find(([, args]) => (args as string[]).includes('gc'));
+    expect(gcCall).toBeDefined();
+    // unref() must be called so gc doesn't block Node.js exit
+    const returnVal = mockSpawnFn.mock.results.find(
+      (r) => r.type === 'return' && r.value?.unref
+    )?.value;
+    expect(returnVal?.unref).toHaveBeenCalled();
+  });
+
+  it('uses a unique GIT_INDEX_FILE per concurrent invocation', async () => {
+    withShadowRepo(true);
+    mockGitSuccess('treeA', 'commitA');
+
+    // Run two snapshots back-to-back (synchronous mock — simulates concurrent PIDs
+    // by checking the index file names are pid_timestamp scoped)
+    const [r1, r2] = await Promise.all([
+      createShadowSnapshot('edit', { file_path: 'a.ts' }),
+      createShadowSnapshot('edit', { file_path: 'b.ts' }),
+    ]);
+
+    expect(r1).not.toBeNull();
+    expect(r2).not.toBeNull();
+
+    // Collect all GIT_INDEX_FILE values used across all git-add calls
+    const indexFiles = mockSpawn.mock.calls
+      .filter(([, args]) => (args as string[]).includes('add'))
+      .map(([, , opts]) => (opts?.env as Record<string, string>)?.GIT_INDEX_FILE)
+      .filter(Boolean);
+
+    // All index files must be inside the shadow dir, never in user's .git
+    for (const f of indexFiles) {
+      expect(f).toContain('.node9/snapshots');
+      expect(f).not.toContain('/.git/');
+    }
   });
 });
 

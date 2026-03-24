@@ -42,6 +42,8 @@ import {
   evaluateSmartConditions,
   shouldSnapshot,
   DEFAULT_CONFIG,
+  validateRegex,
+  getCompiledRegex,
 } from '../core.js';
 
 // Global spies
@@ -690,6 +692,29 @@ describe('evaluateSmartConditions', () => {
         )
       ).toBe(false);
     });
+
+    it('notMatches — fail-closed on invalid regex (returns false, not true)', () => {
+      // A buggy rule with a broken regex must fail-closed: the condition returns
+      // false (meaning "does not pass"), NOT true. If it returned true, an invalid
+      // notMatches rule would silently allow every call — a security hole.
+      expect(
+        evaluateSmartConditions(
+          { sql: 'DROP TABLE users' },
+          makeRule([{ field: 'sql', op: 'notMatches', value: '[broken(' }])
+        )
+      ).toBe(false);
+    });
+
+    it('notMatches — absent field (null) still returns true (field not present → condition passes)', () => {
+      // Original semantics: if the field is absent, notMatches passes (no value to match against).
+      // This must not regress when regex validation is added.
+      expect(
+        evaluateSmartConditions(
+          { command: 'ls' }, // no 'sql' field
+          makeRule([{ field: 'sql', op: 'notMatches', value: '^DROP' }])
+        )
+      ).toBe(true);
+    });
   });
 
   describe('conditionMode', () => {
@@ -1230,5 +1255,74 @@ describe('isDaemonRunning', () => {
       error: undefined,
     });
     expect(isDaemonRunning()).toBe(false);
+  });
+});
+
+// ── validateRegex — ReDoS protection ─────────────────────────────────────────
+
+describe('validateRegex', () => {
+  it('accepts valid simple patterns', () => {
+    expect(validateRegex('^DROP\\s+TABLE')).toBeNull(); // null = no error
+    expect(validateRegex('\\bWHERE\\b')).toBeNull();
+    expect(validateRegex('[A-Z]{3,}')).toBeNull();
+  });
+
+  it('rejects empty pattern', () => {
+    expect(validateRegex('')).not.toBeNull();
+  });
+
+  it('rejects patterns exceeding max length', () => {
+    expect(validateRegex('a'.repeat(101))).not.toBeNull();
+  });
+
+  it('rejects nested quantifiers — catastrophic backtracking risk', () => {
+    expect(validateRegex('(a+)+')).not.toBeNull();
+    expect(validateRegex('(a*)*')).not.toBeNull();
+    expect(validateRegex('([a-z]+){2,}')).not.toBeNull();
+  });
+
+  it('rejects quantified alternations — catastrophic backtracking risk', () => {
+    expect(validateRegex('(foo|bar)+')).not.toBeNull();
+    expect(validateRegex('(a|b|c)*')).not.toBeNull();
+  });
+
+  it('allows bounded quantifiers with ? (safe — zero-or-one cannot backtrack)', () => {
+    // ? is safe: it matches at most one time, so no catastrophic backtracking
+    expect(validateRegex('(ba|z|da|fi|c|k)?sh')).toBeNull();
+    expect(validateRegex('(\\.\\w+)?')).toBeNull();
+  });
+
+  it('rejects invalid regex syntax', () => {
+    expect(validateRegex('[unclosed')).not.toBeNull();
+  });
+});
+
+// ── getCompiledRegex — LRU cache ──────────────────────────────────────────────
+
+describe('getCompiledRegex', () => {
+  it('returns a compiled RegExp for a valid pattern', () => {
+    const re = getCompiledRegex('^DROP', 'i');
+    expect(re).toBeInstanceOf(RegExp);
+    expect(re!.test('drop table')).toBe(true);
+  });
+
+  it('returns null for an invalid pattern', () => {
+    expect(getCompiledRegex('[invalid(')).toBeNull();
+  });
+
+  it('returns null for a ReDoS pattern', () => {
+    expect(getCompiledRegex('(a+)+')).toBeNull();
+  });
+
+  it('returns the same RegExp instance for the same pattern (cache hit)', () => {
+    const re1 = getCompiledRegex('cached-pattern');
+    const re2 = getCompiledRegex('cached-pattern');
+    expect(re1).toBe(re2); // same object reference
+  });
+
+  it('treats pattern+flags as a distinct cache key', () => {
+    const re1 = getCompiledRegex('hello', '');
+    const re2 = getCompiledRegex('hello', 'i');
+    expect(re1).not.toBe(re2);
   });
 });

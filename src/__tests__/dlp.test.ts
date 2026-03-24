@@ -197,19 +197,28 @@ describe('DLP_PATTERNS export', () => {
 
 // ── scanFilePath — sensitive file path blocking ───────────────────────────────
 
+// Typed alias to reduce repetition when accessing realpathSync.native
+type RealpathWithNative = typeof fs.realpathSync & { native: (p: unknown) => string };
+
 describe('scanFilePath — sensitive path blocking', () => {
-  // Mock fs so tests don't touch the real filesystem
+  // Save the original .native so afterEach can restore it precisely.
+  // vi.restoreAllMocks() only restores vi.spyOn spies — direct property
+  // assignments survive it, so we must restore manually to guarantee isolation.
+  const originalNative = (fs.realpathSync as RealpathWithNative).native;
+
   beforeEach(() => {
     vi.spyOn(fs, 'existsSync').mockReturnValue(false);
-    // Mock realpathSync.native — this is the production symlink-resolution path
     vi.spyOn(fs, 'realpathSync').mockImplementation((p) => String(p));
-    (fs.realpathSync as unknown as { native: (p: unknown) => string }).native = vi
+    // Mock realpathSync.native — the production symlink-escape prevention path
+    (fs.realpathSync as RealpathWithNative).native = vi
       .fn()
       .mockImplementation((p: unknown) => String(p));
   });
 
   afterEach(() => {
     vi.restoreAllMocks();
+    // Explicitly restore .native since restoreAllMocks() doesn't track it
+    (fs.realpathSync as RealpathWithNative).native = originalNative;
   });
 
   it('blocks access to SSH key files', () => {
@@ -259,9 +268,7 @@ describe('scanFilePath — sensitive path blocking', () => {
   it('calls realpathSync.native to resolve symlinks when the file exists', () => {
     // Simulate an existing file so the symlink-resolution branch is taken
     vi.mocked(fs.existsSync).mockReturnValue(true);
-    const nativeSpy = vi.mocked(
-      (fs.realpathSync as unknown as { native: (p: unknown) => string }).native
-    );
+    const nativeSpy = vi.mocked((fs.realpathSync as RealpathWithNative).native);
 
     scanFilePath('/project/safe-looking-link.txt', '/project');
 
@@ -273,7 +280,7 @@ describe('scanFilePath — sensitive path blocking', () => {
     // existsSync → true so realpathSync.native is invoked
     vi.mocked(fs.existsSync).mockReturnValue(true);
     // .native resolves the "safe" symlink to a sensitive target
-    (fs.realpathSync as unknown as { native: (p: unknown) => string }).native = vi
+    (fs.realpathSync as RealpathWithNative).native = vi
       .fn()
       .mockReturnValue('/home/user/.ssh/id_rsa');
 
@@ -284,9 +291,7 @@ describe('scanFilePath — sensitive path blocking', () => {
 
   it('does NOT block when a symlink resolves to a safe path', () => {
     vi.mocked(fs.existsSync).mockReturnValue(true);
-    (fs.realpathSync as unknown as { native: (p: unknown) => string }).native = vi
-      .fn()
-      .mockReturnValue('/project/src/app.ts');
+    (fs.realpathSync as RealpathWithNative).native = vi.fn().mockReturnValue('/project/src/app.ts');
 
     expect(scanFilePath('/project/link-to-app', '/project')).toBeNull();
   });

@@ -251,6 +251,9 @@ export async function createShadowSnapshot(
       cwd,
       timestamp: Date.now(),
     });
+    // Check GC BEFORE splice so total-snapshots-ever is used, not capped length.
+    // After splice, stack.length ≤ MAX_SNAPSHOTS (10), so % 20 would never fire.
+    const shouldGc = stack.length % 5 === 0;
     if (stack.length > MAX_SNAPSHOTS) stack.splice(0, stack.length - MAX_SNAPSHOTS);
     writeStack(stack);
 
@@ -258,7 +261,7 @@ export async function createShadowSnapshot(
     fs.writeFileSync(UNDO_LATEST_PATH, commitHash);
 
     // Periodic GC — fire-and-forget, non-blocking, keeps shadow dir tidy
-    if (stack.length % 20 === 0) {
+    if (shouldGc) {
       spawn('git', ['gc', '--auto'], { env: shadowEnv, detached: true, stdio: 'ignore' }).unref();
     }
 
