@@ -215,7 +215,8 @@ async function runProxy(targetCommand: string) {
     if (stdout) executable = stdout.trim();
   } catch {}
 
-  console.log(chalk.green(`🚀 Node9 Proxy Active: Monitoring [${targetCommand}]`));
+  // stderr only — stdout must stay clean for stdio protocols (JSON-RPC, MCP)
+  console.error(chalk.green(`🚀 Node9 Proxy Active: Monitoring [${targetCommand}]`));
 
   // Spawn the MCP Server / Shell command
   const child = spawn(executable, args, {
@@ -1344,7 +1345,20 @@ program
           name?: string;
           tool_input?: unknown;
           args?: unknown;
+          cwd?: string;
         };
+
+        // Mirror check command: change to project cwd before getConfig() so the
+        // correct node9.config.json is loaded. Without this, getConfig() reads the
+        // wrong project config (the node9 binary's cwd, not the agent's project).
+        if (payload.cwd) {
+          try {
+            process.chdir(payload.cwd);
+            _resetConfigCache();
+          } catch {
+            // ignore if cwd doesn't exist
+          }
+        }
 
         // Handle both Claude (tool_name) and Gemini (name)
         const tool = sanitize(payload.tool_name ?? payload.name ?? 'unknown');
@@ -1370,8 +1384,17 @@ program
         if (shouldSnapshot(tool, {}, config)) {
           await createShadowSnapshot('unknown', {}, config.policy.snapshot.ignorePaths);
         }
-      } catch {
-        /* ignore */
+      } catch (err) {
+        // Surface failures — silent swallow here masked audit.log gaps for MCP tools
+        if (process.env.NODE9_DEBUG === '1' || getConfig().settings.enableHookLogDebug) {
+          const debugPath = path.join(os.homedir(), '.node9', 'hook-debug.log');
+          const msg = err instanceof Error ? err.message : String(err);
+          try {
+            fs.appendFileSync(debugPath, `[${new Date().toISOString()}] LOG_ERROR: ${msg}\n`);
+          } catch {
+            /* if we can't write the debug log, nothing we can do */
+          }
+        }
       }
       process.exit(0);
     };
