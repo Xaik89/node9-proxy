@@ -84,7 +84,9 @@ function readSseStream(timeoutMs: number): Promise<string> {
       res.on('error', reject);
     });
     req.on('error', reject);
-    // Close after timeoutMs — enough time to receive the initial burst of events
+    // Close after timeoutMs — enough time to receive the initial burst of events.
+    // Note: parseSseEvents silently drops multi-data-line events (valid SSE spec),
+    // which is acceptable since all daemon events use a single data line.
     setTimeout(() => {
       req.destroy();
       resolve(data);
@@ -124,14 +126,16 @@ function parseSseEvents(raw: string): Map<string, unknown> {
 describe('daemon /events — shields-status emitted on connect', () => {
   let tmpHome: string;
   let daemonProc: ChildProcess;
+  // Captured once in beforeAll and shared across all tests — avoids 3 separate
+  // 1.5s SSE connections and eliminates timing sensitivity on slow CI.
+  let sseSnapshot: Map<string, unknown>;
   let portWasFree = false;
 
   beforeAll(async () => {
     portWasFree = await isPortFree(DAEMON_PORT);
-    if (!portWasFree) return; // skip setup — tests will self-skip
+    if (!portWasFree) return; // skip setup — tests will self-skip via it.skipIf
 
     tmpHome = makeTempHome();
-    // Write active shields to the isolated home
     fs.writeFileSync(
       path.join(tmpHome, '.node9', 'shields.json'),
       JSON.stringify({ active: ['filesystem'] })
@@ -147,6 +151,10 @@ describe('daemon /events — shields-status emitted on connect', () => {
       daemonProc.kill();
       throw new Error('Daemon did not start within 6s');
     }
+
+    // Capture the initial SSE burst once — shared by all three tests below
+    const raw = await readSseStream(1500);
+    sseSnapshot = parseSseEvents(raw);
   });
 
   afterAll(() => {
@@ -155,33 +163,25 @@ describe('daemon /events — shields-status emitted on connect', () => {
       env: { ...process.env, HOME: tmpHome, NODE9_TESTING: '1' },
       timeout: 3000,
     });
-    daemonProc?.kill('SIGTERM');
     if (tmpHome) cleanupDir(tmpHome);
   });
 
-  it('emits shields-status in the initial SSE payload', async () => {
-    if (!portWasFree) {
-      console.warn('Skipping: port 7391 is already in use by another daemon');
-      return;
-    }
+  it('emits shields-status in the initial SSE payload', ({ skip }) => {
+    // it.skipIf cannot be used here: the condition depends on beforeAll (async port
+    // check), which runs after test collection. ctx.skip() is the correct way to
+    // produce a visible skip in the Vitest report when setup was not possible.
+    if (!portWasFree) skip();
 
-    const raw = await readSseStream(1500);
-    expect(raw, 'SSE stream must not be empty').toBeTruthy();
-
-    const events = parseSseEvents(raw);
     expect(
-      events.has('shields-status'),
-      `shields-status event must be present in initial SSE payload.\nGot events: ${[...events.keys()].join(', ')}\nRaw stream:\n${raw}`
+      sseSnapshot.has('shields-status'),
+      `shields-status event must be present in initial SSE payload.\nGot events: ${[...sseSnapshot.keys()].join(', ')}`
     ).toBe(true);
   });
 
-  it('shields-status payload lists all shields with correct active state', async () => {
-    if (!portWasFree) return;
+  it('shields-status payload lists all shields with correct active state', ({ skip }) => {
+    if (!portWasFree) skip();
 
-    const raw = await readSseStream(1500);
-    const events = parseSseEvents(raw);
-
-    const payload = events.get('shields-status') as {
+    const payload = sseSnapshot.get('shields-status') as {
       shields: Array<{ name: string; description: string; active: boolean }>;
     };
 
@@ -195,22 +195,17 @@ describe('daemon /events — shields-status emitted on connect', () => {
     expect(postgres, 'postgres shield must appear in payload').toBeDefined();
     expect(postgres!.active).toBe(false); // not in shields.json → inactive
 
-    // Every entry must have name and description
     for (const s of payload.shields) {
       expect(typeof s.name).toBe('string');
       expect(typeof s.description).toBe('string');
     }
   });
 
-  it('init and decisions events are still present alongside shields-status', async () => {
-    if (!portWasFree) return;
+  it('init and decisions events are still present alongside shields-status', ({ skip }) => {
+    if (!portWasFree) skip();
 
-    const raw = await readSseStream(1500);
-    const events = parseSseEvents(raw);
-
-    // Existing events must not have been removed by the fix
-    expect(events.has('init'), 'init event must still be present').toBe(true);
-    expect(events.has('decisions'), 'decisions event must still be present').toBe(true);
-    expect(events.has('shields-status'), 'shields-status event must be present').toBe(true);
+    expect(sseSnapshot.has('init'), 'init event must still be present').toBe(true);
+    expect(sseSnapshot.has('decisions'), 'decisions event must still be present').toBe(true);
+    expect(sseSnapshot.has('shields-status'), 'shields-status event must be present').toBe(true);
   });
 });
