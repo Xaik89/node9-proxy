@@ -3,6 +3,9 @@
 // Scans tool call arguments for known secret patterns before policy evaluation.
 // Returns only a redacted match object — the full secret never leaves this module.
 
+import fs from 'fs';
+import path from 'path';
+
 export interface DlpMatch {
   patternName: string;
   fieldPath: string;
@@ -27,8 +30,81 @@ export const DLP_PATTERNS: DlpPattern[] = [
     regex: /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/,
     severity: 'block',
   },
+  // GCP service account JSON (detects the type field that uniquely identifies it)
+  {
+    name: 'GCP Service Account',
+    regex: /"type"\s*:\s*"service_account"/,
+    severity: 'block',
+  },
+  // NPM auth token in .npmrc format
+  {
+    name: 'NPM Auth Token',
+    regex: /_authToken\s*=\s*[A-Za-z0-9_\-]{20,}/,
+    severity: 'block',
+  },
   { name: 'Bearer Token', regex: /Bearer\s+[a-zA-Z0-9\-._~+/]+=*/i, severity: 'review' },
 ];
+
+// ── Sensitive File Path Blocklist ─────────────────────────────────────────────
+// Blocks access attempts to credential/key files before their content is read.
+const SENSITIVE_PATH_PATTERNS: RegExp[] = [
+  /[/\\]\.ssh[/\\]/i,
+  /[/\\]\.aws[/\\]/i,
+  /[/\\]\.config[/\\]gcloud[/\\]/i,
+  /[/\\]\.azure[/\\]/i,
+  /[/\\]\.kube[/\\]config$/i,
+  /[/\\]\.env($|\.)/i, // .env, .env.local, .env.production — not .envoy
+  /[/\\]\.git-credentials$/i,
+  /[/\\]\.npmrc$/i,
+  /[/\\]\.docker[/\\]config\.json$/i,
+  /[/\\][^/\\]+\.pem$/i,
+  /[/\\][^/\\]+\.key$/i,
+  /[/\\][^/\\]+\.p12$/i,
+  /[/\\][^/\\]+\.pfx$/i,
+  /^\/etc\/passwd$/,
+  /^\/etc\/shadow$/,
+  /^\/etc\/sudoers$/,
+  /[/\\]credentials\.json$/i,
+  /[/\\]id_rsa$/i,
+  /[/\\]id_ed25519$/i,
+  /[/\\]id_ecdsa$/i,
+];
+
+/**
+ * Checks whether a file path argument targets a sensitive credential file.
+ * Resolves symlinks (if the file exists) before checking, to prevent symlink
+ * escape attacks where a safe-looking path points to a protected file.
+ *
+ * Returns a DlpMatch if the path is sensitive, null if clean.
+ */
+export function scanFilePath(filePath: string, cwd = process.cwd()): DlpMatch | null {
+  if (!filePath) return null;
+
+  let resolved: string;
+  try {
+    const absolute = path.resolve(cwd, filePath);
+    // Resolve symlinks only if the file already exists (Write to new files falls back to resolved absolute path)
+    resolved = fs.existsSync(absolute) ? fs.realpathSync.native(absolute) : absolute;
+  } catch {
+    resolved = path.resolve(cwd, filePath);
+  }
+
+  // Normalise to forward slashes for cross-platform pattern matching
+  const normalised = resolved.replace(/\\/g, '/');
+
+  for (const pattern of SENSITIVE_PATH_PATTERNS) {
+    if (pattern.test(normalised)) {
+      return {
+        patternName: 'Sensitive File Path',
+        fieldPath: 'file_path',
+        redactedSample: filePath, // show original path in alert, not resolved
+        severity: 'block',
+      };
+    }
+  }
+
+  return null;
+}
 
 /**
  * Masks a matched secret: keeps 4-char prefix + 4-char suffix, replaces the

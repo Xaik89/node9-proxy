@@ -13,7 +13,7 @@ import { askNativePopup, sendDesktopNotification } from './ui/native';
 import { computeRiskMetadata, RiskMetadata } from './context-sniper';
 import { sanitizeConfig } from './config-schema';
 import { readActiveShields, getShield } from './shields';
-import { scanArgs, type DlpMatch } from './dlp';
+import { scanArgs, scanFilePath, type DlpMatch } from './dlp';
 
 // ── Feature file paths ────────────────────────────────────────────────────────
 const PAUSED_FILE = path.join(os.homedir(), '.node9', 'PAUSED');
@@ -68,6 +68,103 @@ export function resumeNode9(): void {
   try {
     if (fs.existsSync(PAUSED_FILE)) fs.unlinkSync(PAUSED_FILE);
   } catch {}
+}
+
+// ── Regex Cache & ReDoS Protection ───────────────────────────────────────────
+const MAX_REGEX_LENGTH = 100;
+const REGEX_CACHE_MAX = 500;
+const regexCache = new Map<string, RegExp>();
+
+/**
+ * Validates a user-supplied regex pattern against known ReDoS vectors.
+ * Returns null if valid, or an error string describing the problem.
+ */
+export function validateRegex(pattern: string): string | null {
+  if (!pattern) return 'Pattern is required';
+  if (pattern.length > MAX_REGEX_LENGTH) return `Pattern exceeds max length of ${MAX_REGEX_LENGTH}`;
+
+  // Structural balance (tracks escape sequences and char class scope)
+  let parens = 0,
+    brackets = 0,
+    isEscaped = false,
+    inCharClass = false;
+  for (let i = 0; i < pattern.length; i++) {
+    const char = pattern[i];
+    if (isEscaped) {
+      isEscaped = false;
+      continue;
+    }
+    if (char === '\\') {
+      isEscaped = true;
+      continue;
+    }
+    if (char === '[' && !inCharClass) {
+      inCharClass = true;
+      brackets++;
+      continue;
+    }
+    if (char === ']' && inCharClass) {
+      inCharClass = false;
+      brackets--;
+      continue;
+    }
+    if (inCharClass) continue;
+    if (char === '(') parens++;
+    else if (char === ')') parens--;
+  }
+  if (parens !== 0) return 'Unbalanced parentheses';
+  if (brackets !== 0) return 'Unbalanced brackets';
+
+  // ReDoS vectors — only flag + * { as dangerous outer quantifiers; ? (zero-or-one) is bounded and safe
+  if (/\([^)]*[*+{][^)]*\)[*+{]/.test(pattern))
+    return 'Nested quantifiers are forbidden (ReDoS risk)';
+  if (/\([^)]*\|[^)]*\)[*+{]/.test(pattern))
+    return 'Quantified alternations are forbidden (ReDoS risk)';
+  if (/\\\d+[*+{]/.test(pattern)) return 'Quantified backreferences are forbidden (ReDoS risk)';
+
+  // Final compile check
+  try {
+    new RegExp(pattern);
+  } catch (e) {
+    return `Invalid regex syntax: ${(e as Error).message}`;
+  }
+
+  return null;
+}
+
+/**
+ * Compiles a regex with validation and LRU caching.
+ * Returns null if the pattern is invalid or dangerous.
+ */
+export function getCompiledRegex(pattern: string, flags = ''): RegExp | null {
+  const key = `${pattern}\0${flags}`;
+  if (regexCache.has(key)) {
+    // LRU bump: move to insertion-order end
+    const cached = regexCache.get(key)!;
+    regexCache.delete(key);
+    regexCache.set(key, cached);
+    return cached;
+  }
+
+  const err = validateRegex(pattern);
+  if (err) {
+    if (process.env.NODE9_DEBUG === '1')
+      console.error(`[Node9] Regex blocked: ${err} — pattern: "${pattern}"`);
+    return null;
+  }
+
+  try {
+    const re = new RegExp(pattern, flags);
+    if (regexCache.size >= REGEX_CACHE_MAX) {
+      const oldest = regexCache.keys().next().value;
+      if (oldest) regexCache.delete(oldest);
+    }
+    regexCache.set(key, re);
+    return re;
+  } catch (e) {
+    if (process.env.NODE9_DEBUG === '1') console.error(`[Node9] Regex compile failed:`, e);
+    return null;
+  }
 }
 
 // ── Trust Session helpers ─────────────────────────────────────────────────────
@@ -255,19 +352,16 @@ export function evaluateSmartConditions(args: unknown, rule: SmartRule): boolean
         return val !== null && cond.value ? !val.includes(cond.value) : true;
       case 'matches': {
         if (val === null || !cond.value) return false;
-        try {
-          return new RegExp(cond.value, cond.flags ?? '').test(val);
-        } catch {
-          return false;
-        }
+        const reM = getCompiledRegex(cond.value, cond.flags ?? '');
+        if (!reM) return false; // invalid/dangerous pattern → fail closed
+        return reM.test(val);
       }
       case 'notMatches': {
-        if (val === null || !cond.value) return true;
-        try {
-          return !new RegExp(cond.value, cond.flags ?? '').test(val);
-        } catch {
-          return true;
-        }
+        if (!cond.value) return false; // no pattern → fail closed
+        if (val === null) return true; // field absent → condition passes (preserve original)
+        const reN = getCompiledRegex(cond.value, cond.flags ?? '');
+        if (!reN) return false; // invalid/dangerous pattern → fail closed
+        return !reN.test(val);
       }
       case 'matchesGlob':
         return val !== null && cond.value ? pm.isMatch(val, cond.value) : false;
@@ -1006,7 +1100,13 @@ export async function explainPolicy(toolName: string, args?: unknown): Promise<E
   // ── 0. DLP Content Scanner ────────────────────────────────────────────────
   const wouldBeIgnored = matchesPattern(toolName, config.policy.ignoredTools);
   if (config.policy.dlp.enabled && (!wouldBeIgnored || config.policy.dlp.scanIgnoredTools)) {
-    const dlpMatch = args !== undefined ? scanArgs(args) : null;
+    const argsObjE =
+      args && typeof args === 'object' && !Array.isArray(args)
+        ? (args as Record<string, unknown>)
+        : {};
+    const filePathE = String(argsObjE.file_path ?? argsObjE.path ?? argsObjE.filename ?? '');
+    const dlpMatch =
+      (filePathE ? scanFilePath(filePathE) : null) ?? (args !== undefined ? scanArgs(args) : null);
     if (dlpMatch) {
       steps.push({
         name: 'DLP Content Scanner',
@@ -1566,7 +1666,14 @@ async function _authorizeHeadlessCore(
     config.policy.dlp.enabled &&
     (!isIgnoredTool(toolName) || config.policy.dlp.scanIgnoredTools)
   ) {
-    const dlpMatch: DlpMatch | null = scanArgs(args);
+    // P1-1/P1-2: Check file path first (blocks read attempts before content is returned,
+    // and resolves symlinks to prevent escape attacks).
+    const argsObj =
+      args && typeof args === 'object' && !Array.isArray(args)
+        ? (args as Record<string, unknown>)
+        : {};
+    const filePath = String(argsObj.file_path ?? argsObj.path ?? argsObj.filename ?? '');
+    const dlpMatch: DlpMatch | null = (filePath ? scanFilePath(filePath) : null) ?? scanArgs(args);
     if (dlpMatch) {
       const dlpReason =
         `🚨 DATA LOSS PREVENTION: ${dlpMatch.patternName} detected in ` +
