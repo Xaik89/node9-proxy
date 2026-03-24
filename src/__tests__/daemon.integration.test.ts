@@ -152,8 +152,10 @@ describe('daemon /events — shields-status emitted on connect', () => {
       throw new Error('Daemon did not start within 6s');
     }
 
-    // Capture the initial SSE burst once — shared by all three tests below
-    const raw = await readSseStream(1500);
+    // Capture the initial SSE burst once — shared by all three tests below.
+    // 3000ms gives slow CI enough headroom; the daemon flushes the initial
+    // events synchronously so in practice this completes in <100ms.
+    const raw = await readSseStream(3000);
     sseSnapshot = parseSseEvents(raw);
   });
 
@@ -181,23 +183,31 @@ describe('daemon /events — shields-status emitted on connect', () => {
   it('shields-status payload lists all shields with correct active state', ({ skip }) => {
     if (!portWasFree) skip();
 
-    const payload = sseSnapshot.get('shields-status') as {
-      shields: Array<{ name: string; description: string; active: boolean }>;
-    };
+    // Assert defined before accessing .shields — gives a clear failure message
+    // if test 1 is skipped or the event is absent (tests can run independently).
+    const payload = sseSnapshot.get('shields-status') as
+      | { shields: Array<{ name: string; description: string; active: boolean }> }
+      | undefined;
+    expect(payload, 'shields-status payload must be defined').toBeDefined();
+    expect(Array.isArray(payload!.shields)).toBe(true);
 
-    expect(Array.isArray(payload?.shields)).toBe(true);
+    const { shields } = payload!;
 
-    const filesystem = payload.shields.find((s) => s.name === 'filesystem');
+    // Verify the one shield we configured active
+    const filesystem = shields.find((s) => s.name === 'filesystem');
     expect(filesystem, 'filesystem shield must appear in payload').toBeDefined();
     expect(filesystem!.active).toBe(true); // configured active in shields.json
 
-    const postgres = payload.shields.find((s) => s.name === 'postgres');
-    expect(postgres, 'postgres shield must appear in payload').toBeDefined();
-    expect(postgres!.active).toBe(false); // not in shields.json → inactive
-
-    for (const s of payload.shields) {
-      expect(typeof s.name).toBe('string');
-      expect(typeof s.description).toBe('string');
+    // Verify all other known shields are inactive — enumerate structurally
+    // rather than hardcoding names so this survives adding/removing shields.
+    for (const s of shields) {
+      expect(typeof s.name, `shield "${s.name}" must have a string name`).toBe('string');
+      expect(typeof s.description, `shield "${s.name}" must have a string description`).toBe(
+        'string'
+      );
+      if (s.name !== 'filesystem') {
+        expect(s.active, `shield "${s.name}" should be inactive (not in shields.json)`).toBe(false);
+      }
     }
   });
 
