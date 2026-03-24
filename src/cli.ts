@@ -1363,17 +1363,16 @@ program
           await createShadowSnapshot('unknown', {}, config.policy.snapshot.ignorePaths);
         }
       } catch (err) {
-        // Surface failures — silent swallow here masked audit.log gaps for MCP tools.
-        // Do NOT call getConfig() here — if it caused the original error, calling it
-        // again re-throws and hides the real message.
-        if (process.env.NODE9_DEBUG === '1') {
-          const debugPath = path.join(os.homedir(), '.node9', 'hook-debug.log');
-          const msg = err instanceof Error ? err.message : String(err);
-          try {
-            fs.appendFileSync(debugPath, `[${new Date().toISOString()}] LOG_ERROR: ${msg}\n`);
-          } catch {
-            /* if we can't write the debug log, nothing we can do */
-          }
+        // Always write to hook-debug.log — this catch guards the audit trail, so
+        // silent failures here directly create audit gaps. Do NOT call getConfig()
+        // here: if it caused the original error, calling it again re-throws and
+        // hides the real message.
+        const debugPath = path.join(os.homedir(), '.node9', 'hook-debug.log');
+        const msg = err instanceof Error ? err.message : String(err);
+        try {
+          fs.appendFileSync(debugPath, `[${new Date().toISOString()}] LOG_ERROR: ${msg}\n`);
+        } catch {
+          /* if we can't write the debug log, nothing we can do */
         }
       }
       process.exit(0);

@@ -1311,8 +1311,12 @@ describe('validateRegex', () => {
     expect(validateRegex('a'.repeat(101))).not.toBeNull();
   });
 
-  it('rejects patterns flagged as dangerous by safe-regex2 (NFA analysis)', () => {
-    expect(validateRegex('(a+)+')).not.toBeNull();
+  it('rejects ReDoS patterns — syntactically valid but caught by safe-regex2 NFA analysis', () => {
+    // These patterns compile fine (new RegExp() succeeds), confirming safe-regex2
+    // still runs after the compile-first reorder and correctly rejects them.
+    expect(() => new RegExp('(a+)+')).not.toThrow(); // compile step passes
+    expect(validateRegex('(a+)+')).not.toBeNull(); // safe-regex2 still rejects it
+
     expect(validateRegex('(a*)*')).not.toBeNull();
     expect(validateRegex('([a-z]+){2,}')).not.toBeNull();
   });
