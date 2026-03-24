@@ -44,6 +44,7 @@ import {
   DEFAULT_CONFIG,
   validateRegex,
   getCompiledRegex,
+  getConfig,
 } from '../core.js';
 
 // Global spies
@@ -1426,5 +1427,40 @@ describe('getCompiledRegex', () => {
     const re2 = getCompiledRegex(firstPattern);
     expect(re2).toBeInstanceOf(RegExp);
     expect(re2).not.toBe(re1); // different instance = was evicted and recompiled
+  });
+});
+
+// ── getConfig — cwd fallback behaviour ───────────────────────────────────────
+
+describe('getConfig — nonexistent cwd falls back to global config', () => {
+  beforeEach(() => {
+    _resetConfigCache();
+  });
+
+  it('returns default config when project node9.config.json does not exist', () => {
+    // existsSpy already returns false for all paths (set in global beforeEach).
+    // Passing a nonexistent absolute path must not throw — tryLoadConfig returns
+    // null and the project layer is silently skipped.
+    expect(() => getConfig('/nonexistent/path/that/does/not/exist')).not.toThrow();
+    const config = getConfig('/nonexistent/path/that/does/not/exist');
+    // Result should be the default config (global config also missing → all defaults)
+    expect(config.settings.mode).toBe(DEFAULT_CONFIG.settings.mode);
+    expect(config.policy.dangerousWords).toEqual(
+      expect.arrayContaining(DEFAULT_CONFIG.policy.dangerousWords)
+    );
+  });
+
+  it('does not populate the ambient cache when called with explicit cwd', () => {
+    // getConfig(cwd) bypasses the cache — a subsequent no-arg call must reload
+    // from disk rather than returning the per-project result.
+    getConfig('/some/project/dir');
+    // Reset existsSpy to return true for a global config path with specific content
+    const globalPath = path.join(os.homedir(), '.node9', 'config.json');
+    existsSpy.mockImplementation((p) => String(p) === globalPath);
+    readSpy.mockImplementation((p) =>
+      String(p) === globalPath ? JSON.stringify({ settings: { mode: 'strict' } }) : ''
+    );
+    const ambient = getConfig(); // no-arg — must read from disk, not use project result
+    expect(ambient.settings.mode).toBe('strict');
   });
 });

@@ -13,14 +13,31 @@
  */
 
 import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
-
-// echo is a shell builtin on Windows — the proxy tests that spawn /usr/bin/echo
-// via `node9 echo` only work on Linux/macOS where echo is an executable on PATH.
-const itUnix = it.skipIf(process.platform === 'win32');
 import { spawnSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+
+// echo is a shell builtin on Windows — the proxy tests that spawn /usr/bin/echo
+// via `node9 echo` only work on Linux/macOS where echo is an executable on PATH.
+const itUnix = it.skipIf(process.platform === 'win32');
+
+/**
+ * Parses an audit.log file into typed entries with a descriptive failure message
+ * if any line is not valid JSON (e.g. a debug line or partial write landed in the log).
+ */
+function parseAuditLog(logPath: string): Record<string, unknown>[] {
+  const raw = fs.readFileSync(logPath, 'utf-8').trim();
+  return raw.split('\n').map((line, i) => {
+    try {
+      return JSON.parse(line) as Record<string, unknown>;
+    } catch {
+      throw new Error(
+        `audit.log line ${i + 1} is not valid JSON.\nLine: ${line}\nFull log:\n${raw}`
+      );
+    }
+  });
+}
 
 const CLI = path.resolve(__dirname, '../../dist/cli.js');
 
@@ -147,11 +164,7 @@ describe('log command — audit.log written when payload.cwd differs from proces
       const auditLog = path.join(tmpHome, '.node9', 'audit.log');
       expect(fs.existsSync(auditLog)).toBe(true);
 
-      const entries = fs
-        .readFileSync(auditLog, 'utf-8')
-        .trim()
-        .split('\n')
-        .map((l) => JSON.parse(l) as Record<string, unknown>);
+      const entries = parseAuditLog(auditLog);
 
       expect(entries).toHaveLength(1);
       expect(entries[0]).toMatchObject({
@@ -255,11 +268,7 @@ describe('log command — audit.log written when payload.cwd differs from proces
       // audit.log must exist and contain the entry despite the corrupt config
       const auditLog = path.join(corruptHome, '.node9', 'audit.log');
       expect(fs.existsSync(auditLog)).toBe(true);
-      const entries = fs
-        .readFileSync(auditLog, 'utf-8')
-        .trim()
-        .split('\n')
-        .map((l) => JSON.parse(l) as Record<string, unknown>);
+      const entries = parseAuditLog(auditLog);
       expect(entries[0]).toMatchObject({ tool: 'bash', decision: 'allowed' });
     } finally {
       cleanupDir(corruptHome);
