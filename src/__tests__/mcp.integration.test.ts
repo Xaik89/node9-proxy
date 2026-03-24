@@ -1,0 +1,186 @@
+/**
+ * Integration tests for MCP stdio compatibility — regression suite for #33.
+ *
+ * Tests two bugs fixed in #33:
+ *   1. Proxy banner must go to stderr, never stdout — stdout must stay clean for JSON-RPC.
+ *   2. `node9 log` must write to audit.log even when payload.cwd differs from process.cwd().
+ *
+ * Requirements:
+ *   - `npm run build` must be run before these tests (suite checks for dist/cli.js)
+ *   - Tests set NODE9_NO_AUTO_DAEMON=1 to prevent daemon auto-start side effects
+ *   - Tests set NODE9_TESTING=1 to disable interactive approval UI
+ *   - Tests set HOME to an isolated tmp directory to control config state
+ */
+
+import { describe, it, expect, beforeAll, afterEach } from 'vitest';
+import { spawnSync } from 'child_process';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+
+const CLI = path.resolve(__dirname, '../../dist/cli.js');
+
+function makeTempHome(config: object): string {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'node9-test-'));
+  const node9Dir = path.join(tmpHome, '.node9');
+  fs.mkdirSync(node9Dir, { recursive: true });
+  fs.writeFileSync(path.join(node9Dir, 'config.json'), JSON.stringify(config));
+  return tmpHome;
+}
+
+function cleanupDir(dir: string) {
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
+// Collect temp dirs created per test for cleanup
+const tempDirs: string[] = [];
+
+beforeAll(() => {
+  if (!fs.existsSync(CLI)) {
+    throw new Error(
+      `dist/cli.js not found. Run "npm run build" before running integration tests.\nExpected: ${CLI}`
+    );
+  }
+});
+
+afterEach(() => {
+  for (const d of tempDirs.splice(0)) cleanupDir(d);
+});
+
+// ── 1. Proxy stdout cleanliness ───────────────────────────────────────────────
+// Regression: banner was written to stdout via console.log, corrupting JSON-RPC
+// streams when node9 wrapped stdio MCP servers.
+
+describe('proxy command — stdout must stay clean for stdio protocols (MCP / JSON-RPC)', () => {
+  it('banner goes to stderr; stdout contains only the child process output', () => {
+    const tmpHome = makeTempHome({ settings: { mode: 'audit', autoStartDaemon: false } });
+    tempDirs.push(tmpHome);
+
+    const result = spawnSync(process.execPath, [CLI, 'echo', 'hello-mcp-test'], {
+      encoding: 'utf-8',
+      timeout: 8000,
+      cwd: os.tmpdir(),
+      env: {
+        ...process.env,
+        HOME: tmpHome,
+        NODE9_NO_AUTO_DAEMON: '1',
+        NODE9_TESTING: '1',
+      },
+    });
+
+    // Critical: stdout must be exactly what the child wrote — no banner injected
+    expect(result.stdout).toBe('hello-mcp-test\n');
+    // Banner must appear on stderr so MCP clients are unaffected
+    expect(result.stderr).toContain('Node9 Proxy Active');
+  });
+
+  it('stdout is valid JSON when the child writes JSON — banner does not corrupt the stream', () => {
+    const tmpHome = makeTempHome({ settings: { mode: 'audit', autoStartDaemon: false } });
+    tempDirs.push(tmpHome);
+
+    // Simulate a minimal JSON-RPC response from an MCP server
+    const jsonRpcResponse = '{"jsonrpc":"2.0","id":1,"result":{"ok":true}}';
+
+    const result = spawnSync(process.execPath, [CLI, 'echo', jsonRpcResponse], {
+      encoding: 'utf-8',
+      timeout: 8000,
+      cwd: os.tmpdir(),
+      env: {
+        ...process.env,
+        HOME: tmpHome,
+        NODE9_NO_AUTO_DAEMON: '1',
+        NODE9_TESTING: '1',
+      },
+    });
+
+    // stdout must parse as valid JSON — banner injection would break this
+    const parsed: unknown = JSON.parse(result.stdout.trim());
+    expect(parsed).toMatchObject({ jsonrpc: '2.0', id: 1 });
+  });
+});
+
+// ── 2. Log command cross-cwd audit write ──────────────────────────────────────
+// Regression: `node9 log` silently failed to write audit.log when payload.cwd
+// pointed to a project dir different from the binary's process.cwd(). The root
+// cause was getConfig() reading the wrong config (wrong project), which caused
+// it to throw and the catch block to silently swallow the error.
+
+describe('log command — audit.log written when payload.cwd differs from process.cwd()', () => {
+  it('writes MCP tool call to audit.log when payload.cwd is a different project directory', () => {
+    const tmpHome = makeTempHome({ settings: { mode: 'audit', autoStartDaemon: false } });
+    tempDirs.push(tmpHome);
+
+    // Project directory is different from the node9 binary's cwd
+    const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'node9-project-'));
+    tempDirs.push(projectDir);
+
+    const payload = JSON.stringify({
+      tool_name: 'mcp__opsgenie__list_teams',
+      tool_input: { limit: 10 },
+      cwd: projectDir,
+      hook_event_name: 'PostToolUse',
+    });
+
+    spawnSync(process.execPath, [CLI, 'log', payload], {
+      encoding: 'utf-8',
+      timeout: 5000,
+      cwd: os.tmpdir(), // intentionally different from projectDir
+      env: {
+        ...process.env,
+        HOME: tmpHome,
+        NODE9_NO_AUTO_DAEMON: '1',
+        NODE9_TESTING: '1',
+      },
+    });
+
+    const auditLog = path.join(tmpHome, '.node9', 'audit.log');
+    expect(fs.existsSync(auditLog)).toBe(true);
+
+    const entries = fs
+      .readFileSync(auditLog, 'utf-8')
+      .trim()
+      .split('\n')
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({
+      tool: 'mcp__opsgenie__list_teams',
+      decision: 'allowed',
+      source: 'post-hook',
+    });
+  });
+
+  it('writes to audit.log when payload has no cwd (backward compat — uses process.cwd())', () => {
+    const tmpHome = makeTempHome({ settings: { mode: 'audit', autoStartDaemon: false } });
+    tempDirs.push(tmpHome);
+
+    const payload = JSON.stringify({
+      tool_name: 'write_file',
+      tool_input: { file_path: '/tmp/test.txt', content: 'hello' },
+      hook_event_name: 'PostToolUse',
+    });
+
+    spawnSync(process.execPath, [CLI, 'log', payload], {
+      encoding: 'utf-8',
+      timeout: 5000,
+      cwd: os.tmpdir(),
+      env: {
+        ...process.env,
+        HOME: tmpHome,
+        NODE9_NO_AUTO_DAEMON: '1',
+        NODE9_TESTING: '1',
+      },
+    });
+
+    const auditLog = path.join(tmpHome, '.node9', 'audit.log');
+    expect(fs.existsSync(auditLog)).toBe(true);
+
+    const entries = fs
+      .readFileSync(auditLog, 'utf-8')
+      .trim()
+      .split('\n')
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    expect(entries[0]).toMatchObject({ tool: 'write_file', decision: 'allowed' });
+  });
+});
