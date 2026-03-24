@@ -1,0 +1,12 @@
+# CODEOWNERS — requires human review on security-critical files.
+# See: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# CLAUDE.md embeds AI instructions that control agent behavior in this repo.
+# A malicious diff could silently weaken security invariants (e.g. audit ordering,
+# fail-closed rules). Require explicit human sign-off on every change.
+CLAUDE.md @node9-ai/maintainers
+
+# Security-sensitive source files — policy engine, DLP, and hook commands.
+src/core.ts @node9-ai/maintainers
+src/dlp.ts @node9-ai/maintainers
+src/cli.ts @node9-ai/maintainers
