@@ -358,7 +358,11 @@ export function applyUndo(hash: string, cwd?: string): boolean {
     });
     // Guard: if ls-tree fails, snapshotFiles would be empty and every file
     // in the working tree would be deleted. Abort instead.
-    if (lsTree.status !== 0) return false;
+    if (lsTree.status !== 0) {
+      if (process.env.NODE9_DEBUG === '1')
+        console.error(`[Node9] applyUndo: git ls-tree failed for hash ${hash}`);
+      return false;
+    }
     const snapshotFiles = new Set(
       lsTree.stdout?.toString().trim().split('\n').filter(Boolean) ?? []
     );

@@ -820,4 +820,19 @@ describe('applyUndo', () => {
     expect(restoreEnv?.GIT_DIR).toContain('.node9/snapshots');
     expect(restoreEnv?.GIT_WORK_TREE).toBe('/mock/project');
   });
+
+  it('returns false when ls-tree exits non-zero (prevents empty-set mass delete)', () => {
+    vi.mocked(fs.readdirSync).mockReturnValue([]);
+    mockSpawn.mockImplementation((_cmd, args) => {
+      const a = (args ?? []) as string[];
+      if (a.includes('rev-parse') && a.includes('--git-dir'))
+        return spawnResult(0, '/shadow\n');
+      if (a.includes('restore')) return spawnResult(0, '');
+      if (a.includes('ls-tree')) return spawnResult(1, ''); // ls-tree fails
+      return spawnResult(0, '');
+    });
+    // Must return false rather than deleting every file in the working tree
+    expect(applyUndo('abc123', '/mock/project')).toBe(false);
+    expect(vi.mocked(fs.unlinkSync)).not.toHaveBeenCalled();
+  });
 });

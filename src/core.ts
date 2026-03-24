@@ -84,21 +84,23 @@ export function validateRegex(pattern: string): string | null {
   if (!pattern) return 'Pattern is required';
   if (pattern.length > MAX_REGEX_LENGTH) return `Pattern exceeds max length of ${MAX_REGEX_LENGTH}`;
 
+  // Compile check first — rejects structurally invalid patterns (unbalanced parens,
+  // bad escapes, etc.) before they reach safe-regex2, which may misanalyse them.
+  try {
+    new RegExp(pattern);
+  } catch (e) {
+    return `Invalid regex syntax: ${(e as Error).message}`;
+  }
+
   // Quantified backreferences — safe-regex2 does not analyse backreferences,
   // so we keep this explicit guard: \1+ \2* \1{2,} can cause catastrophic backtracking.
+  // \d+ matches multi-digit group numbers (\10, \11, …) correctly.
   if (/\\\d+[*+{]/.test(pattern)) return 'Quantified backreferences are forbidden (ReDoS risk)';
 
   // ReDoS check via safe-regex2 — proper NFA analysis, replaces the previous
   // hand-rolled heuristics which had false positives ((GET|POST)+) and false
   // negatives ((x|xx)*). safe-regex2 correctly handles both cases.
   if (!safeRegex(pattern)) return 'Pattern rejected: potential ReDoS vulnerability detected';
-
-  // Final compile check
-  try {
-    new RegExp(pattern);
-  } catch (e) {
-    return `Invalid regex syntax: ${(e as Error).message}`;
-  }
 
   return null;
 }

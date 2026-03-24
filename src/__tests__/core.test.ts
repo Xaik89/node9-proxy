@@ -994,6 +994,28 @@ describe('evaluateSmartConditions — matchesGlob operator', () => {
     expect(result.decision).not.toBe('block');
   });
 
+  it('notMatchesGlob — absent field is vacuously true (field not present cannot match)', async () => {
+    // Security note: an absent field genuinely has nothing to match against a glob.
+    // This is consistent with notContains. If the attacker-controlled call omits the
+    // field, the rule author must add an explicit 'exists' condition to guard it.
+    mockProjectConfig({
+      policy: {
+        smartRules: [
+          {
+            name: 'allow-non-node-modules',
+            tool: 'write',
+            conditions: [{ field: 'file_path', op: 'notMatchesGlob', value: '**/node_modules/**' }],
+            conditionMode: 'all',
+            verdict: 'allow',
+          },
+        ],
+      },
+    });
+    // file_path absent → notMatchesGlob returns true → allow rule fires
+    const result = await evaluatePolicy('write', {});
+    expect(result.decision).toBe('allow');
+  });
+
   it('notMatchesGlob allows when the path does NOT match the glob', async () => {
     mockProjectConfig({
       policy: {
@@ -1269,6 +1291,15 @@ describe('validateRegex', () => {
 
   it('rejects empty pattern', () => {
     expect(validateRegex('')).not.toBeNull();
+  });
+
+  it('rejects structurally malformed patterns (compile check before safe-regex2)', () => {
+    // These must still be caught after the manual parser was removed.
+    // new RegExp() is now called first, guaranteeing invalid syntax is rejected
+    // before the pattern reaches safe-regex2.
+    expect(validateRegex('((unclosed')).not.toBeNull();
+    expect(validateRegex('[unclosed')).not.toBeNull();
+    expect(validateRegex('*invalid')).not.toBeNull(); // quantifier with nothing before it
   });
 
   it('rejects patterns exceeding max length', () => {

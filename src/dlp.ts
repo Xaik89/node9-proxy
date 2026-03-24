@@ -22,7 +22,7 @@ interface DlpPattern {
 export const DLP_PATTERNS: DlpPattern[] = [
   { name: 'AWS Access Key ID', regex: /\bAKIA[0-9A-Z]{16}\b/, severity: 'block' },
   { name: 'GitHub Token', regex: /\bgh[pous]_[A-Za-z0-9]{36}\b/, severity: 'block' },
-  { name: 'Slack Bot Token', regex: /\bxoxb-[0-9A-Za-z-]{1,100}\b/, severity: 'block' },
+  { name: 'Slack Bot Token', regex: /\bxoxb-[0-9A-Za-z-]{20,100}\b/, severity: 'block' },
   { name: 'OpenAI API Key', regex: /\bsk-[a-zA-Z0-9_-]{20,}\b/, severity: 'block' },
   { name: 'Stripe Secret Key', regex: /\bsk_(?:live|test)_[0-9a-zA-Z]{24}\b/, severity: 'block' },
   {
