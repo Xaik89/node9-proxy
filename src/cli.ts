@@ -1125,7 +1125,7 @@ program
 
         // Pass payload.cwd directly to getConfig() instead of mutating process.chdir —
         // process.chdir is process-global and would race with concurrent hook invocations.
-        const config = getConfig(payload.cwd ?? undefined);
+        const config = getConfig(payload.cwd || undefined);
 
         // Debug logging — controlled by Env Var OR new Settings config
         if (process.env.NODE9_DEBUG === '1' || config.settings.enableHookLogDebug) {
@@ -1338,7 +1338,7 @@ program
 
         // Pass payload.cwd directly to getConfig() instead of mutating process.chdir —
         // process.chdir is process-global and would race with concurrent hook invocations.
-        const config = getConfig(payload.cwd ?? undefined);
+        const config = getConfig(payload.cwd || undefined);
 
         // Handle both Claude (tool_name) and Gemini (name)
         const tool = sanitize(payload.tool_name ?? payload.name ?? 'unknown');
@@ -1374,6 +1374,11 @@ program
         } catch {
           /* if we can't write the debug log, nothing we can do */
         }
+        // Intentional: exit(0) even on audit failure. Returning a non-zero code
+        // here would cause Claude/Gemini to treat the *tool call itself* as failed,
+        // which is incorrect — the tool already ran. The tradeoff is that the hook
+        // host sees success even when audit.log was not written; the error is
+        // recorded in hook-debug.log for operator visibility.
       }
       process.exit(0);
     };

@@ -68,6 +68,9 @@ describe('proxy command — stdout must stay clean for stdio protocols (MCP / JS
       },
     });
 
+    // Guard: if spawn itself failed, result.error is set and stdout is empty — fail loudly
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(0);
     // Critical: stdout must be exactly what the child wrote — no banner injected
     expect(result.stdout).toBe('hello-mcp-test\n');
     // Banner must appear on stderr so MCP clients are unaffected
@@ -93,6 +96,11 @@ describe('proxy command — stdout must stay clean for stdio protocols (MCP / JS
       },
     });
 
+    // Guard: if spawn itself failed, result.error is set — fail loudly
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(0);
+    // Pre-assertion: non-empty stdout before attempting JSON.parse (better diagnostics)
+    expect(result.stdout.trim()).toBeTruthy();
     // stdout must parse as valid JSON — banner injection would break this
     const parsed: unknown = JSON.parse(result.stdout.trim());
     expect(parsed).toMatchObject({ jsonrpc: '2.0', id: 1 });
@@ -121,7 +129,7 @@ describe('log command — audit.log written when payload.cwd differs from proces
       hook_event_name: 'PostToolUse',
     });
 
-    spawnSync(process.execPath, [CLI, 'log', payload], {
+    const r = spawnSync(process.execPath, [CLI, 'log', payload], {
       encoding: 'utf-8',
       timeout: 5000,
       cwd: os.tmpdir(), // intentionally different from projectDir
@@ -132,6 +140,8 @@ describe('log command — audit.log written when payload.cwd differs from proces
         NODE9_TESTING: '1',
       },
     });
+    expect(r.error).toBeUndefined();
+    expect(r.status).toBe(0);
 
     const auditLog = path.join(tmpHome, '.node9', 'audit.log');
     expect(fs.existsSync(auditLog)).toBe(true);
@@ -160,7 +170,7 @@ describe('log command — audit.log written when payload.cwd differs from proces
       hook_event_name: 'PostToolUse',
     });
 
-    spawnSync(process.execPath, [CLI, 'log', payload], {
+    const r2 = spawnSync(process.execPath, [CLI, 'log', payload], {
       encoding: 'utf-8',
       timeout: 5000,
       cwd: os.tmpdir(),
@@ -171,6 +181,8 @@ describe('log command — audit.log written when payload.cwd differs from proces
         NODE9_TESTING: '1',
       },
     });
+    expect(r2.error).toBeUndefined();
+    expect(r2.status).toBe(0);
 
     const auditLog = path.join(tmpHome, '.node9', 'audit.log');
     expect(fs.existsSync(auditLog)).toBe(true);
