@@ -994,16 +994,21 @@ describe('evaluateSmartConditions — matchesGlob operator', () => {
     expect(result.decision).not.toBe('block');
   });
 
-  it('notMatchesGlob — absent field is vacuously true (field not present cannot match)', async () => {
-    // Security note: an absent field genuinely has nothing to match against a glob.
-    // This is consistent with notContains. If the attacker-controlled call omits the
-    // field, the rule author must add an explicit 'exists' condition to guard it.
+  it('notMatchesGlob — absent field fails closed (attacker cannot omit field to satisfy allow rule)', async () => {
+    // Security invariant: notMatchesGlob with a missing field returns false (fail closed).
+    // An attacker omitting file_path must NOT satisfy a notMatchesGlob allow rule.
+    // Rule authors needing "pass when field absent" should pair with a 'notExists' condition.
+    //
+    // Uses 'delete_file' (contains dangerous word 'delete') so the tool is normally
+    // blocked. The allow rule only fires when the condition passes — absent field must NOT
+    // be enough to trigger it.
     mockProjectConfig({
       policy: {
+        dangerousWords: ['delete'],
         smartRules: [
           {
             name: 'allow-non-node-modules',
-            tool: 'write',
+            tool: 'delete_file',
             conditions: [{ field: 'file_path', op: 'notMatchesGlob', value: '**/node_modules/**' }],
             conditionMode: 'all',
             verdict: 'allow',
@@ -1011,9 +1016,9 @@ describe('evaluateSmartConditions — matchesGlob operator', () => {
         ],
       },
     });
-    // file_path absent → notMatchesGlob returns true → allow rule fires
-    const result = await evaluatePolicy('write', {});
-    expect(result.decision).toBe('allow');
+    // file_path absent → notMatchesGlob returns false → allow rule does NOT fire → blocked
+    const result = await evaluatePolicy('delete_file', {});
+    expect(result.decision).not.toBe('allow');
   });
 
   it('notMatchesGlob allows when the path does NOT match the glob', async () => {

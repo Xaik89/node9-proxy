@@ -345,11 +345,12 @@ export function evaluateSmartConditions(args: unknown, rule: SmartRule): boolean
       case 'matchesGlob':
         return val !== null && cond.value ? pm.isMatch(val, cond.value) : false;
       case 'notMatchesGlob':
-        // val absent → field doesn't exist → "not matching" is vacuously true (same as notContains)
-        // cond.value absent → misconfigured rule → fail closed
-        if (!cond.value) return false;
-        if (val === null) return true;
-        return !pm.isMatch(val, cond.value);
+        // Both absent field AND missing pattern → fail closed.
+        // For a security tool, fail-closed is the safer default: an attacker
+        // omitting a field must not satisfy a notMatchesGlob allow rule.
+        // Rule authors who need "pass when field absent" should add an explicit
+        // 'notExists' condition paired with 'notMatchesGlob'.
+        return val !== null && cond.value ? !pm.isMatch(val, cond.value) : false;
       default:
         return false;
     }
