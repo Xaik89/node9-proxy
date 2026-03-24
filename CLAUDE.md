@@ -30,6 +30,12 @@ They cannot catch protocol bugs, filesystem path bugs, or exit code bugs.
 
 ## Code Rules
 
+**Audit writes must happen before config loads.**
+In hook commands, `fs.appendFileSync(auditLog, ...)` must come before any `getConfig()` call. A config failure must never silently skip the audit entry.
+
+**Validate external path inputs before filesystem use.**
+Any `cwd`, `file_path`, or similar value from hook payloads must be validated (`path.isAbsolute()`) before being passed to `getConfig()`, `path.join()`, or `fs` calls. Use `payload.cwd || undefined` for empty-string guard, then `path.isAbsolute()` for traversal guard.
+
 **No `process.chdir()` in hook commands.**
 Pass `cwd` explicitly to `getConfig(cwd)` instead. `process.chdir` is process-global and races with concurrent hook invocations.
 
