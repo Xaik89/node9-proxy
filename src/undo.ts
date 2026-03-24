@@ -356,6 +356,9 @@ export function applyUndo(hash: string, cwd?: string): boolean {
       env,
       timeout: GIT_TIMEOUT,
     });
+    // Guard: if ls-tree fails, snapshotFiles would be empty and every file
+    // in the working tree would be deleted. Abort instead.
+    if (lsTree.status !== 0) return false;
     const snapshotFiles = new Set(
       lsTree.stdout?.toString().trim().split('\n').filter(Boolean) ?? []
     );

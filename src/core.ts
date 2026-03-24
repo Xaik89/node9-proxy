@@ -84,38 +84,6 @@ export function validateRegex(pattern: string): string | null {
   if (!pattern) return 'Pattern is required';
   if (pattern.length > MAX_REGEX_LENGTH) return `Pattern exceeds max length of ${MAX_REGEX_LENGTH}`;
 
-  // Structural balance (tracks escape sequences and char class scope)
-  let parens = 0,
-    brackets = 0,
-    isEscaped = false,
-    inCharClass = false;
-  for (let i = 0; i < pattern.length; i++) {
-    const char = pattern[i];
-    if (isEscaped) {
-      isEscaped = false;
-      continue;
-    }
-    if (char === '\\') {
-      isEscaped = true;
-      continue;
-    }
-    if (char === '[' && !inCharClass) {
-      inCharClass = true;
-      brackets++;
-      continue;
-    }
-    if (char === ']' && inCharClass) {
-      inCharClass = false;
-      brackets--;
-      continue;
-    }
-    if (inCharClass) continue;
-    if (char === '(') parens++;
-    else if (char === ')') parens--;
-  }
-  if (parens !== 0) return 'Unbalanced parentheses';
-  if (brackets !== 0) return 'Unbalanced brackets';
-
   // Quantified backreferences — safe-regex2 does not analyse backreferences,
   // so we keep this explicit guard: \1+ \2* \1{2,} can cause catastrophic backtracking.
   if (/\\\d+[*+{]/.test(pattern)) return 'Quantified backreferences are forbidden (ReDoS risk)';
@@ -375,8 +343,11 @@ export function evaluateSmartConditions(args: unknown, rule: SmartRule): boolean
       case 'matchesGlob':
         return val !== null && cond.value ? pm.isMatch(val, cond.value) : false;
       case 'notMatchesGlob':
-        // Missing value → treat as misconfigured rule; fail closed (false) rather than open (true)
-        return val !== null && cond.value ? !pm.isMatch(val, cond.value) : false;
+        // val absent → field doesn't exist → "not matching" is vacuously true (same as notContains)
+        // cond.value absent → misconfigured rule → fail closed
+        if (!cond.value) return false;
+        if (val === null) return true;
+        return !pm.isMatch(val, cond.value);
       default:
         return false;
     }
