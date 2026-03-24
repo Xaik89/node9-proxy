@@ -26,10 +26,14 @@ beforeEach(() => {
 /** Grant approval for a tool via a persistent decision file (no HITL needed). */
 function setPersistentDecision(toolName: string, decision: 'allow' | 'deny') {
   const decisionsPath = '/mock/home/.node9/decisions.json';
-  existsSpy.mockImplementation((p) => String(p) === decisionsPath);
-  readSpy.mockImplementation((p) =>
-    String(p) === decisionsPath ? JSON.stringify({ [toolName]: decision }) : ''
-  );
+  const globalPath = '/mock/home/.node9/config.json';
+  existsSpy.mockImplementation((p) => String(p) === decisionsPath || String(p) === globalPath);
+  readSpy.mockImplementation((p) => {
+    if (String(p) === decisionsPath) return JSON.stringify({ [toolName]: decision });
+    if (String(p) === globalPath)
+      return JSON.stringify({ settings: { mode: 'standard', approvalTimeoutMs: 0 } });
+    return '';
+  });
 }
 
 describe('protect()', () => {
@@ -47,11 +51,12 @@ describe('protect()', () => {
   });
 
   it('throws and does NOT call the wrapped function when denied', async () => {
-    // Changed 'delete_resource' -> 'drop_resource'
-    setPersistentDecision('drop_resource', 'deny');
+    // 'mkfs_resource' contains 'mkfs' (in DANGEROUS_WORDS) so it evaluates to review,
+    // then the persistent deny decision kicks in.
+    setPersistentDecision('mkfs_resource', 'deny');
 
     const fn = vi.fn();
-    const secured = protect('drop_resource', fn);
+    const secured = protect('mkfs_resource', fn);
 
     await expect(secured()).rejects.toThrow(/denied/i);
     expect(fn).not.toHaveBeenCalled();

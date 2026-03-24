@@ -1,6 +1,6 @@
 {
   "name": "@node9/proxy",
-  "version": "1.0.6",
+  "version": "1.0.18",
   "description": "The Sudo Command for AI Agents. Execution Security for Claude Code & MCP.",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",
@@ -41,7 +41,7 @@
     "hitl"
   ],
   "author": "Nadav <nadav@node9.ai>",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "files": [
     "dist",
     "README.md",
@@ -59,6 +59,7 @@
     "fix": "npm run format && npm run lint:fix",
     "validate": "npm run format && npm run lint && npm run typecheck && npm run test && npm run test:e2e && npm run build",
     "test:e2e": "NODE9_TESTING=1 bash scripts/e2e.sh",
+    "preuninstall": "node9 uninstall || echo 'node9 uninstall failed — remove hooks manually from ~/.claude/settings.json'",
     "prepublishOnly": "npm run validate",
     "test": "NODE_ENV=test vitest --run",
     "test:watch": "NODE_ENV=test vitest",
@@ -70,9 +71,13 @@
     "commander": "^14.0.3",
     "execa": "^9.6.1",
     "picomatch": "^4.0.3",
-    "sh-syntax": "^0.5.8"
+    "safe-regex2": "^5.1.0",
+    "sh-syntax": "^0.5.8",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
+    "@anthropic-ai/sdk": "^0.78.0",
+    "@octokit/rest": "^22.0.1",
     "@semantic-release/commit-analyzer": "^13.0.1",
     "@semantic-release/git": "^10.0.1",
     "@semantic-release/github": "^12.0.6",

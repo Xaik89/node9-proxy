@@ -46,7 +46,11 @@ trap 'rm -rf "$TESTDIR" "$TEST_HOME"' EXIT
 
 cat > "$TESTDIR/node9.config.json" << 'EOF'
 {
-  "settings": { "mode": "standard" },
+  "settings": {
+    "mode": "standard",
+    "approvalTimeoutMs": 0,
+    "approvers": { "native": false, "browser": false, "cloud": false, "terminal": false }
+  },
   "policy": {
     "dangerousWords": [
       "delete","drop","remove","rm","rmdir","terminate",
@@ -227,7 +231,11 @@ GLOBAL_HOME=$(mktemp -d)
 mkdir -p "$GLOBAL_HOME/.node9"
 cat > "$GLOBAL_HOME/.node9/config.json" << 'EOF'
 {
-  "settings": { "mode": "standard" },
+  "settings": {
+    "mode": "standard",
+    "approvalTimeoutMs": 0,
+    "approvers": { "native": false, "browser": false, "cloud": false, "terminal": false }
+  },
   "policy": {
     "dangerousWords": ["nuke"],
     "ignoredTools": ["list_*","get_*","read_*","describe_*"]
@@ -256,7 +264,11 @@ fi
 # Project config must take precedence over global config
 cat > "$NOPROJECT/node9.config.json" << 'EOF'
 {
-  "settings": { "mode": "standard" },
+  "settings": {
+    "mode": "standard",
+    "approvalTimeoutMs": 0,
+    "approvers": { "native": false, "browser": false, "cloud": false, "terminal": false }
+  },
   "policy": { "dangerousWords": [], "ignoredTools": [] },
   "environments": {}
 }

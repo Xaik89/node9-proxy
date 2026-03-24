@@ -4,9 +4,17 @@ import { confirm } from '@inquirer/prompts';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import net from 'net';
+import { randomUUID } from 'crypto';
+import { spawnSync } from 'child_process';
 import pm from 'picomatch';
+import safeRegex from 'safe-regex2';
 import { parse } from 'sh-syntax';
 import { askNativePopup, sendDesktopNotification } from './ui/native';
+import { computeRiskMetadata, RiskMetadata } from './context-sniper';
+import { sanitizeConfig } from './config-schema';
+import { readActiveShields, getShield } from './shields';
+import { scanArgs, scanFilePath, type DlpMatch } from './dlp';
 
 // ── Feature file paths ────────────────────────────────────────────────────────
 const PAUSED_FILE = path.join(os.homedir(), '.node9', 'PAUSED');
@@ -61,6 +69,111 @@ export function resumeNode9(): void {
   try {
     if (fs.existsSync(PAUSED_FILE)) fs.unlinkSync(PAUSED_FILE);
   } catch {}
+}
+
+// ── Regex Cache & ReDoS Protection ───────────────────────────────────────────
+const MAX_REGEX_LENGTH = 100;
+const REGEX_CACHE_MAX = 500;
+const regexCache = new Map<string, RegExp>();
+
+/**
+ * Validates a user-supplied regex pattern against known ReDoS vectors.
+ * Returns null if valid, or an error string describing the problem.
+ */
+export function validateRegex(pattern: string): string | null {
+  if (!pattern) return 'Pattern is required';
+  if (pattern.length > MAX_REGEX_LENGTH) return `Pattern exceeds max length of ${MAX_REGEX_LENGTH}`;
+
+  // Structural balance (tracks escape sequences and char class scope)
+  let parens = 0,
+    brackets = 0,
+    isEscaped = false,
+    inCharClass = false;
+  for (let i = 0; i < pattern.length; i++) {
+    const char = pattern[i];
+    if (isEscaped) {
+      isEscaped = false;
+      continue;
+    }
+    if (char === '\\') {
+      isEscaped = true;
+      continue;
+    }
+    if (char === '[' && !inCharClass) {
+      inCharClass = true;
+      brackets++;
+      continue;
+    }
+    if (char === ']' && inCharClass) {
+      inCharClass = false;
+      brackets--;
+      continue;
+    }
+    if (inCharClass) continue;
+    if (char === '(') parens++;
+    else if (char === ')') parens--;
+  }
+  if (parens !== 0) return 'Unbalanced parentheses';
+  if (brackets !== 0) return 'Unbalanced brackets';
+
+  // Quantified backreferences — safe-regex2 does not analyse backreferences,
+  // so we keep this explicit guard: \1+ \2* \1{2,} can cause catastrophic backtracking.
+  if (/\\\d+[*+{]/.test(pattern)) return 'Quantified backreferences are forbidden (ReDoS risk)';
+
+  // ReDoS check via safe-regex2 — proper NFA analysis, replaces the previous
+  // hand-rolled heuristics which had false positives ((GET|POST)+) and false
+  // negatives ((x|xx)*). safe-regex2 correctly handles both cases.
+  if (!safeRegex(pattern)) return 'Pattern rejected: potential ReDoS vulnerability detected';
+
+  // Final compile check
+  try {
+    new RegExp(pattern);
+  } catch (e) {
+    return `Invalid regex syntax: ${(e as Error).message}`;
+  }
+
+  return null;
+}
+
+/**
+ * Compiles a regex with validation and LRU caching.
+ * Returns null if the pattern is invalid or dangerous.
+ */
+export function getCompiledRegex(pattern: string, flags = ''): RegExp | null {
+  // Validate flags before anything else — invalid flags (e.g. 'z') would throw
+  // inside new RegExp() and could leak debug info; reject them explicitly.
+  if (flags && !/^[gimsuy]+$/.test(flags)) {
+    if (process.env.NODE9_DEBUG === '1') console.error(`[Node9] Invalid regex flags: "${flags}"`);
+    return null;
+  }
+  const key = `${pattern}\0${flags}`;
+  if (regexCache.has(key)) {
+    // LRU bump: move to insertion-order end
+    const cached = regexCache.get(key)!;
+    regexCache.delete(key);
+    regexCache.set(key, cached);
+    return cached;
+  }
+
+  const err = validateRegex(pattern);
+  if (err) {
+    if (process.env.NODE9_DEBUG === '1')
+      console.error(`[Node9] Regex blocked: ${err} — pattern: "${pattern}"`);
+    return null;
+  }
+
+  try {
+    const re = new RegExp(pattern, flags);
+    if (regexCache.size >= REGEX_CACHE_MAX) {
+      const oldest = regexCache.keys().next().value;
+      if (oldest) regexCache.delete(oldest);
+    }
+    regexCache.set(key, re);
+    return re;
+  } catch (e) {
+    if (process.env.NODE9_DEBUG === '1') console.error(`[Node9] Regex compile failed:`, e);
+    return null;
+  }
 }
 
 // ── Trust Session helpers ─────────────────────────────────────────────────────
@@ -184,7 +297,15 @@ function getNestedValue(obj: unknown, path: string): unknown {
 
 export interface SmartCondition {
   field: string;
-  op: 'matches' | 'notMatches' | 'contains' | 'notContains' | 'exists' | 'notExists';
+  op:
+    | 'matches'
+    | 'notMatches'
+    | 'contains'
+    | 'notContains'
+    | 'exists'
+    | 'notExists'
+    | 'matchesGlob'
+    | 'notMatchesGlob';
   value?: string;
   flags?: string;
 }
@@ -196,6 +317,27 @@ export interface SmartRule {
   conditionMode?: 'all' | 'any';
   verdict: 'allow' | 'review' | 'block';
   reason?: string;
+}
+
+/**
+ * Returns true if a snapshot should be taken for this tool call.
+ * Checks: tool name match → ignorePaths → onlyPaths (if specified).
+ */
+export function shouldSnapshot(toolName: string, args: unknown, config: Config): boolean {
+  if (!config.settings.enableUndo) return false;
+
+  const snap = config.policy.snapshot;
+  if (!snap.tools.includes(toolName.toLowerCase())) return false;
+
+  const a = args && typeof args === 'object' ? (args as Record<string, unknown>) : {};
+  const filePath = String(a.file_path ?? a.path ?? a.filename ?? '');
+
+  if (filePath) {
+    if (snap.ignorePaths.length && pm(snap.ignorePaths)(filePath)) return false;
+    if (snap.onlyPaths.length && !pm(snap.onlyPaths)(filePath)) return false;
+  }
+
+  return true;
 }
 
 export function evaluateSmartConditions(args: unknown, rule: SmartRule): boolean {
@@ -219,20 +361,22 @@ export function evaluateSmartConditions(args: unknown, rule: SmartRule): boolean
         return val !== null && cond.value ? !val.includes(cond.value) : true;
       case 'matches': {
         if (val === null || !cond.value) return false;
-        try {
-          return new RegExp(cond.value, cond.flags ?? '').test(val);
-        } catch {
-          return false;
-        }
+        const reM = getCompiledRegex(cond.value, cond.flags ?? '');
+        if (!reM) return false; // invalid/dangerous pattern → fail closed
+        return reM.test(val);
       }
       case 'notMatches': {
-        if (val === null || !cond.value) return true;
-        try {
-          return !new RegExp(cond.value, cond.flags ?? '').test(val);
-        } catch {
-          return true;
-        }
+        if (!cond.value) return false; // no pattern → fail closed
+        if (val === null) return true; // field absent → condition passes (preserve original)
+        const reN = getCompiledRegex(cond.value, cond.flags ?? '');
+        if (!reN) return false; // invalid/dangerous pattern → fail closed
+        return !reN.test(val);
       }
+      case 'matchesGlob':
+        return val !== null && cond.value ? pm.isMatch(val, cond.value) : false;
+      case 'notMatchesGlob':
+        // Missing value → treat as misconfigured rule; fail closed (false) rather than open (true)
+        return val !== null && cond.value ? !pm.isMatch(val, cond.value) : false;
       default:
         return false;
     }
@@ -390,19 +534,15 @@ interface EnvironmentConfig {
   requireApproval?: boolean;
 }
 
-interface PolicyRule {
-  action: string;
-  allowPaths?: string[];
-  blockPaths?: string[];
-}
-
 interface Config {
+  version?: string;
   settings: {
     mode: string;
     autoStartDaemon?: boolean;
     enableUndo?: boolean;
     enableHookLogDebug?: boolean;
     approvalTimeoutMs?: number;
+    flightRecorder?: boolean;
     approvers: { native: boolean; browser: boolean; cloud: boolean; terminal: boolean };
     environment?: string;
   };
@@ -411,8 +551,16 @@ interface Config {
     dangerousWords: string[];
     ignoredTools: string[];
     toolInspection: Record<string, string>;
-    rules: PolicyRule[];
     smartRules: SmartRule[];
+    snapshot: {
+      tools: string[];
+      onlyPaths: string[];
+      ignorePaths: string[];
+    };
+    dlp: {
+      enabled: boolean;
+      scanIgnoredTools: boolean;
+    };
   };
   environments: Record<string, EnvironmentConfig>;
 }
@@ -434,27 +582,25 @@ export const DANGEROUS_WORDS = [
   'format',
 ];
 */
+// Intentionally minimal — only words that are catastrophic AND never appear
+// in legitimate code/content. Everything else is handled by smart rules,
+// which can scope to specific tool fields and avoid false positives.
 export const DANGEROUS_WORDS = [
-  'drop',
-  'truncate',
-  'purge',
-  'format',
-  'destroy',
-  'terminate',
-  'revoke',
-  'docker',
-  'psql',
+  'mkfs', // formats/wipes a filesystem partition
+  'shred', // permanently overwrites file contents (unrecoverable)
 ];
 
 // 2. The Master Default Config
 export const DEFAULT_CONFIG: Config = {
+  version: '1.0',
   settings: {
-    mode: 'standard',
+    mode: 'audit',
     autoStartDaemon: true,
     enableUndo: true, // 🔥 ALWAYS TRUE BY DEFAULT for the safety net
-    enableHookLogDebug: false,
-    approvalTimeoutMs: 0, // 0 = disabled; set e.g. 30000 for 30-second auto-deny
-    approvers: { native: true, browser: true, cloud: true, terminal: true },
+    enableHookLogDebug: true,
+    approvalTimeoutMs: 30000, // 30-second auto-deny timeout
+    flightRecorder: true,
+    approvers: { native: true, browser: true, cloud: false, terminal: true },
   },
   policy: {
     sandboxPaths: ['/tmp/**', '**/sandbox/**', '**/test-results/**'],
@@ -487,23 +633,40 @@ export const DEFAULT_CONFIG: Config = {
       'terminal.execute': 'command',
       'postgres:query': 'sql',
     },
-    rules: [
-      {
-        action: 'rm',
-        allowPaths: [
-          '**/node_modules/**',
-          'dist/**',
-          'build/**',
-          '.next/**',
-          'coverage/**',
-          '.cache/**',
-          'tmp/**',
-          'temp/**',
-          '.DS_Store',
-        ],
-      },
-    ],
+    snapshot: {
+      tools: [
+        'str_replace_based_edit_tool',
+        'write_file',
+        'edit_file',
+        'create_file',
+        'edit',
+        'replace',
+      ],
+      onlyPaths: [],
+      ignorePaths: ['**/node_modules/**', 'dist/**', 'build/**', '.next/**', '**/*.log'],
+    },
     smartRules: [
+      // ── rm safety (critical — always evaluated first) ──────────────────────
+      {
+        name: 'block-rm-rf-home',
+        tool: 'bash',
+        conditionMode: 'all',
+        conditions: [
+          {
+            field: 'command',
+            op: 'matches',
+            value: 'rm\\b.*(-[rRfF]*[rR][rRfF]*|--recursive)',
+          },
+          {
+            field: 'command',
+            op: 'matches',
+            value: '(~|\\/root(\\/|$)|\\$HOME|\\/home\\/)',
+          },
+        ],
+        verdict: 'block',
+        reason: 'Recursive delete of home directory is irreversible',
+      },
+      // ── SQL safety ────────────────────────────────────────────────────────
       {
         name: 'no-delete-without-where',
         tool: '*',
@@ -515,10 +678,129 @@ export const DEFAULT_CONFIG: Config = {
         verdict: 'review',
         reason: 'DELETE/UPDATE without WHERE clause — would affect every row in the table',
       },
+      {
+        name: 'review-drop-truncate-shell',
+        tool: 'bash',
+        conditions: [
+          {
+            field: 'command',
+            op: 'matches',
+            value: '\\b(DROP|TRUNCATE)\\s+(TABLE|DATABASE|SCHEMA|INDEX)',
+            flags: 'i',
+          },
+        ],
+        conditionMode: 'all',
+        verdict: 'review',
+        reason: 'SQL DDL destructive statement inside a shell command',
+      },
+      // ── Git safety ────────────────────────────────────────────────────────
+      {
+        name: 'block-force-push',
+        tool: 'bash',
+        conditions: [
+          {
+            field: 'command',
+            op: 'matches',
+            value: '^\\s*git\\b.*\\bpush\\b.*(--force|--force-with-lease|-f\\b)',
+            flags: 'i',
+          },
+        ],
+        conditionMode: 'all',
+        verdict: 'block',
+        reason: 'Force push overwrites remote history and cannot be undone',
+      },
+      {
+        name: 'review-git-push',
+        tool: 'bash',
+        conditions: [
+          {
+            field: 'command',
+            op: 'matches',
+            value: '^\\s*git\\b.*\\bpush\\b(?!.*(-f\\b|--force|--force-with-lease))',
+            flags: 'i',
+          },
+        ],
+        conditionMode: 'all',
+        verdict: 'review',
+        reason: 'git push sends changes to a shared remote',
+      },
+      {
+        name: 'review-git-destructive',
+        tool: 'bash',
+        conditions: [
+          {
+            field: 'command',
+            op: 'matches',
+            value:
+              '^\\s*git\\b.*(reset\\s+--hard|clean\\s+-[fdxX]|\\brebase\\b|tag\\s+-d|branch\\s+-[dD])',
+            flags: 'i',
+          },
+        ],
+        conditionMode: 'all',
+        verdict: 'review',
+        reason: 'Destructive git operation — discards history or working-tree changes',
+      },
+      // ── Shell safety ──────────────────────────────────────────────────────
+      {
+        name: 'review-sudo',
+        tool: 'bash',
+        conditions: [{ field: 'command', op: 'matches', value: '^\\s*sudo\\s', flags: 'i' }],
+        conditionMode: 'all',
+        verdict: 'review',
+        reason: 'Command requires elevated privileges',
+      },
+      {
+        name: 'review-curl-pipe-shell',
+        tool: 'bash',
+        conditions: [
+          {
+            field: 'command',
+            op: 'matches',
+            value: '(curl|wget)[^|]*\\|\\s*(ba|z|da|fi|c|k)?sh',
+            flags: 'i',
+          },
+        ],
+        conditionMode: 'all',
+        verdict: 'block',
+        reason: 'Piping remote script into a shell is a supply-chain attack vector',
+      },
     ],
+    dlp: { enabled: true, scanIgnoredTools: true },
   },
   environments: {},
 };
+
+// Advisory rm rules — appended LAST in getConfig() so user-defined smart rules
+// (project/global/shield) are evaluated first and can override them.
+// tool: '*' so they cover bash, shell, run_shell_command, and Gemini's Shell.
+// Pattern '(^|&&|\|\||;)\s*rm\b' matches rm as a shell command (including in chained
+// commands like 'cat foo && rm bar') but avoids false-positives on 'docker rm'.
+const ADVISORY_SMART_RULES: SmartRule[] = [
+  {
+    name: 'allow-rm-safe-paths',
+    tool: '*',
+    conditionMode: 'all',
+    conditions: [
+      { field: 'command', op: 'matches', value: '(^|&&|\\|\\||;)\\s*rm\\b' },
+      {
+        field: 'command',
+        op: 'matches',
+        // Matches known-safe build artifact paths in the command.
+        value:
+          '(node_modules|\\bdist\\b|\\.next|\\bcoverage\\b|\\.cache|\\btmp\\b|\\btemp\\b|\\.DS_Store)(\\/|\\s|$)',
+      },
+    ],
+    verdict: 'allow',
+    reason: 'Deleting a known-safe build artifact path',
+  },
+  {
+    name: 'review-rm',
+    tool: '*',
+    conditions: [{ field: 'command', op: 'matches', value: '(^|&&|\\|\\||;)\\s*rm\\b' }],
+    verdict: 'review',
+    reason: 'rm can permanently delete files — confirm the target path',
+  },
+];
 
 let cachedConfig: Config | null = null;
 
@@ -547,7 +829,7 @@ export function getGlobalSettings(): {
       >;
       const settings = (parsed.settings as Record<string, unknown>) || {};
       return {
-        mode: (settings.mode as string) || 'standard',
+        mode: (settings.mode as string) || 'audit',
         autoStartDaemon: settings.autoStartDaemon !== false,
         slackEnabled: settings.slackEnabled !== false,
         enableTrustSessions: settings.enableTrustSessions === true,
@@ -556,7 +838,7 @@ export function getGlobalSettings(): {
     }
   } catch {}
   return {
-    mode: 'standard',
+    mode: 'audit',
     autoStartDaemon: true,
     slackEnabled: true,
     enableTrustSessions: false,
@@ -595,7 +877,15 @@ export async function evaluatePolicy(
   toolName: string,
   args?: unknown,
   agent?: string
-): Promise<{ decision: 'allow' | 'review' | 'block'; blockedByLabel?: string; reason?: string }> {
+): Promise<{
+  decision: 'allow' | 'review' | 'block';
+  blockedByLabel?: string;
+  reason?: string;
+  matchedField?: string;
+  matchedWord?: string;
+  tier?: 1 | 2 | 3 | 4 | 5 | 6 | 7;
+  ruleName?: string;
+}> {
   const config = getConfig();
 
   // 1. Ignored tools (Fast Path) - Always allow these first
@@ -607,17 +897,19 @@ export async function evaluatePolicy(
       (rule) => matchesPattern(toolName, rule.tool) && evaluateSmartConditions(args, rule)
     );
     if (matchedRule) {
-      if (matchedRule.verdict === 'allow') return { decision: 'allow' };
+      if (matchedRule.verdict === 'allow')
+        return { decision: 'allow', ruleName: matchedRule.name ?? matchedRule.tool };
       return {
         decision: matchedRule.verdict,
         blockedByLabel: `Smart Rule: ${matchedRule.name ?? matchedRule.tool}`,
         reason: matchedRule.reason,
+        tier: 2,
+        ruleName: matchedRule.name ?? matchedRule.tool,
       };
     }
   }
 
   let allTokens: string[] = [];
-  let actionTokens: string[] = [];
   let pathTokens: string[] = [];
 
   // 2. Tokenize the input
@@ -625,24 +917,21 @@ export async function evaluatePolicy(
   if (shellCommand) {
     const analyzed = await analyzeShellCommand(shellCommand);
     allTokens = analyzed.allTokens;
-    actionTokens = analyzed.actions;
     pathTokens = analyzed.paths;
 
     // Inline arbitrary code execution is always a review
     const INLINE_EXEC_PATTERN = /^(python3?|bash|sh|zsh|perl|ruby|node|php|lua)\s+(-c|-e|-eval)\s/i;
     if (INLINE_EXEC_PATTERN.test(shellCommand.trim())) {
-      return { decision: 'review', blockedByLabel: 'Node9 Standard (Inline Execution)' };
+      return { decision: 'review', blockedByLabel: 'Node9 Standard (Inline Execution)', tier: 3 };
     }
 
     // Strip DML keywords from tokens so user dangerousWords like "delete"/"update"
     // don't re-flag a SQL query that already passed the smart rules check above.
     if (isSqlTool(toolName, config.policy.toolInspection)) {
       allTokens = allTokens.filter((t) => !SQL_DML_KEYWORDS.has(t.toLowerCase()));
-      actionTokens = actionTokens.filter((t) => !SQL_DML_KEYWORDS.has(t.toLowerCase()));
     }
   } else {
     allTokens = tokenize(toolName);
-    actionTokens = [toolName];
 
     // Deep scan: if this tool isn't in toolInspection, scan all arg values for dangerous words
     if (args && typeof args === 'object') {
@@ -670,7 +959,7 @@ export async function evaluatePolicy(
     if (hasSystemDisaster || isRootWipe) {
       // If it IS a system disaster, return review so the dev gets a
       // "Manual Nuclear Protection" popup as a final safety check.
-      return { decision: 'review', blockedByLabel: 'Manual Nuclear Protection' };
+      return { decision: 'review', blockedByLabel: 'Manual Nuclear Protection', tier: 3 };
     }
 
     // For everything else (docker, psql, rmdir, delete, rm),
@@ -684,30 +973,7 @@ export async function evaluatePolicy(
     if (allInSandbox) return { decision: 'allow' };
   }
 
-  // ── 5. Rules Evaluation ─────────────────────────────────────────────────
-  for (const action of actionTokens) {
-    const rule = config.policy.rules.find(
-      (r) => r.action === action || matchesPattern(action, r.action)
-    );
-    if (rule) {
-      if (pathTokens.length > 0) {
-        const anyBlocked = pathTokens.some((p) => matchesPattern(p, rule.blockPaths || []));
-        if (anyBlocked)
-          return {
-            decision: 'review',
-            blockedByLabel: `Project/Global Config — rule "${rule.action}" (path blocked)`,
-          };
-        const allAllowed = pathTokens.every((p) => matchesPattern(p, rule.allowPaths || []));
-        if (allAllowed) return { decision: 'allow' };
-      }
-      return {
-        decision: 'review',
-        blockedByLabel: `Project/Global Config — rule "${rule.action}" (default block)`,
-      };
-    }
-  }
-
-  // ── 6. Dangerous Words Evaluation ───────────────────────────────────────
+  // ── 5. Dangerous Words Evaluation ───────────────────────────────────────
   let matchedDangerousWord: string | undefined;
   const isDangerous = allTokens.some((token) =>
     config.policy.dangerousWords.some((word) => {
@@ -727,9 +993,34 @@ export async function evaluatePolicy(
   );
 
   if (isDangerous) {
+    // Find which specific field contained the dangerous word for the UI
+    let matchedField: string | undefined;
+    if (matchedDangerousWord && args && typeof args === 'object' && !Array.isArray(args)) {
+      const obj = args as Record<string, unknown>;
+      for (const [key, value] of Object.entries(obj)) {
+        if (typeof value === 'string') {
+          try {
+            if (
+              new RegExp(
+                `\\b${matchedDangerousWord.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`,
+                'i'
+              ).test(value)
+            ) {
+              matchedField = key;
+              break;
+            }
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+    }
     return {
       decision: 'review',
       blockedByLabel: `Project/Global Config — dangerous word: "${matchedDangerousWord}"`,
+      matchedWord: matchedDangerousWord,
+      matchedField,
+      tier: 6,
     };
   }
 
@@ -737,7 +1028,7 @@ export async function evaluatePolicy(
   if (config.settings.mode === 'strict') {
     const envConfig = getActiveEnvironment(config);
     if (envConfig?.requireApproval === false) return { decision: 'allow' };
-    return { decision: 'review', blockedByLabel: 'Global Config (Strict Mode Active)' };
+    return { decision: 'review', blockedByLabel: 'Global Config (Strict Mode Active)', tier: 7 };
   }
 
   return { decision: 'allow' };
@@ -815,8 +1106,37 @@ export async function explainPolicy(toolName: string, args?: unknown): Promise<E
 
   const config = getConfig();
 
+  // ── 0. DLP Content Scanner ────────────────────────────────────────────────
+  const wouldBeIgnored = matchesPattern(toolName, config.policy.ignoredTools);
+  if (config.policy.dlp.enabled && (!wouldBeIgnored || config.policy.dlp.scanIgnoredTools)) {
+    const argsObjE =
+      args && typeof args === 'object' && !Array.isArray(args)
+        ? (args as Record<string, unknown>)
+        : {};
+    const filePathE = String(argsObjE.file_path ?? argsObjE.path ?? argsObjE.filename ?? '');
+    const dlpMatch =
+      (filePathE ? scanFilePath(filePathE) : null) ?? (args !== undefined ? scanArgs(args) : null);
+    if (dlpMatch) {
+      steps.push({
+        name: 'DLP Content Scanner',
+        outcome: dlpMatch.severity === 'block' ? 'block' : 'review',
+        detail: `🚨 ${dlpMatch.patternName} detected in ${dlpMatch.fieldPath} — sample: ${dlpMatch.redactedSample}`,
+        isFinal: dlpMatch.severity === 'block',
+      });
+      if (dlpMatch.severity === 'block') {
+        return { tool: toolName, args, waterfall, steps, decision: 'block' };
+      }
+    } else {
+      steps.push({
+        name: 'DLP Content Scanner',
+        outcome: 'checked',
+        detail: 'No sensitive credentials detected in args',
+      });
+    }
+  }
+
   // ── 1. Ignored tools ──────────────────────────────────────────────────────
-  if (matchesPattern(toolName, config.policy.ignoredTools)) {
+  if (wouldBeIgnored) {
     steps.push({
       name: 'Ignored tools',
       outcome: 'allow',
@@ -873,14 +1193,12 @@ export async function explainPolicy(toolName: string, args?: unknown): Promise<E
 
   // ── 3. Input parsing ──────────────────────────────────────────────────────
   let allTokens: string[] = [];
-  let actionTokens: string[] = [];
   let pathTokens: string[] = [];
 
   const shellCommand = extractShellCommand(toolName, args, config.policy.toolInspection);
   if (shellCommand) {
     const analyzed = await analyzeShellCommand(shellCommand);
     allTokens = analyzed.allTokens;
-    actionTokens = analyzed.actions;
     pathTokens = analyzed.paths;
 
     const patterns = Object.keys(config.policy.toolInspection);
@@ -921,7 +1239,6 @@ export async function explainPolicy(toolName: string, args?: unknown): Promise<E
     // DML keywords so dangerous-word checks don't re-flag a validated query.
     if (isSqlTool(toolName, config.policy.toolInspection)) {
       allTokens = allTokens.filter((t) => !SQL_DML_KEYWORDS.has(t.toLowerCase()));
-      actionTokens = actionTokens.filter((t) => !SQL_DML_KEYWORDS.has(t.toLowerCase()));
       steps.push({
         name: 'SQL token stripping',
         outcome: 'checked',
@@ -930,7 +1247,6 @@ export async function explainPolicy(toolName: string, args?: unknown): Promise<E
     }
   } else {
     allTokens = tokenize(toolName);
-    actionTokens = [toolName];
     let detail = `No toolInspection match for "${toolName}" — tokens: [${allTokens.join(', ')}]`;
     if (args && typeof args === 'object') {
       const flattenedArgs = JSON.stringify(args).toLowerCase();
@@ -977,71 +1293,7 @@ export async function explainPolicy(toolName: string, args?: unknown): Promise<E
     });
   }
 
-  // ── 6. Policy rules ───────────────────────────────────────────────────────
-  let ruleMatched = false;
-  for (const action of actionTokens) {
-    const rule = config.policy.rules.find(
-      (r) => r.action === action || matchesPattern(action, r.action)
-    );
-    if (rule) {
-      ruleMatched = true;
-      if (pathTokens.length > 0) {
-        const anyBlocked = pathTokens.some((p) => matchesPattern(p, rule.blockPaths || []));
-        if (anyBlocked) {
-          steps.push({
-            name: 'Policy rules',
-            outcome: 'review',
-            detail: `Rule "${rule.action}" matched + path is in blockPaths`,
-            isFinal: true,
-          });
-          return {
-            tool: toolName,
-            args,
-            waterfall,
-            steps,
-            decision: 'review',
-            blockedByLabel: `Project/Global Config — rule "${rule.action}" (path blocked)`,
-          };
-        }
-        const allAllowed = pathTokens.every((p) => matchesPattern(p, rule.allowPaths || []));
-        if (allAllowed) {
-          steps.push({
-            name: 'Policy rules',
-            outcome: 'allow',
-            detail: `Rule "${rule.action}" matched + all paths are in allowPaths`,
-            isFinal: true,
-          });
-          return { tool: toolName, args, waterfall, steps, decision: 'allow' };
-        }
-      }
-      steps.push({
-        name: 'Policy rules',
-        outcome: 'review',
-        detail: `Rule "${rule.action}" matched — default block (no path exception)`,
-        isFinal: true,
-      });
-      return {
-        tool: toolName,
-        args,
-        waterfall,
-        steps,
-        decision: 'review',
-        blockedByLabel: `Project/Global Config — rule "${rule.action}" (default block)`,
-      };
-    }
-  }
-  if (!ruleMatched) {
-    steps.push({
-      name: 'Policy rules',
-      outcome: 'skip',
-      detail:
-        config.policy.rules.length === 0
-          ? 'No rules configured'
-          : `No rule matched [${actionTokens.join(', ')}]`,
-    });
-  }
-
-  // ── 7. Dangerous words ────────────────────────────────────────────────────
+  // ── 6. Dangerous words ────────────────────────────────────────────────────
   let matchedDangerousWord: string | undefined;
   const isDangerous = uniqueTokens.some((token) =>
     config.policy.dangerousWords.some((word) => {
@@ -1118,13 +1370,27 @@ const DAEMON_PORT = 7391;
 const DAEMON_HOST = '127.0.0.1';
 
 export function isDaemonRunning(): boolean {
+  const pidFile = path.join(os.homedir(), '.node9', 'daemon.pid');
+
+  if (fs.existsSync(pidFile)) {
+    // PID file present — trust it: live PID → running, dead PID → not running
+    try {
+      const { pid, port } = JSON.parse(fs.readFileSync(pidFile, 'utf-8'));
+      if (port !== DAEMON_PORT) return false;
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // No PID file — port check catches orphaned daemons (PID file was lost)
   try {
-    const pidFile = path.join(os.homedir(), '.node9', 'daemon.pid');
-    if (!fs.existsSync(pidFile)) return false;
-    const { pid, port } = JSON.parse(fs.readFileSync(pidFile, 'utf-8'));
-    if (port !== DAEMON_PORT) return false;
-    process.kill(pid, 0);
-    return true;
+    const r = spawnSync('ss', ['-Htnp', `sport = :${DAEMON_PORT}`], {
+      encoding: 'utf8',
+      timeout: 500,
+    });
+    return r.status === 0 && (r.stdout ?? '').includes(`:${DAEMON_PORT}`);
   } catch {
     return false;
   }
@@ -1147,7 +1413,9 @@ async function askDaemon(
   toolName: string,
   args: unknown,
   meta?: { agent?: string; mcpServer?: string },
-  signal?: AbortSignal // NEW: Added signal
+  signal?: AbortSignal,
+  riskMetadata?: RiskMetadata,
+  activityId?: string
 ): Promise<'allow' | 'deny' | 'abandoned'> {
   const base = `http://${DAEMON_HOST}:${DAEMON_PORT}`;
 
@@ -1161,7 +1429,19 @@ async function askDaemon(
     const checkRes = await fetch(`${base}/check`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ toolName, args, agent: meta?.agent, mcpServer: meta?.mcpServer }),
+      body: JSON.stringify({
+        toolName,
+        args,
+        agent: meta?.agent,
+        mcpServer: meta?.mcpServer,
+        fromCLI: true,
+        // Pass the flight-recorder ID so the daemon uses the same UUID for
+        // activity-result as the CLI used for the pending activity event.
+        // Without this, the two UUIDs never match and tail.ts never resolves
+        // the pending item.
+        activityId,
+        ...(riskMetadata && { riskMetadata }),
+      }),
       signal: checkCtrl.signal,
     });
     if (!checkRes.ok) throw new Error('Daemon fail');
@@ -1193,7 +1473,8 @@ async function askDaemon(
 async function notifyDaemonViewer(
   toolName: string,
   args: unknown,
-  meta?: { agent?: string; mcpServer?: string }
+  meta?: { agent?: string; mcpServer?: string },
+  riskMetadata?: RiskMetadata
 ): Promise<string> {
   const base = `http://${DAEMON_HOST}:${DAEMON_PORT}`;
   const res = await fetch(`${base}/check`, {
@@ -1205,6 +1486,7 @@ async function notifyDaemonViewer(
       slackDelegated: true,
       agent: meta?.agent,
       mcpServer: meta?.mcpServer,
+      ...(riskMetadata && { riskMetadata }),
     }),
     signal: AbortSignal.timeout(3000),
   });
@@ -1268,11 +1550,83 @@ export interface AuthResult {
     | 'audit';
 }
 
+// ── Flight Recorder — fire-and-forget socket notify ──────────────────────────
+const ACTIVITY_SOCKET_PATH =
+  process.platform === 'win32'
+    ? '\\\\.\\pipe\\node9-activity'
+    : path.join(os.tmpdir(), 'node9-activity.sock');
+
+// Returns a Promise so callers can await socket flush before process.exit().
+// Without await, process.exit(0) kills the socket mid-connect for fast-passing
+// tools (Read, Glob, Grep, etc.), making them invisible in node9 tail.
+function notifyActivity(data: {
+  id: string;
+  ts: number;
+  tool: string;
+  args?: unknown;
+  status: string;
+  label?: string;
+}): Promise<void> {
+  return new Promise<void>((resolve) => {
+    try {
+      const payload = JSON.stringify(data);
+      const sock = net.createConnection(ACTIVITY_SOCKET_PATH);
+      sock.on('connect', () => {
+        // Attach listeners before calling end() so events fired synchronously
+        // on the loopback socket are not missed.
+        sock.on('close', resolve);
+        sock.end(payload);
+      });
+      sock.on('error', resolve); // daemon not running — resolve immediately
+    } catch {
+      resolve();
+    }
+  });
+}
+
 export async function authorizeHeadless(
   toolName: string,
   args: unknown,
   allowTerminalFallback = false,
-  meta?: { agent?: string; mcpServer?: string }
+  meta?: { agent?: string; mcpServer?: string },
+  options?: { calledFromDaemon?: boolean }
+): Promise<AuthResult> {
+  // Skip socket notification when called from daemon — daemon already broadcasts via SSE
+  if (!options?.calledFromDaemon) {
+    const actId = randomUUID();
+    const actTs = Date.now();
+    await notifyActivity({ id: actId, ts: actTs, tool: toolName, args, status: 'pending' });
+    const result = await _authorizeHeadlessCore(toolName, args, allowTerminalFallback, meta, {
+      ...options,
+      activityId: actId,
+    });
+    // noApprovalMechanism means no channels were available — the CLI will retry
+    // after auto-starting the daemon. Don't log a false 'block' to the flight
+    // recorder; the retry call will produce the real result notification.
+    if (!result.noApprovalMechanism) {
+      await notifyActivity({
+        id: actId,
+        tool: toolName,
+        ts: actTs,
+        status: result.approved
+          ? 'allow'
+          : result.blockedByLabel?.includes('DLP')
+            ? 'dlp'
+            : 'block',
+        label: result.blockedByLabel,
+      });
+    }
+    return result;
+  }
+  return _authorizeHeadlessCore(toolName, args, allowTerminalFallback, meta, options);
+}
+
+async function _authorizeHeadlessCore(
+  toolName: string,
+  args: unknown,
+  allowTerminalFallback = false,
+  meta?: { agent?: string; mcpServer?: string },
+  options?: { calledFromDaemon?: boolean; activityId?: string }
 ): Promise<AuthResult> {
   if (process.env.NODE9_PAUSED === '1') return { approved: true, checkedBy: 'paused' };
   const pauseState = checkPause();
@@ -1310,12 +1664,56 @@ export async function authorizeHeadless(
   const isManual = meta?.agent === 'Terminal';
 
   let explainableLabel = 'Local Config';
+  let policyMatchedField: string | undefined;
+  let policyMatchedWord: string | undefined;
+  let riskMetadata: RiskMetadata | undefined;
+
+  // ── DLP CONTENT SCANNER ───────────────────────────────────────────────────
+  // Runs before ignored-tool fast path and audit mode so that a leaked
+  // credential is always caught — even for "safe" tools like web_search.
+  if (
+    config.policy.dlp.enabled &&
+    (!isIgnoredTool(toolName) || config.policy.dlp.scanIgnoredTools)
+  ) {
+    // P1-1/P1-2: Check file path first (blocks read attempts before content is returned,
+    // and resolves symlinks to prevent escape attacks).
+    const argsObj =
+      args && typeof args === 'object' && !Array.isArray(args)
+        ? (args as Record<string, unknown>)
+        : {};
+    const filePath = String(argsObj.file_path ?? argsObj.path ?? argsObj.filename ?? '');
+    const dlpMatch: DlpMatch | null = (filePath ? scanFilePath(filePath) : null) ?? scanArgs(args);
+    if (dlpMatch) {
+      const dlpReason =
+        `🚨 DATA LOSS PREVENTION: ${dlpMatch.patternName} detected in ` +
+        `field "${dlpMatch.fieldPath}" (${dlpMatch.redactedSample})`;
+      if (dlpMatch.severity === 'block') {
+        if (!isManual) appendLocalAudit(toolName, args, 'deny', 'dlp-block', meta);
+        return {
+          approved: false,
+          reason: dlpReason,
+          blockedBy: 'local-config',
+          blockedByLabel: '🚨 Node9 DLP (Secret Detected)',
+        };
+      }
+      // severity === 'review': fall through to the race engine with a DLP label.
+      // Write an audit entry now so the DLP flag is traceable even if the race
+      // engine later approves the call without recording why it was intercepted.
+      if (!isManual) appendLocalAudit(toolName, args, 'allow', 'dlp-review-flagged', meta);
+      explainableLabel = '🚨 Node9 DLP (Credential Review)';
+    }
+  }
 
   if (config.settings.mode === 'audit') {
     if (!isIgnoredTool(toolName)) {
       const policyResult = await evaluatePolicy(toolName, args, meta?.agent);
       if (policyResult.decision === 'review') {
         appendLocalAudit(toolName, args, 'allow', 'audit-mode', meta);
+        // Must await — process.exit(0) follows immediately and kills any fire-and-forget fetch.
+        // Only send to SaaS when cloud is enabled — respects privacy mode (cloud: false).
+        if (approvers.cloud && creds?.apiKey) {
+          await auditLocalAllow(toolName, args, 'audit-mode', creds, meta);
+        }
         sendDesktopNotification(
           'Node9 Audit Mode',
           `Would have blocked "${toolName}" (${policyResult.blockedByLabel || 'Local Config'}) — running in audit mode`
@@ -1328,13 +1726,15 @@ export async function authorizeHeadless(
   // Fast Paths (Ignore, Trust, Policy Allow)
   if (!isIgnoredTool(toolName)) {
     if (getActiveTrustSession(toolName)) {
-      if (creds?.apiKey) auditLocalAllow(toolName, args, 'trust', creds, meta);
+      if (approvers.cloud && creds?.apiKey)
+        await auditLocalAllow(toolName, args, 'trust', creds, meta);
       if (!isManual) appendLocalAudit(toolName, args, 'allow', 'trust', meta);
       return { approved: true, checkedBy: 'trust' };
     }
     const policyResult = await evaluatePolicy(toolName, args, meta?.agent);
     if (policyResult.decision === 'allow') {
-      if (creds?.apiKey) auditLocalAllow(toolName, args, 'local-policy', creds, meta);
+      if (approvers.cloud && creds?.apiKey)
+        auditLocalAllow(toolName, args, 'local-policy', creds, meta);
       if (!isManual) appendLocalAudit(toolName, args, 'allow', 'local-policy', meta);
       return { approved: true, checkedBy: 'local-policy' };
     }
@@ -1351,10 +1751,21 @@ export async function authorizeHeadless(
     }
 
     explainableLabel = policyResult.blockedByLabel || 'Local Config';
+    policyMatchedField = policyResult.matchedField;
+    policyMatchedWord = policyResult.matchedWord;
+    riskMetadata = computeRiskMetadata(
+      args,
+      policyResult.tier ?? 6,
+      explainableLabel,
+      policyMatchedField,
+      policyMatchedWord,
+      policyResult.ruleName
+    );
 
     const persistent = getPersistentDecision(toolName);
     if (persistent === 'allow') {
-      if (creds?.apiKey) auditLocalAllow(toolName, args, 'persistent', creds, meta);
+      if (approvers.cloud && creds?.apiKey)
+        await auditLocalAllow(toolName, args, 'persistent', creds, meta);
       if (!isManual) appendLocalAudit(toolName, args, 'allow', 'persistent', meta);
       return { approved: true, checkedBy: 'persistent' };
     }
@@ -1368,7 +1779,8 @@ export async function authorizeHeadless(
       };
     }
   } else {
-    if (creds?.apiKey) auditLocalAllow(toolName, args, 'ignoredTools', creds, meta);
+    // ignoredTools (read, glob, grep, ls…) fire on every agent operation — too
+    // frequent and too noisy to send to the SaaS audit log.
     if (!isManual) appendLocalAudit(toolName, args, 'allow', 'ignored', meta);
     return { approved: true };
   }
@@ -1380,9 +1792,21 @@ export async function authorizeHeadless(
 
   if (cloudEnforced) {
     try {
-      const initResult = await initNode9SaaS(toolName, args, creds!, meta);
+      const initResult = await initNode9SaaS(toolName, args, creds!, meta, riskMetadata);
 
       if (!initResult.pending) {
+        // Shadow mode: allowed through, but warn the developer passively
+        if (initResult.shadowMode) {
+          console.error(
+            chalk.yellow(
+              `\n⚠️  Node9 Shadow Mode: Action allowed, but would have been blocked by company policy.`
+            )
+          );
+          if (initResult.shadowReason) {
+            console.error(chalk.dim(`   Reason: ${initResult.shadowReason}\n`));
+          }
+          return { approved: true, checkedBy: 'cloud' };
+        }
         return {
           approved: !!initResult.approved,
           reason:
@@ -1422,18 +1846,23 @@ export async function authorizeHeadless(
   // Print before the race so the message is guaranteed to show regardless of
   // which channel wins (cloud message was previously lost when native popup
   // resolved first and aborted the race before pollNode9SaaS could print it).
-  if (cloudEnforced && cloudRequestId) {
-    console.error(
-      chalk.yellow('\n🛡️  Node9: Action suspended — waiting for Organization approval.')
-    );
-    console.error(chalk.cyan('   Dashboard  → ') + chalk.bold('Mission Control > Activity Feed\n'));
-  } else if (!cloudEnforced) {
-    const cloudOffReason = !creds?.apiKey
-      ? 'no API key — run `node9 login` to connect'
-      : 'privacy mode (cloud disabled)';
-    console.error(
-      chalk.dim(`\n🛡️  Node9: intercepted "${toolName}" — cloud off (${cloudOffReason})\n`)
-    );
+  // Skip when called from the daemon — the CLI already printed this message.
+  if (!options?.calledFromDaemon) {
+    if (cloudEnforced && cloudRequestId) {
+      console.error(
+        chalk.yellow('\n🛡️  Node9: Action suspended — waiting for Organization approval.')
+      );
+      console.error(
+        chalk.cyan('   Dashboard  → ') + chalk.bold('Mission Control > Activity Feed\n')
+      );
+    } else if (!cloudEnforced) {
+      const cloudOffReason = !creds?.apiKey
+        ? 'no API key — run `node9 login` to connect'
+        : 'privacy mode (cloud disabled)';
+      console.error(
+        chalk.dim(`\n🛡️  Node9: intercepted "${toolName}" — cloud off (${cloudOffReason})\n`)
+      );
+    }
   }
 
   // ── THE MULTI-CHANNEL RACE ENGINE ──────────────────────────────────────────
@@ -1470,8 +1899,10 @@ export async function authorizeHeadless(
     racePromises.push(
       (async () => {
         try {
-          if (isDaemonRunning() && internalToken) {
-            viewerId = await notifyDaemonViewer(toolName, args, meta).catch(() => null);
+          if (isDaemonRunning() && internalToken && !options?.calledFromDaemon) {
+            viewerId = await notifyDaemonViewer(toolName, args, meta, riskMetadata).catch(
+              () => null
+            );
           }
           const cloudResult = await pollNode9SaaS(cloudRequestId, creds!, signal);
 
@@ -1494,7 +1925,10 @@ export async function authorizeHeadless(
   }
 
   // 🏁 RACER 2: Native OS Popup
-  if (approvers.native && !isManual) {
+  // Skip when called from the daemon's background pipeline — the CLI already
+  // launched this popup as part of its own race; firing it a second time from
+  // the daemon would show a duplicate popup for the same request.
+  if (approvers.native && !isManual && !options?.calledFromDaemon) {
     racePromises.push(
       (async () => {
         // Pass isRemoteLocked so the popup knows to hide the "Allow" button
@@ -1504,7 +1938,9 @@ export async function authorizeHeadless(
           meta?.agent,
           explainableLabel,
           isRemoteLocked,
-          signal
+          signal,
+          policyMatchedField,
+          policyMatchedWord
         );
 
         if (decision === 'always_allow') {
@@ -1527,7 +1963,10 @@ export async function authorizeHeadless(
   }
 
   // 🏁 RACER 3: Browser Dashboard
-  if (approvers.browser && isDaemonRunning()) {
+  // Skip when cloudEnforced — notifyDaemonViewer already created a viewer card on
+  // the dashboard. Running askDaemon on top would create a second duplicate entry,
+  // open a second browser tab, and fire a second daemon authorizeHeadless call.
+  if (approvers.browser && isDaemonRunning() && !options?.calledFromDaemon && !cloudEnforced) {
     racePromises.push(
       (async () => {
         try {
@@ -1538,7 +1977,14 @@ export async function authorizeHeadless(
             console.error(chalk.cyan(`   URL → http://${DAEMON_HOST}:${DAEMON_PORT}/\n`));
           }
 
-          const daemonDecision = await askDaemon(toolName, args, meta, signal);
+          const daemonDecision = await askDaemon(
+            toolName,
+            args,
+            meta,
+            signal,
+            riskMetadata,
+            options?.activityId
+          );
           if (daemonDecision === 'abandoned') throw new Error('Abandoned');
 
           const isApproved = daemonDecision === 'allow';
@@ -1563,7 +2009,14 @@ export async function authorizeHeadless(
     racePromises.push(
       (async () => {
         try {
-          console.log(chalk.bgRed.white.bold(` 🛑 NODE9 INTERCEPTOR `));
+          if (explainableLabel.includes('DLP')) {
+            console.log(chalk.bgRed.white.bold(` 🚨 NODE9 DLP ALERT — CREDENTIAL DETECTED `));
+            console.log(
+              chalk.red.bold(`   A sensitive secret was detected in the tool arguments!`)
+            );
+          } else {
+            console.log(chalk.bgRed.white.bold(` 🛑 NODE9 INTERCEPTOR `));
+          }
           console.log(`${chalk.bold('Action:')} ${chalk.red(toolName)}`);
           console.log(`${chalk.bold('Flagged By:')} ${chalk.yellow(explainableLabel)}`);
 
@@ -1733,9 +2186,15 @@ export function getConfig(): Config {
     dangerousWords: [...DEFAULT_CONFIG.policy.dangerousWords],
     ignoredTools: [...DEFAULT_CONFIG.policy.ignoredTools],
     toolInspection: { ...DEFAULT_CONFIG.policy.toolInspection },
-    rules: [...DEFAULT_CONFIG.policy.rules],
     smartRules: [...DEFAULT_CONFIG.policy.smartRules],
+    snapshot: {
+      tools: [...DEFAULT_CONFIG.policy.snapshot.tools],
+      onlyPaths: [...DEFAULT_CONFIG.policy.snapshot.onlyPaths],
+      ignorePaths: [...DEFAULT_CONFIG.policy.snapshot.ignorePaths],
+    },
+    dlp: { ...DEFAULT_CONFIG.policy.dlp },
   };
+  const mergedEnvironments: Record<string, EnvironmentConfig> = { ...DEFAULT_CONFIG.environments };
 
   const applyLayer = (source: Record<string, unknown> | null) => {
     if (!source) return;
@@ -1748,6 +2207,7 @@ export function getConfig(): Config {
     if (s.enableHookLogDebug !== undefined)
       mergedSettings.enableHookLogDebug = s.enableHookLogDebug;
     if (s.approvers) mergedSettings.approvers = { ...mergedSettings.approvers, ...s.approvers };
+    if (s.approvalTimeoutMs !== undefined) mergedSettings.approvalTimeoutMs = s.approvalTimeoutMs;
     if (s.environment !== undefined) mergedSettings.environment = s.environment;
 
     if (p.sandboxPaths) mergedPolicy.sandboxPaths.push(...p.sandboxPaths);
@@ -1757,23 +2217,76 @@ export function getConfig(): Config {
 
     if (p.toolInspection)
       mergedPolicy.toolInspection = { ...mergedPolicy.toolInspection, ...p.toolInspection };
-    if (p.rules) mergedPolicy.rules.push(...p.rules);
     if (p.smartRules) mergedPolicy.smartRules.push(...p.smartRules);
+    if (p.snapshot) {
+      const s = p.snapshot as Partial<Config['policy']['snapshot']>;
+      if (s.tools) mergedPolicy.snapshot.tools.push(...s.tools);
+      if (s.onlyPaths) mergedPolicy.snapshot.onlyPaths.push(...s.onlyPaths);
+      if (s.ignorePaths) mergedPolicy.snapshot.ignorePaths.push(...s.ignorePaths);
+    }
+    if (p.dlp) {
+      const d = p.dlp as Partial<Config['policy']['dlp']>;
+      if (d.enabled !== undefined) mergedPolicy.dlp.enabled = d.enabled;
+      if (d.scanIgnoredTools !== undefined) mergedPolicy.dlp.scanIgnoredTools = d.scanIgnoredTools;
+    }
+
+    const envs = (source.environments || {}) as Record<string, unknown>;
+    for (const [envName, envConfig] of Object.entries(envs)) {
+      if (envConfig && typeof envConfig === 'object') {
+        const ec = envConfig as Record<string, unknown>;
+        mergedEnvironments[envName] = {
+          ...mergedEnvironments[envName],
+          // Validate field types before merging — do not blindly spread user input
+          ...(typeof ec.requireApproval === 'boolean'
+            ? { requireApproval: ec.requireApproval }
+            : {}),
+        };
+      }
+    }
   };
 
   applyLayer(globalConfig);
   applyLayer(projectConfig);
+
+  // ── Shield layer ──────────────────────────────────────────────────────────
+  // Shields are applied after user config so they cannot be overridden locally.
+  // Rules are sourced from the in-memory catalog, not from config.json — so
+  // enabling a shield never mutates the user's config file.
+  for (const shieldName of readActiveShields()) {
+    const shield = getShield(shieldName);
+    if (!shield) continue;
+    // Deduplicate smartRules by name — prevents duplicates if the user also
+    // has the same rule name in their config (shouldn't happen, but be safe).
+    const existingRuleNames = new Set(mergedPolicy.smartRules.map((r) => r.name));
+    for (const rule of shield.smartRules) {
+      if (!existingRuleNames.has(rule.name)) mergedPolicy.smartRules.push(rule);
+    }
+    const existingWords = new Set(mergedPolicy.dangerousWords);
+    for (const word of shield.dangerousWords) {
+      if (!existingWords.has(word)) mergedPolicy.dangerousWords.push(word);
+    }
+  }
+
+  // Advisory rm rules are always appended last so user-defined rules (project/global/shield)
+  // are evaluated first and can override default rm behaviour.
+  const existingAdvisoryNames = new Set(mergedPolicy.smartRules.map((r) => r.name));
+  for (const rule of ADVISORY_SMART_RULES) {
+    if (!existingAdvisoryNames.has(rule.name)) mergedPolicy.smartRules.push(rule);
+  }
 
   if (process.env.NODE9_MODE) mergedSettings.mode = process.env.NODE9_MODE as string;
 
   mergedPolicy.sandboxPaths = [...new Set(mergedPolicy.sandboxPaths)];
   mergedPolicy.dangerousWords = [...new Set(mergedPolicy.dangerousWords)];
   mergedPolicy.ignoredTools = [...new Set(mergedPolicy.ignoredTools)];
+  mergedPolicy.snapshot.tools = [...new Set(mergedPolicy.snapshot.tools)];
+  mergedPolicy.snapshot.onlyPaths = [...new Set(mergedPolicy.snapshot.onlyPaths)];
+  mergedPolicy.snapshot.ignorePaths = [...new Set(mergedPolicy.snapshot.ignorePaths)];
 
   cachedConfig = {
     settings: mergedSettings,
     policy: mergedPolicy,
-    environments: {},
+    environments: mergedEnvironments,
   };
 
   return cachedConfig;
@@ -1781,11 +2294,41 @@ export function getConfig(): Config {
 
 function tryLoadConfig(filePath: string): Record<string, unknown> | null {
   if (!fs.existsSync(filePath)) return null;
+  let raw: unknown;
   try {
-    return JSON.parse(fs.readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
-  } catch {
+    raw = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    process.stderr.write(
+      `\n⚠️  Node9: Failed to parse ${filePath}\n   ${msg}\n   → Using default config\n\n`
+    );
     return null;
   }
+  const SUPPORTED_VERSION = '1.0';
+  const SUPPORTED_MAJOR = SUPPORTED_VERSION.split('.')[0];
+  const fileVersion = (raw as Record<string, unknown>)?.version;
+  if (fileVersion !== undefined) {
+    const vStr = String(fileVersion);
+    const fileMajor = vStr.split('.')[0];
+    if (fileMajor !== SUPPORTED_MAJOR) {
+      process.stderr.write(
+        `\n❌  Node9: Config at ${filePath} has version "${vStr}" — major version is incompatible with this release (expected "${SUPPORTED_VERSION}"). Config will not be loaded.\n\n`
+      );
+      return null;
+    } else if (vStr !== SUPPORTED_VERSION) {
+      process.stderr.write(
+        `\n⚠️  Node9: Config at ${filePath} declares version "${vStr}" — expected "${SUPPORTED_VERSION}". Continuing with best-effort parsing.\n\n`
+      );
+    }
+  }
+
+  const { sanitized, error } = sanitizeConfig(raw);
+  if (error) {
+    process.stderr.write(
+      `\n⚠️  Node9: Invalid config at ${filePath}:\n${error.replace('Invalid config:\n', '')}\n   → Invalid fields ignored, using defaults for those keys\n\n`
+    );
+  }
+  return sanitized;
 }
 
 function getActiveEnvironment(config: Config): EnvironmentConfig | null {
@@ -1837,8 +2380,9 @@ export interface CloudApprovalResult {
 }
 
 /**
- * Fire-and-forget: send an audit record to the backend for a locally fast-pathed call.
- * Never blocks the agent — failures are silently ignored.
+ * Send an audit record to the SaaS backend for a locally fast-pathed call.
+ * Returns a Promise so callers that precede process.exit(0) can await it.
+ * Failures are silently ignored — never blocks the agent.
  */
 function auditLocalAllow(
   toolName: string,
@@ -1846,11 +2390,8 @@ function auditLocalAllow(
   checkedBy: string,
   creds: { apiKey: string; apiUrl: string },
   meta?: { agent?: string; mcpServer?: string }
-): void {
-  const controller = new AbortController();
-  setTimeout(() => controller.abort(), 5000);
-
-  fetch(`${creds.apiUrl}/audit`, {
+): Promise<void> {
+  return fetch(`${creds.apiUrl}/audit`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${creds.apiKey}` },
     body: JSON.stringify({
@@ -1865,8 +2406,10 @@ function auditLocalAllow(
         platform: os.platform(),
       },
     }),
-    signal: controller.signal,
-  }).catch(() => {});
+    signal: AbortSignal.timeout(5000),
+  })
+    .then(() => {})
+    .catch(() => {});
 }
 
 /**
@@ -1876,13 +2419,16 @@ async function initNode9SaaS(
   toolName: string,
   args: unknown,
   creds: { apiKey: string; apiUrl: string },
-  meta?: { agent?: string; mcpServer?: string }
+  meta?: { agent?: string; mcpServer?: string },
+  riskMetadata?: RiskMetadata
 ): Promise<{
   pending: boolean;
   requestId?: string;
   approved?: boolean;
   reason?: string;
   remoteApprovalOnly?: boolean;
+  shadowMode?: boolean;
+  shadowReason?: string;
 }> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 10000);
@@ -1901,6 +2447,7 @@ async function initNode9SaaS(
           cwd: process.cwd(),
           platform: os.platform(),
         },
+        ...(riskMetadata && { riskMetadata }),
       }),
       signal: controller.signal,
     });
@@ -1914,6 +2461,8 @@ async function initNode9SaaS(
       approved?: boolean;
       reason?: string;
       remoteApprovalOnly?: boolean;
+      shadowMode?: boolean;
+      shadowReason?: string;
     };
   } finally {
     clearTimeout(timeout);

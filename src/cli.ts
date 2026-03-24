@@ -12,8 +12,16 @@ import {
   getConfig,
   _resetConfigCache,
   explainPolicy,
+  shouldSnapshot,
 } from './core';
-import { setupClaude, setupGemini, setupCursor } from './setup';
+import {
+  setupClaude,
+  setupGemini,
+  setupCursor,
+  teardownClaude,
+  teardownGemini,
+  teardownCursor,
+} from './setup';
 import { startDaemon, stopDaemon, daemonStatus, DAEMON_PORT, DAEMON_HOST } from './daemon/index';
 import { spawn, execSync } from 'child_process';
 import { parseCommandString } from 'execa';
@@ -24,6 +32,13 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { createShadowSnapshot, applyUndo, getSnapshotHistory, computeUndoDiff } from './undo';
+import {
+  getShield,
+  listShields,
+  readActiveShields,
+  writeActiveShields,
+  resolveShieldName,
+} from './shields';
 import { confirm } from '@inquirer/prompts';
 
 const { version } = JSON.parse(
@@ -74,6 +89,20 @@ INSTRUCTIONS:
   }
 
   const label = blockedByLabel.toLowerCase();
+
+  if (
+    label.includes('dlp') ||
+    label.includes('secret detected') ||
+    label.includes('credential review')
+  ) {
+    return `NODE9 SECURITY ALERT: A sensitive credential (API key, token, or private key) was found in your tool call arguments.
+CRITICAL INSTRUCTION: Do NOT retry this action.
+REQUIRED ACTIONS:
+1. Remove the hardcoded credential from your command or code.
+2. Use an environment variable or a dedicated secrets manager instead.
+3. Treat the leaked credential as compromised and rotate it immediately.
+Do NOT attempt to bypass this check or pass the credential through another tool.`;
+  }
 
   if (label.includes('sql safety') && label.includes('delete without where')) {
     return `NODE9: Blocked — DELETE without WHERE clause would wipe the entire table.
@@ -332,7 +361,13 @@ program
         cloud: true,
         terminal: true,
       };
-      approvers.cloud = !options.local;
+      // Only change cloud setting when --local is explicitly passed.
+      // Without --local, preserve whatever the user had before so that
+      // re-running `node9 login` to refresh an API key doesn't silently
+      // re-enable cloud approvals for users who had turned them off.
+      if (options.local) {
+        approvers.cloud = false;
+      }
       s.approvers = approvers;
       if (!fs.existsSync(path.dirname(configPath)))
         fs.mkdirSync(path.dirname(configPath), { recursive: true });
@@ -390,7 +425,112 @@ program
     process.exit(1);
   });
 
-// 2c. DOCTOR
+// 2c. REMOVEFROM
+program
+  .command('removefrom')
+  .description('Remove Node9 hooks from an AI agent configuration')
+  .addHelpText('after', '\n  Supported targets:  claude  gemini  cursor')
+  .argument('<target>', 'The agent to remove from: claude | gemini | cursor')
+  .action((target: string) => {
+    // Validate before logging so the target string is never interpolated
+    // into output before it has been confirmed to be a known value.
+    let fn: (() => void) | undefined;
+    if (target === 'claude') fn = teardownClaude;
+    else if (target === 'gemini') fn = teardownGemini;
+    else if (target === 'cursor') fn = teardownCursor;
+    else {
+      console.error(chalk.red(`Unknown target: "${target}". Supported: claude, gemini, cursor`));
+      process.exit(1);
+    }
+    console.log(chalk.cyan(`\n🛡️  Node9: removing hooks from ${target}...\n`));
+    try {
+      fn!();
+    } catch (err) {
+      console.error(chalk.red(`  ⚠️  Failed: ${err instanceof Error ? err.message : String(err)}`));
+      process.exit(1);
+    }
+    console.log(chalk.gray('\n  Restart the agent for changes to take effect.'));
+  });
+
+// 2d. UNINSTALL
+program
+  .command('uninstall')
+  .description('Remove all Node9 hooks and optionally delete config files')
+  .option('--purge', 'Also delete ~/.node9/ directory (config, audit log, credentials)')
+  .action(async (options: { purge?: boolean }) => {
+    console.log(chalk.cyan('\n🛡️  Node9 Uninstall\n'));
+
+    // 1. Stop the daemon
+    console.log(chalk.bold('Stopping daemon...'));
+    try {
+      stopDaemon();
+      console.log(chalk.green('  ✅ Daemon stopped'));
+    } catch {
+      console.log(chalk.blue('  ℹ️  Daemon was not running'));
+    }
+
+    // 2. Remove hooks from all agents (each wrapped independently so a partial
+    //    failure does not silently skip the remaining agents)
+    console.log(chalk.bold('\nRemoving hooks...'));
+    let teardownFailed = false;
+    for (const [label, fn] of [
+      ['Claude', teardownClaude],
+      ['Gemini', teardownGemini],
+      ['Cursor', teardownCursor],
+    ] as const) {
+      try {
+        fn();
+      } catch (err) {
+        teardownFailed = true;
+        console.error(
+          chalk.red(
+            `  ⚠️  Failed to remove ${label} hooks: ${err instanceof Error ? err.message : String(err)}`
+          )
+        );
+      }
+    }
+
+    // 3. Optionally purge ~/.node9/ — requires explicit confirmation because the
+    //    directory may contain credentials and cannot be recovered after deletion.
+    if (options.purge) {
+      const node9Dir = path.join(os.homedir(), '.node9');
+      if (fs.existsSync(node9Dir)) {
+        const confirmed = await confirm({
+          message: `Permanently delete ${node9Dir} (config, audit log, credentials)?`,
+          default: false,
+        });
+        if (confirmed) {
+          fs.rmSync(node9Dir, { recursive: true });
+          // Verify deletion succeeded — force:true would swallow errors and
+          // print a false success if a file was locked or permission-denied.
+          if (fs.existsSync(node9Dir)) {
+            console.error(
+              chalk.red('\n  ⚠️  ~/.node9/ could not be fully deleted — remove it manually.')
+            );
+          } else {
+            console.log(chalk.green('\n  ✅ Deleted ~/.node9/ (config, audit log, credentials)'));
+          }
+        } else {
+          console.log(chalk.yellow('\n  Skipped — ~/.node9/ was not deleted.'));
+        }
+      } else {
+        console.log(chalk.blue('\n  ℹ️  ~/.node9/ not found — nothing to delete'));
+      }
+    } else {
+      console.log(
+        chalk.gray('\n  ~/.node9/ kept — run with --purge to delete config and audit log')
+      );
+    }
+
+    if (teardownFailed) {
+      console.error(chalk.red('\n  ⚠️  Some hooks could not be removed — see errors above.'));
+      process.exit(1);
+    }
+    console.log(chalk.green.bold('\n🛡️  Node9 removed. Run: npm uninstall -g @node9/proxy'));
+    console.log(chalk.gray('   Restart any open AI agent sessions for changes to take effect.\n'));
+  });
+
+// 2e. DOCTOR
 program
   .command('doctor')
   .description('Check that Node9 is installed and configured correctly')
@@ -871,14 +1011,32 @@ program
   .argument('[action]', 'start | stop | status (default: start)')
   .option('-b, --background', 'Start the daemon in the background (detached)')
   .option('-o, --openui', 'Start in background and open browser')
+  .option(
+    '-w, --watch',
+    'Start daemon + open browser, stay alive permanently (Flight Recorder mode)'
+  )
   .action(
-    async (action: string | undefined, options: { background?: boolean; openui?: boolean }) => {
+    async (
+      action: string | undefined,
+      options: { background?: boolean; openui?: boolean; watch?: boolean }
+    ) => {
       const cmd = (action ?? 'start').toLowerCase();
       if (cmd === 'stop') return stopDaemon();
       if (cmd === 'status') return daemonStatus();
       if (cmd !== 'start' && action !== undefined) {
         console.error(chalk.red(`Unknown daemon action: "${action}". Use: start | stop | status`));
         process.exit(1);
+      }
+
+      if (options.watch) {
+        process.env.NODE9_WATCH_MODE = '1';
+        // Open browser shortly after daemon binds to its port
+        setTimeout(() => {
+          openBrowserLocal();
+          console.log(chalk.cyan(`🛰️  Flight Recorder: http://${DAEMON_HOST}:${DAEMON_PORT}/`));
+        }, 600);
+        startDaemon(); // foreground — keeps process alive
+        return;
       }
 
       if (options.openui) {
@@ -909,7 +1067,23 @@ program
     }
   );
 
-// 6. CHECK (Internal Hook - Upgraded with AI Negotiation Loop)
+// 6. TAIL
+program
+  .command('tail')
+  .description('Stream live agent activity to the terminal')
+  .option('--history', 'Replay recent history then continue live', false)
+  .option('--clear', 'Clear the history buffer and exit (does not stream)', false)
+  .action(async (options: { history?: boolean; clear?: boolean }) => {
+    const { startTail } = await import('./tui/tail.js');
+    try {
+      await startTail(options);
+    } catch (err) {
+      console.error(chalk.red(`❌ ${err instanceof Error ? err.message : String(err)}`));
+      process.exit(1);
+    }
+  });
+
+// 7. CHECK (Internal Hook - Upgraded with AI Negotiation Loop)
 program
   .command('check')
   .description('Hook handler — evaluates a tool call before execution')
@@ -1011,7 +1185,16 @@ program
             blockedByContext.toLowerCase().includes('decision');
 
           // 3. Print to the human terminal for visibility
-          console.error(chalk.red(`\n🛑 Node9 blocked "${toolName}"`));
+          if (
+            blockedByContext.includes('DLP') ||
+            blockedByContext.includes('Secret Detected') ||
+            blockedByContext.includes('Credential Review')
+          ) {
+            console.error(chalk.bgRed.white.bold(`\n 🚨 NODE9 DLP ALERT — CREDENTIAL DETECTED `));
+            console.error(chalk.red.bold(`   A sensitive secret was found in the tool arguments!`));
+          } else {
+            console.error(chalk.red(`\n🛑 Node9 blocked "${toolName}"`));
+          }
           console.error(chalk.gray(`   Triggered by: ${blockedByContext}`));
           if (result?.changeHint) console.error(chalk.cyan(`   To change:  ${result.changeHint}`));
           console.error('');
@@ -1045,27 +1228,17 @@ program
         // Snapshot BEFORE the tool runs (PreToolUse) so undo can restore to
         // the state prior to this change. Snapshotting after (PostToolUse)
         // captures the changed state, making undo a no-op.
-        const STATE_CHANGING_TOOLS_PRE = [
-          'write_file',
-          'edit_file',
-          'edit',
-          'replace',
-          'terminal.execute',
-          'str_replace_based_edit_tool',
-          'create_file',
-        ];
-        if (
-          config.settings.enableUndo &&
-          STATE_CHANGING_TOOLS_PRE.includes(toolName.toLowerCase())
-        ) {
-          await createShadowSnapshot(toolName, toolInput);
+        if (shouldSnapshot(toolName, toolInput, config)) {
+          await createShadowSnapshot(toolName, toolInput, config.policy.snapshot.ignorePaths);
         }
 
         // Pass to Headless authorization
         const result = await authorizeHeadless(toolName, toolInput, false, meta);
 
         if (result.approved) {
-          if (result.checkedBy)
+          // Only write to stderr in debug mode — Claude Code treats any stderr
+          // output as a hook error regardless of exit code (see GitHub issue).
+          if (result.checkedBy && process.env.NODE9_DEBUG === '1')
             process.stderr.write(`✓ node9 [${result.checkedBy}]: "${toolName}" allowed\n`);
           process.exit(0);
         }
@@ -1083,11 +1256,14 @@ program
           if (daemonReady) {
             const retry = await authorizeHeadless(toolName, toolInput, false, meta);
             if (retry.approved) {
-              if (retry.checkedBy)
+              if (retry.checkedBy && process.env.NODE9_DEBUG === '1')
                 process.stderr.write(`✓ node9 [${retry.checkedBy}]: "${toolName}" allowed\n`);
               process.exit(0);
             }
             // Add the dynamic label so we know if it was Cloud, Config, etc.
+            // Denials communicate via exit code (non-zero) and JSON on stdout —
+            // stderr is intentionally unused so Claude Code never treats a block
+            // as a "hook error" (it does so on any stderr output regardless of exit code).
             sendBlock(retry.reason ?? `Node9 blocked "${toolName}".`, {
               ...retry,
               blockedByLabel: retry.blockedByLabel,
@@ -1096,7 +1272,9 @@ program
           }
         }
 
-        // Add the dynamic label to the final block
+        // Denials communicate via exit code (non-zero) and JSON on stdout —
+        // stderr is intentionally unused so Claude Code never treats a block
+        // as a "hook error" (it does so on any stderr output regardless of exit code).
         sendBlock(result.reason ?? `Node9 blocked "${toolName}".`, {
           ...result,
           blockedByLabel: result.blockedByLabel,
@@ -1186,17 +1364,11 @@ program
         fs.appendFileSync(logPath, JSON.stringify(entry) + '\n');
 
         const config = getConfig();
-        const STATE_CHANGING_TOOLS = [
-          'bash',
-          'shell',
-          'write_file',
-          'edit_file',
-          'replace',
-          'terminal.execute',
-        ];
 
-        if (config.settings.enableUndo && STATE_CHANGING_TOOLS.includes(tool.toLowerCase())) {
-          await createShadowSnapshot();
+        // PostToolUse snapshot is a fallback for tools not covered by PreToolUse.
+        // Uses the same configurable snapshot policy.
+        if (shouldSnapshot(tool, {}, config)) {
+          await createShadowSnapshot('unknown', {}, config.policy.snapshot.ignorePaths);
         }
       } catch {
         /* ignore */
@@ -1317,15 +1489,26 @@ program
 program
   .command('undo')
   .description(
-    'Revert files to a pre-AI snapshot. Shows a diff and asks for confirmation before reverting. Use --steps N to go back N actions.'
+    'Revert files to a pre-AI snapshot. Shows a diff and asks for confirmation before reverting. Use --steps N to go back N actions, --all to include snapshots from other directories.'
   )
   .option('--steps <n>', 'Number of snapshots to go back (default: 1)', '1')
-  .action(async (options: { steps: string }) => {
+  .option('--all', 'Show snapshots from all directories, not just the current one')
+  .action(async (options: { steps: string; all?: boolean }) => {
     const steps = Math.max(1, parseInt(options.steps, 10) || 1);
-    const history = getSnapshotHistory();
+    const allHistory = getSnapshotHistory();
+    const history = options.all ? allHistory : allHistory.filter((s) => s.cwd === process.cwd());
 
     if (history.length === 0) {
-      console.log(chalk.yellow('\nℹ️  No undo snapshots found.\n'));
+      if (!options.all && allHistory.length > 0) {
+        console.log(
+          chalk.yellow(
+            `\nℹ️  No snapshots found for the current directory (${process.cwd()}).\n` +
+              `    Run ${chalk.cyan('node9 undo --all')} to see snapshots from all projects.\n`
+          )
+        );
+      } else {
+        console.log(chalk.yellow('\nℹ️  No undo snapshots found.\n'));
+      }
       return;
     }
 
@@ -1401,6 +1584,112 @@ program
     } else {
       console.log(chalk.gray('\nCancelled.\n'));
     }
+  });
+
+// ---------------------------------------------------------------------------
+// node9 shield — manage pre-packaged security rule templates
+// ---------------------------------------------------------------------------
+// Shields are applied dynamically at getConfig() load time by reading
+// ~/.node9/shields.json and merging the catalog rules into the runtime policy.
+// enable/disable only update shields.json — config.json is never touched.
+
+const shieldCmd = program
+  .command('shield')
+  .description('Manage pre-packaged security shield templates');
+
+shieldCmd
+  .command('enable <service>')
+  .description('Enable a security shield for a specific service')
+  .action((service: string) => {
+    const name = resolveShieldName(service);
+    if (!name) {
+      console.error(chalk.red(`\n❌ Unknown shield: "${service}"\n`));
+      console.log(`Run ${chalk.cyan('node9 shield list')} to see available shields.\n`);
+      process.exit(1);
+    }
+    const shield = getShield(name!)!;
+
+    const active = readActiveShields();
+    if (active.includes(name!)) {
+      console.log(chalk.yellow(`\nℹ️  Shield "${name}" is already active.\n`));
+      return;
+    }
+    writeActiveShields([...active, name!]);
+
+    console.log(chalk.green(`\n🛡️  Shield "${name}" enabled.`));
+    console.log(chalk.gray(`   ${shield.smartRules.length} smart rules now active.`));
+    if (shield.dangerousWords.length > 0)
+      console.log(chalk.gray(`   ${shield.dangerousWords.length} dangerous words now active.`));
+    if (name === 'filesystem') {
+      console.log(
+        chalk.yellow(
+          `\n   ⚠️  Note: filesystem rules cover common rm -rf patterns but not all variants.\n` +
+            `      Tools like unlink, find -delete, or language-level file ops are not intercepted.`
+        )
+      );
+    }
+    console.log('');
+  });
+
+shieldCmd
+  .command('disable <service>')
+  .description('Disable a security shield')
+  .action((service: string) => {
+    const name = resolveShieldName(service);
+    if (!name) {
+      console.error(chalk.red(`\n❌ Unknown shield: "${service}"\n`));
+      console.log(`Run ${chalk.cyan('node9 shield list')} to see available shields.\n`);
+      process.exit(1);
+    }
+
+    const active = readActiveShields();
+    if (!active.includes(name!)) {
+      console.log(chalk.yellow(`\nℹ️  Shield "${name}" is not active.\n`));
+      return;
+    }
+
+    writeActiveShields(active.filter((s) => s !== name));
+
+    console.log(chalk.green(`\n🛡️  Shield "${name}" disabled.\n`));
+  });
+
+shieldCmd
+  .command('list')
+  .description('Show all available shields')
+  .action(() => {
+    const active = new Set(readActiveShields());
+    console.log(chalk.bold('\n🛡️  Available Shields\n'));
+    for (const shield of listShields()) {
+      const status = active.has(shield.name) ? chalk.green('● enabled') : chalk.gray('○ disabled');
+      console.log(`  ${status}  ${chalk.cyan(shield.name.padEnd(12))} ${shield.description}`);
+      if (shield.aliases.length > 0)
+        console.log(chalk.gray(`              aliases: ${shield.aliases.join(', ')}`));
+    }
+    console.log('');
+  });
+
+shieldCmd
+  .command('status')
+  .description('Show which shields are currently active')
+  .action(() => {
+    const active = readActiveShields();
+    if (active.length === 0) {
+      console.log(chalk.yellow('\nℹ️  No shields are active.\n'));
+      console.log(`Run ${chalk.cyan('node9 shield list')} to see available shields.\n`);
+      return;
+    }
+    console.log(chalk.bold('\n🛡️  Active Shields\n'));
+    for (const name of active) {
+      const shield = getShield(name);
+      if (!shield) continue;
+      console.log(`  ${chalk.green('●')} ${chalk.cyan(name)}`);
+      console.log(
+        chalk.gray(
+          `    ${shield.smartRules.length} smart rules · ${shield.dangerousWords.length} dangerous words`
+        )
+      );
+    }
+    console.log('');
   });
 
 process.on('unhandledRejection', (reason) => {

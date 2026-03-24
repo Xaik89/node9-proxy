@@ -1,13 +1,21 @@
 // src/daemon/index.ts — Node9 localhost approval server
 import { UI_HTML_TEMPLATE } from './ui';
+import { RiskMetadata } from '../context-sniper';
 import http from 'http';
+import net from 'net';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { spawn } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
 import { randomUUID } from 'crypto';
 import chalk from 'chalk';
-import { getGlobalSettings } from '../core';
+import { authorizeHeadless, getGlobalSettings, getConfig, _resetConfigCache } from '../core';
+import { SHIELDS, readActiveShields, writeActiveShields } from '../shields';
+
+const ACTIVITY_SOCKET_PATH =
+  process.platform === 'win32'
+    ? '\\\\.\\pipe\\node9-activity'
+    : path.join(os.tmpdir(), 'node9-activity.sock');
 
 export const DAEMON_PORT = 7391;
 export const DAEMON_HOST = '127.0.0.1';
@@ -136,13 +144,15 @@ interface PendingEntry {
   id: string;
   toolName: string;
   args: unknown;
+  riskMetadata?: RiskMetadata;
   agent?: string;
   mcpServer?: string;
   timestamp: number;
   slackDelegated: boolean;
   timer: ReturnType<typeof setTimeout>;
-  waiter: ((d: Decision) => void) | null;
+  waiter: ((d: Decision, reason?: string) => void) | null;
   earlyDecision: Decision | null;
+  earlyReason?: string;
 }
 
 const pending = new Map<string, PendingEntry>();
@@ -150,6 +160,10 @@ const sseClients = new Set<http.ServerResponse>();
 let abandonTimer: ReturnType<typeof setTimeout> | null = null;
 let daemonServer: http.Server | null = null;
 let hadBrowserClient = false; // true once at least one SSE client has connected
+
+// ── Flight Recorder ring buffer — replayed to new SSE clients on connect ──
+const ACTIVITY_RING_SIZE = 100;
+const activityRing: { event: string; data: unknown }[] = [];
 
 function abandonPending() {
   abandonTimer = null;
@@ -173,6 +187,23 @@ function abandonPending() {
 }
 
 function broadcast(event: string, data: unknown) {
+  // Buffer activity events so late-joining browsers get history
+  if (event === 'activity') {
+    activityRing.push({ event, data });
+    if (activityRing.length > ACTIVITY_RING_SIZE) activityRing.shift();
+  } else if (event === 'activity-result') {
+    // Patch the status in the ring buffer so replayed history is up-to-date.
+    // Intentional in-place mutation — safe because Node.js is single-threaded
+    // and ring entries are only read during SSE replay on the same event loop tick.
+    const { id, status, label } = data as { id: string; status: string; label?: string };
+    for (let i = activityRing.length - 1; i >= 0; i--) {
+      if ((activityRing[i].data as { id: string }).id === id) {
+        Object.assign(activityRing[i].data as object, { status, label });
+        break;
+      }
+    }
+  }
+
   const msg = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
   sseClients.forEach((client) => {
     try {
@@ -232,8 +263,10 @@ export function startDaemon(): void {
 
   // ── Graceful Idle Timeout (Fixes Task 0.4) ──────────────────────────────
   const IDLE_TIMEOUT_MS = 12 * 60 * 60 * 1000; // 12 hours
-  let idleTimer: NodeJS.Timeout;
+  const watchMode = process.env.NODE9_WATCH_MODE === '1';
+  let idleTimer: NodeJS.Timeout | undefined;
   function resetIdleTimer() {
+    if (watchMode) return; // Watch mode — never idle-timeout
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
       if (autoStarted) {
@@ -273,6 +306,7 @@ export function startDaemon(): void {
             id: e.id,
             toolName: e.toolName,
             args: e.args,
+            riskMetadata: e.riskMetadata,
             slackDelegated: e.slackDelegated,
             timestamp: e.timestamp,
             agent: e.agent,
@@ -283,6 +317,10 @@ export function startDaemon(): void {
         })}\n\n`
       );
       res.write(`event: decisions\ndata: ${JSON.stringify(readPersistentDecisions())}\n\n`);
+      // Replay recent activity history so late-joining browsers see the feed
+      for (const item of activityRing) {
+        res.write(`event: ${item.event}\ndata: ${JSON.stringify(item.data)}\n\n`);
+      }
       return req.on('close', () => {
         sseClients.delete(res);
         if (sseClients.size === 0 && pending.size > 0) {
@@ -299,15 +337,29 @@ export function startDaemon(): void {
     if (req.method === 'POST' && pathname === '/check') {
       try {
         resetIdleTimer(); // Agent is active, reset the shutdown clock
+        _resetConfigCache(); // Always read fresh config — catches login/manual edits without restart
 
         const body = await readBody(req);
         if (body.length > 65_536) return res.writeHead(413).end();
-        const { toolName, args, slackDelegated = false, agent, mcpServer } = JSON.parse(body);
-        const id = randomUUID();
+        const {
+          toolName,
+          args,
+          slackDelegated = false,
+          agent,
+          mcpServer,
+          riskMetadata,
+          fromCLI = false,
+          activityId,
+        } = JSON.parse(body);
+        // When fromCLI is true the CLI already sent an 'activity' event with
+        // activityId via the Unix socket. Reuse that ID so the daemon's
+        // 'activity-result' broadcast matches what tail.ts has in its pending map.
+        const id = (fromCLI && typeof activityId === 'string' && activityId) || randomUUID();
         const entry: PendingEntry = {
           id,
           toolName,
           args,
+          riskMetadata: riskMetadata ?? undefined,
           agent: typeof agent === 'string' ? agent : undefined,
           mcpServer: typeof mcpServer === 'string' ? mcpServer : undefined,
           slackDelegated: !!slackDelegated,
@@ -322,28 +374,113 @@ export function startDaemon(): void {
                 args: e.args,
                 decision: 'auto-deny',
               });
-              if (e.waiter) e.waiter('deny');
-              else e.earlyDecision = 'deny';
+              if (e.waiter) e.waiter('deny', 'No response — auto-denied after timeout');
+              else {
+                e.earlyDecision = 'deny';
+                e.earlyReason = 'No response — auto-denied after timeout';
+              }
               pending.delete(id);
               broadcast('remove', { id });
             }
           }, AUTO_DENY_MS),
         };
         pending.set(id, entry);
-        broadcast('add', {
-          id,
+
+        // Flight recorder: CLI callers already sent 'activity' via the Unix socket
+        // (notifyActivity), so skip it here to avoid duplicate entries. External
+        // callers (non-CLI integrations) set fromCLI=false and need the broadcast.
+        if (!fromCLI) {
+          broadcast('activity', {
+            id,
+            ts: entry.timestamp,
+            tool: toolName,
+            args: redactArgs(args),
+            status: 'pending',
+          });
+        }
+
+        const browserEnabled = getConfig().settings.approvers?.browser !== false;
+        if (browserEnabled) {
+          broadcast('add', {
+            id,
+            toolName,
+            args,
+            riskMetadata: entry.riskMetadata,
+            slackDelegated: entry.slackDelegated,
+            agent: entry.agent,
+            mcpServer: entry.mcpServer,
+          });
+          // When auto-started, the CLI already called openBrowserLocal() before
+          // the request was registered, so the browser is already opening.
+          // Skip here to avoid opening a duplicate tab.
+          if (sseClients.size === 0 && !autoStarted)
+            openBrowser(`http://127.0.0.1:${DAEMON_PORT}/`);
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ id }));
+
+        // Run the full policy + cloud + native pipeline in the background.
+        // Browser and terminal racers are skipped (no TTY, browser card already exists via SSE).
+        authorizeHeadless(
           toolName,
           args,
-          slackDelegated: entry.slackDelegated,
-          agent: entry.agent,
-          mcpServer: entry.mcpServer,
-        });
-        // When auto-started, the CLI already called openBrowserLocal() before
-        // the request was registered, so the browser is already opening.
-        // Skip here to avoid opening a duplicate tab.
-        if (sseClients.size === 0 && !autoStarted) openBrowser(`http://127.0.0.1:${DAEMON_PORT}/`);
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify({ id }));
+          false,
+          {
+            agent: typeof agent === 'string' ? agent : undefined,
+            mcpServer: typeof mcpServer === 'string' ? mcpServer : undefined,
+          },
+          { calledFromDaemon: true }
+        )
+          .then((result) => {
+            const e = pending.get(id);
+            if (!e) return; // Already resolved (browser click or auto-deny timer)
+
+            // If no background channels were available (no cloud, no native),
+            // leave the entry alive so the browser dashboard can decide.
+            if (result.noApprovalMechanism) return;
+
+            // ── Flight Recorder: update the feed item with the final verdict ──
+            broadcast('activity-result', {
+              id,
+              status: result.approved
+                ? 'allow'
+                : result.blockedByLabel?.includes('DLP')
+                  ? 'dlp'
+                  : 'block',
+              label: result.blockedByLabel,
+            });
+
+            clearTimeout(e.timer);
+            const decision: Decision = result.approved ? 'allow' : 'deny';
+            appendAuditLog({ toolName: e.toolName, args: e.args, decision });
+            if (e.waiter) {
+              // Python is already waiting on GET /wait/:id — respond and clean up
+              e.waiter(decision, result.reason);
+              pending.delete(id);
+              broadcast('remove', { id });
+            } else {
+              // Python hasn't sent GET /wait/:id yet — set earlyDecision and leave
+              // the entry alive so the GET handler can find it and respond
+              e.earlyDecision = decision;
+              e.earlyReason = result.reason;
+            }
+          })
+          .catch((err) => {
+            const e = pending.get(id);
+            if (!e) return;
+            clearTimeout(e.timer);
+            const reason =
+              (err as { reason?: string })?.reason || 'No response — request timed out';
+            if (e.waiter) e.waiter('deny', reason);
+            else {
+              e.earlyDecision = 'deny';
+              e.earlyReason = reason;
+            }
+            pending.delete(id);
+            broadcast('remove', { id });
+          });
+
+        return;
       } catch {
         res.writeHead(400).end();
       }
@@ -354,12 +491,19 @@ export function startDaemon(): void {
       const entry = pending.get(id);
       if (!entry) return res.writeHead(404).end();
       if (entry.earlyDecision) {
+        clearTimeout(entry.timer); // cancel the 30s cleanup timer set by POST /decision
+        pending.delete(id);
+        // POST /decision already broadcast 'remove' — don't send a duplicate
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify({ decision: entry.earlyDecision }));
+        const body: { decision: Decision; reason?: string } = { decision: entry.earlyDecision };
+        if (entry.earlyReason) body.reason = entry.earlyReason;
+        return res.end(JSON.stringify(body));
       }
-      entry.waiter = (d) => {
+      entry.waiter = (d, reason?) => {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ decision: d }));
+        const body: { decision: Decision; reason?: string } = { decision: d };
+        if (reason) body.reason = reason;
+        res.end(JSON.stringify(body));
       };
       return;
     }
@@ -370,10 +514,11 @@ export function startDaemon(): void {
         const id = pathname.split('/').pop()!;
         const entry = pending.get(id);
         if (!entry) return res.writeHead(404).end();
-        const { decision, persist, trustDuration } = JSON.parse(await readBody(req)) as {
+        const { decision, persist, trustDuration, reason } = JSON.parse(await readBody(req)) as {
           decision: string;
           persist?: boolean;
           trustDuration?: string;
+          reason?: string;
         };
 
         // Trust session
@@ -386,10 +531,15 @@ export function startDaemon(): void {
             decision: `trust:${trustDuration}`,
           });
           clearTimeout(entry.timer);
-          if (entry.waiter) entry.waiter('allow');
-          else entry.earlyDecision = 'allow';
-          pending.delete(id);
-          broadcast('remove', { id });
+          if (entry.waiter) {
+            entry.waiter('allow');
+            pending.delete(id);
+            broadcast('remove', { id });
+          } else {
+            entry.earlyDecision = 'allow';
+            broadcast('remove', { id });
+            entry.timer = setTimeout(() => pending.delete(id), 30_000);
+          }
           res.writeHead(200);
           return res.end(JSON.stringify({ ok: true }));
         }
@@ -402,10 +552,22 @@ export function startDaemon(): void {
           decision: resolvedDecision,
         });
         clearTimeout(entry.timer);
-        if (entry.waiter) entry.waiter(resolvedDecision);
-        else entry.earlyDecision = resolvedDecision;
-        pending.delete(id!);
-        broadcast('remove', { id });
+
+        if (entry.waiter) {
+          // GET /wait/:id is already connected — respond and clean up now
+          entry.waiter(resolvedDecision, reason);
+          pending.delete(id!);
+          broadcast('remove', { id });
+        } else {
+          // GET /wait/:id hasn't arrived yet — keep entry alive so it can pick up
+          // the early decision. Without this, the long-poll would get a 404 and
+          // cause askDaemon() to return 'deny' even when the user clicked Allow.
+          entry.earlyDecision = resolvedDecision;
+          entry.earlyReason = reason;
+          broadcast('remove', { id });
+          // Safety cleanup: remove the entry after 30s if GET /wait/:id never comes
+          entry.timer = setTimeout(() => pending.delete(id!), 30_000);
+        }
         res.writeHead(200);
         return res.end(JSON.stringify({ ok: true }));
       } catch {
@@ -505,9 +667,54 @@ export function startDaemon(): void {
       }
     }
 
+    if (req.method === 'POST' && pathname === '/events/clear') {
+      activityRing.length = 0;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ ok: true }));
+    }
+
     if (req.method === 'GET' && pathname === '/audit') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify(getAuditHistory()));
+    }
+
+    if (req.method === 'GET' && pathname === '/shields') {
+      if (!validToken(req)) return res.writeHead(403).end();
+      const active = readActiveShields();
+      const shields = Object.values(SHIELDS).map((s) => ({
+        name: s.name,
+        description: s.description,
+        active: active.includes(s.name),
+      }));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ shields }));
+    }
+
+    if (req.method === 'POST' && pathname === '/shields') {
+      if (!validToken(req)) return res.writeHead(403).end();
+      try {
+        const { name, active } = JSON.parse(await readBody(req)) as {
+          name: string;
+          active: boolean;
+        };
+        if (!SHIELDS[name]) return res.writeHead(400).end();
+        const current = readActiveShields();
+        const updated = active
+          ? [...new Set([...current, name])]
+          : current.filter((n) => n !== name);
+        writeActiveShields(updated);
+        _resetConfigCache();
+        const shieldsPayload = Object.values(SHIELDS).map((s) => ({
+          name: s.name,
+          description: s.description,
+          active: updated.includes(s.name),
+        }));
+        broadcast('shields-status', { shields: shieldsPayload });
+        res.writeHead(200);
+        return res.end(JSON.stringify({ ok: true }));
+      } catch {
+        res.writeHead(400).end();
+      }
     }
 
     res.writeHead(404).end();
@@ -515,24 +722,60 @@ export function startDaemon(): void {
 
   daemonServer = server;
 
-  // ── Port Conflict Resolution (Fixes Task 0.2) ───────────────────────────
+  // ── Port Conflict Resolution ─────────────────────────────────────────────
   server.on('error', (e: NodeJS.ErrnoException) => {
     if (e.code === 'EADDRINUSE') {
       try {
         if (fs.existsSync(DAEMON_PID_FILE)) {
           const { pid } = JSON.parse(fs.readFileSync(DAEMON_PID_FILE, 'utf-8'));
           process.kill(pid, 0); // Throws if process is dead
-          // If we reach here, a legitimate daemon is running. Safely exit.
+          // Legitimate daemon running with PID file. Safely exit.
           return process.exit(0);
         }
       } catch {
-        // Zombie PID detected. Clean up and resurrect server.
+        // Zombie PID in file — clean up and retry listen.
         try {
           fs.unlinkSync(DAEMON_PID_FILE);
         } catch {}
         server.listen(DAEMON_PORT, DAEMON_HOST);
         return;
       }
+
+      // No PID file but port is in use — orphaned daemon from a previous run.
+      // Do an HTTP health check; if healthy, recover the PID file and exit 0.
+      fetch(`http://${DAEMON_HOST}:${DAEMON_PORT}/settings`, {
+        signal: AbortSignal.timeout(1000),
+      })
+        .then((res) => {
+          if (res.ok) {
+            // Port is healthy. Try to find the listening PID via ss and write the PID file.
+            try {
+              const r = spawnSync('ss', ['-Htnp', `sport = :${DAEMON_PORT}`], {
+                encoding: 'utf8',
+                timeout: 1000,
+              });
+              const match = r.stdout?.match(/pid=(\d+)/);
+              if (match) {
+                const orphanPid = parseInt(match[1], 10);
+                process.kill(orphanPid, 0); // Verify still alive
+                atomicWriteSync(
+                  DAEMON_PID_FILE,
+                  JSON.stringify({ pid: orphanPid, port: DAEMON_PORT, internalToken, autoStarted }),
+                  { mode: 0o600 }
+                );
+              }
+            } catch {}
+            process.exit(0);
+          } else {
+            // Unhealthy — try to reclaim the port.
+            server.listen(DAEMON_PORT, DAEMON_HOST);
+          }
+        })
+        .catch(() => {
+          // Not reachable — try to reclaim the port.
+          server.listen(DAEMON_PORT, DAEMON_HOST);
+        });
+      return;
     }
     console.error(chalk.red('\n🛑 Node9 Daemon Error:'), e.message);
     process.exit(1);
@@ -545,6 +788,65 @@ export function startDaemon(): void {
       { mode: 0o600 }
     );
     console.log(chalk.green(`🛡️  Node9 Guard LIVE: http://127.0.0.1:${DAEMON_PORT}`));
+  });
+
+  // ── Flight Recorder — Unix socket for all tool call activity ─────────────
+  if (watchMode) {
+    console.log(chalk.cyan('🛰️  Flight Recorder active — daemon will not idle-timeout'));
+  }
+
+  // Clean up stale socket file from previous run
+  try {
+    fs.unlinkSync(ACTIVITY_SOCKET_PATH);
+  } catch {}
+
+  const ACTIVITY_MAX_BYTES = 1024 * 1024; // 1 MB guard against runaway senders
+  const unixServer = net.createServer((socket) => {
+    const chunks: Buffer<ArrayBuffer>[] = [];
+    let bytesReceived = 0;
+    socket.on('data', (chunk: Buffer<ArrayBuffer>) => {
+      bytesReceived += chunk.length;
+      if (bytesReceived > ACTIVITY_MAX_BYTES) {
+        socket.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    socket.on('end', () => {
+      try {
+        const data = JSON.parse(Buffer.concat(chunks).toString()) as {
+          id: string;
+          ts: number;
+          tool: string;
+          args?: unknown;
+          status: string;
+          label?: string;
+        };
+        if (data.status === 'pending') {
+          broadcast('activity', {
+            id: data.id,
+            ts: data.ts,
+            tool: data.tool,
+            args: redactArgs(data.args),
+            status: 'pending',
+          });
+        } else {
+          broadcast('activity-result', {
+            id: data.id,
+            status: data.status,
+            label: data.label,
+          });
+        }
+      } catch {}
+    });
+    socket.on('error', () => {});
+  });
+
+  unixServer.listen(ACTIVITY_SOCKET_PATH);
+  process.on('exit', () => {
+    try {
+      fs.unlinkSync(ACTIVITY_SOCKET_PATH);
+    } catch {}
   });
 }
 
@@ -564,13 +866,25 @@ export function stopDaemon(): void {
 }
 
 export function daemonStatus(): void {
-  if (!fs.existsSync(DAEMON_PID_FILE))
-    return console.log(chalk.yellow('Node9 daemon: not running'));
-  try {
-    const { pid } = JSON.parse(fs.readFileSync(DAEMON_PID_FILE, 'utf-8'));
-    process.kill(pid, 0);
-    console.log(chalk.green('Node9 daemon: running'));
-  } catch {
-    console.log(chalk.yellow('Node9 daemon: not running (stale PID)'));
+  if (fs.existsSync(DAEMON_PID_FILE)) {
+    try {
+      const { pid } = JSON.parse(fs.readFileSync(DAEMON_PID_FILE, 'utf-8'));
+      process.kill(pid, 0);
+      console.log(chalk.green('Node9 daemon: running'));
+      return;
+    } catch {
+      console.log(chalk.yellow('Node9 daemon: not running (stale PID)'));
+      return;
+    }
+  }
+  // No PID file — check if port is actually in use (orphaned daemon)
+  const r = spawnSync('ss', ['-Htnp', `sport = :${DAEMON_PORT}`], {
+    encoding: 'utf8',
+    timeout: 500,
+  });
+  if (r.status === 0 && (r.stdout ?? '').includes(`:${DAEMON_PORT}`)) {
+    console.log(chalk.yellow('Node9 daemon: running (no PID file — orphaned)'));
+  } else {
+    console.log(chalk.yellow('Node9 daemon: not running'));
   }
 }
