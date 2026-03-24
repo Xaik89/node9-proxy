@@ -83,10 +83,20 @@ export function scanFilePath(filePath: string, cwd = process.cwd()): DlpMatch | 
   let resolved: string;
   try {
     const absolute = path.resolve(cwd, filePath);
-    // Resolve symlinks only if the file already exists (Write to new files falls back to resolved absolute path)
+    // Resolve symlinks only if the file already exists (Write to new files uses resolved absolute path)
     resolved = fs.existsSync(absolute) ? fs.realpathSync.native(absolute) : absolute;
   } catch {
-    resolved = path.resolve(cwd, filePath);
+    // Fail-closed: realpathSync.native threw — most likely a TOCTOU race where
+    // the file existed at existsSync time but was deleted before native() ran.
+    // A safe-looking symlink pointing to a sensitive file could exploit the
+    // fallback window, so we block immediately rather than falling back to the
+    // unresolved path.
+    return {
+      patternName: 'Sensitive File Path',
+      fieldPath: 'file_path',
+      redactedSample: filePath,
+      severity: 'block',
+    };
   }
 
   // Normalise to forward slashes for cross-platform pattern matching

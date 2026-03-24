@@ -1297,6 +1297,14 @@ describe('validateRegex', () => {
     expect(validateRegex('(\\.\\w+)?')).toBeNull();
   });
 
+  it('rejects quantified backreferences — catastrophic backtracking risk', () => {
+    // (\w+)\1+ can catastrophically backtrack on strings like 'aaaaaaaaab'
+    // The guard checks for \<digit>[*+{] in the pattern
+    expect(validateRegex('(\\w+)\\1+')).not.toBeNull();
+    expect(validateRegex('(\\w+)\\1*')).not.toBeNull();
+    expect(validateRegex('(\\w+)\\1{2,}')).not.toBeNull();
+  });
+
   it('rejects invalid regex syntax', () => {
     expect(validateRegex('[unclosed')).not.toBeNull();
   });
@@ -1329,6 +1337,20 @@ describe('getCompiledRegex', () => {
     const re1 = getCompiledRegex('hello', '');
     const re2 = getCompiledRegex('hello', 'i');
     expect(re1).not.toBe(re2);
+  });
+
+  it('cache key uses null-byte separator — no collision between pattern and flags', () => {
+    // Key format: `${pattern}\0${flags}`. Flags are always [gimsuy] so they
+    // can't contain \0. Verify that a pattern ending in 'i' with no flags
+    // does NOT collide with the same prefix with flag 'i'.
+    // pattern='foo\0' flags='' → key 'foo\0\0'
+    // pattern='foo'   flags='' → key 'foo\0'  (different length → no collision)
+    const reSuffix = getCompiledRegex('collision-test-i', '');
+    const reFlag = getCompiledRegex('collision-test-', 'i');
+    expect(reSuffix).not.toBe(reFlag); // distinct entries, not a cache collision
+    // Both should compile successfully
+    expect(reSuffix).toBeInstanceOf(RegExp);
+    expect(reFlag).toBeInstanceOf(RegExp);
   });
 
   it('handles 520 distinct patterns without error (LRU stays bounded)', () => {

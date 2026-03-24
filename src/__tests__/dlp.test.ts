@@ -299,28 +299,36 @@ describe('scanFilePath — sensitive path blocking', () => {
     expect(scanFilePath('/project/link-to-app', '/project')).toBeNull();
   });
 
-  it('does not throw when realpathSync.native throws (TOCTOU race — file deleted between existsSync and native)', () => {
-    // existsSync returns true (file existed at check time), but .native throws
-    // because the file was deleted in the race window — a real TOCTOU scenario.
+  it('is fail-closed when realpathSync.native throws (TOCTOU race)', () => {
+    // existsSync returns true, but .native throws — classic TOCTOU: file deleted
+    // between the existsSync check and the native() call.
+    // Fail-closed: block immediately rather than falling back to the unresolved
+    // path, which could be a safe-looking symlink pointing to a sensitive file.
     vi.mocked(fs.existsSync).mockReturnValue(true);
     (fs.realpathSync as RealpathWithNative).native = vi.fn().mockImplementation(() => {
       throw new Error('ENOENT: no such file or directory');
     });
 
-    // Must not throw — the catch block in production falls back to path.resolve
+    // Must not throw
     expect(() => scanFilePath('/project/src/app.ts', '/project')).not.toThrow();
+    // Must block — fail-closed regardless of how safe the nominal path looks
+    const match = scanFilePath('/project/src/app.ts', '/project');
+    expect(match).not.toBeNull();
+    expect(match!.severity).toBe('block');
   });
 
-  it('falls back to original path when native throws, still blocks if original path is sensitive', () => {
+  it('blocks (fail-closed) on TOCTOU even when nominal path looks completely safe', () => {
+    // This is the specific attack the reviewer identified:
+    // /project/harmless-config.ts is a symlink to /home/user/.ssh/id_rsa
+    // existsSync → true, .native throws (file deleted after check)
+    // Without fail-closed, path.resolve('/project/harmless-config.ts') passes all patterns
     vi.mocked(fs.existsSync).mockReturnValue(true);
     (fs.realpathSync as RealpathWithNative).native = vi.fn().mockImplementation(() => {
       throw new Error('ENOENT');
     });
 
-    // Even with the TOCTOU fallback, the original sensitive path is still blocked
-    // because path.resolve('/home/user/.ssh/id_rsa') is also sensitive
-    const match = scanFilePath('/home/user/.ssh/id_rsa', '/home/user');
-    expect(match).not.toBeNull();
+    const match = scanFilePath('/project/harmless-config.ts', '/project');
+    expect(match).not.toBeNull(); // fail-closed: block on any native() throw
     expect(match!.severity).toBe('block');
   });
 });
