@@ -41,7 +41,7 @@ import {
   clearShieldOverride,
   resolveShieldName,
   resolveShieldRule,
-  type ShieldVerdict,
+  isShieldVerdict,
 } from './shields';
 import { confirm } from '@inquirer/prompts';
 
@@ -1755,7 +1755,7 @@ shieldCmd
       console.error(`  ${chalk.cyan(`node9 shield enable ${name}`)}\n`);
       process.exit(1);
     }
-    if (verdict !== 'block' && verdict !== 'review' && verdict !== 'allow') {
+    if (!isShieldVerdict(verdict)) {
       console.error(chalk.red(`\n❌ Invalid verdict "${verdict}". Use: block, review, or allow\n`));
       process.exit(1);
     }
@@ -1781,7 +1781,7 @@ shieldCmd
       console.error('');
       process.exit(1);
     }
-    writeShieldOverride(name, ruleName, verdict as ShieldVerdict);
+    writeShieldOverride(name, ruleName, verdict);
     const shortName = ruleName.replace(`shield:${name}:`, '');
     const verdictLabel =
       verdict === 'block'

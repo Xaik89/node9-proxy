@@ -15,6 +15,7 @@ import {
   readShieldOverrides,
   writeShieldOverride,
   clearShieldOverride,
+  isShieldVerdict,
 } from '../shields.js';
 import { DEFAULT_CONFIG } from '../core.js';
 
@@ -232,9 +233,8 @@ describe('shield overrides', () => {
   it('clearShieldOverride is a no-op when the rule has no existing override', () => {
     readFileSyncSpy.mockReturnValueOnce(JSON.stringify({ active: ['postgres'] }));
     clearShieldOverride('postgres', 'shield:postgres:block-drop-table');
-    const written = writeFileSyncSpy.mock.calls[0][1] as string;
-    const parsed = JSON.parse(written);
-    expect(parsed.overrides).toBeUndefined();
+    // True no-op: nothing should be written to disk when there was nothing to clear
+    expect(writeFileSyncSpy).not.toHaveBeenCalled();
   });
 
   it('clearShieldOverride removes overrides key entirely when last override cleared', () => {
@@ -248,6 +248,62 @@ describe('shield overrides', () => {
     const written = writeFileSyncSpy.mock.calls[0][1] as string;
     const parsed = JSON.parse(written);
     expect(parsed.overrides).toBeUndefined();
+  });
+});
+
+// ── isShieldVerdict ───────────────────────────────────────────────────────────
+describe('isShieldVerdict', () => {
+  it('returns true for valid verdicts', () => {
+    expect(isShieldVerdict('allow')).toBe(true);
+    expect(isShieldVerdict('review')).toBe(true);
+    expect(isShieldVerdict('block')).toBe(true);
+  });
+
+  it('returns false for invalid strings', () => {
+    expect(isShieldVerdict('explode')).toBe(false);
+    expect(isShieldVerdict('ALLOW')).toBe(false);
+    expect(isShieldVerdict('')).toBe(false);
+    expect(isShieldVerdict(null)).toBe(false);
+    expect(isShieldVerdict(undefined)).toBe(false);
+    expect(isShieldVerdict(42)).toBe(false);
+  });
+});
+
+// ── readShieldOverrides: schema validation (tampered disk content) ─────────────
+describe('readShieldOverrides schema validation', () => {
+  it('drops entries with invalid verdict values from disk', () => {
+    readFileSyncSpy.mockReturnValueOnce(
+      JSON.stringify({
+        active: ['postgres'],
+        overrides: {
+          postgres: {
+            'shield:postgres:block-drop-table': 'explode', // invalid
+            'shield:postgres:block-truncate': 'review', // valid
+          },
+        },
+      })
+    );
+    const overrides = readShieldOverrides();
+    expect(overrides.postgres['shield:postgres:block-drop-table']).toBeUndefined();
+    expect(overrides.postgres['shield:postgres:block-truncate']).toBe('review');
+  });
+
+  it('returns empty object when overrides field is not an object', () => {
+    readFileSyncSpy.mockReturnValueOnce(
+      JSON.stringify({ active: ['postgres'], overrides: 'not-an-object' })
+    );
+    expect(readShieldOverrides()).toEqual({});
+  });
+
+  it('drops entire shield entry when all verdicts are invalid', () => {
+    readFileSyncSpy.mockReturnValueOnce(
+      JSON.stringify({
+        active: ['postgres'],
+        overrides: { postgres: { 'shield:postgres:block-drop-table': 'bad' } },
+      })
+    );
+    const overrides = readShieldOverrides();
+    expect(overrides.postgres).toBeUndefined();
   });
 });
 

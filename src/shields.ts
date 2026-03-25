@@ -210,6 +210,30 @@ export type ShieldVerdict = 'allow' | 'review' | 'block';
 // overrides: { shieldName: { fullRuleName: verdict } }
 export type ShieldOverrides = Record<string, Record<string, ShieldVerdict>>;
 
+export function isShieldVerdict(v: unknown): v is ShieldVerdict {
+  return v === 'allow' || v === 'review' || v === 'block';
+}
+
+/**
+ * Validates and filters an overrides object read from disk.
+ * Entries with invalid (non-ShieldVerdict) values are silently dropped
+ * to prevent tampered disk content from propagating arbitrary strings
+ * into the policy engine.
+ */
+function validateOverrides(raw: unknown): ShieldOverrides {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const result: ShieldOverrides = {};
+  for (const [shieldName, rules] of Object.entries(raw as Record<string, unknown>)) {
+    if (!rules || typeof rules !== 'object' || Array.isArray(rules)) continue;
+    const validRules: Record<string, ShieldVerdict> = {};
+    for (const [ruleName, verdict] of Object.entries(rules as Record<string, unknown>)) {
+      if (isShieldVerdict(verdict)) validRules[ruleName] = verdict;
+    }
+    if (Object.keys(validRules).length > 0) result[shieldName] = validRules;
+  }
+  return result;
+}
+
 interface ShieldsFile {
   active: string[];
   overrides?: ShieldOverrides;
@@ -225,7 +249,7 @@ function readShieldsFile(): ShieldsFile {
           (e): e is string => typeof e === 'string' && e.length > 0 && e in SHIELDS
         )
       : [];
-    return { active, overrides: parsed.overrides };
+    return { active, overrides: validateOverrides(parsed.overrides) };
   } catch (err: unknown) {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
       process.stderr.write(`[node9] Warning: could not read shields state: ${String(err)}\n`);
@@ -270,15 +294,15 @@ export function writeShieldOverride(
 
 export function clearShieldOverride(shieldName: string, ruleName: string): void {
   const current = readShieldsFile();
-  const overrides = { ...(current.overrides ?? {}) };
-  if (overrides[shieldName]) {
-    const updated = { ...overrides[shieldName] };
-    delete updated[ruleName];
-    if (Object.keys(updated).length === 0) {
-      delete overrides[shieldName];
-    } else {
-      overrides[shieldName] = updated;
-    }
+  // True no-op: don't touch disk if the override doesn't exist
+  if (!current.overrides?.[shieldName]?.[ruleName]) return;
+  const overrides = { ...current.overrides };
+  const updated = { ...overrides[shieldName] };
+  delete updated[ruleName];
+  if (Object.keys(updated).length === 0) {
+    delete overrides[shieldName];
+  } else {
+    overrides[shieldName] = updated;
   }
   writeShieldsFile({ ...current, overrides });
 }
@@ -299,6 +323,9 @@ export function resolveShieldRule(shieldName: string, identifier: string): strin
     if (rule.name === id) return rule.name;
     const withoutShieldPrefix = rule.name.replace(`shield:${shieldName}:`, '');
     if (withoutShieldPrefix === id) return rule.name;
+    // NOTE: operation-suffix matching returns the first rule whose suffix matches.
+    // If two rules in the same shield ever share a suffix (e.g. block-drop and review-drop),
+    // the first entry wins silently. Keep rule names unambiguous within each shield.
     const operation = withoutShieldPrefix.replace(/^(block|review|allow)-/, '');
     if (operation === id) return rule.name;
   }

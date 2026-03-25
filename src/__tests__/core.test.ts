@@ -979,6 +979,21 @@ describe('Safe by Default — advisory SQL rules', () => {
     expect(result.decision).toBe('block');
     expect(result.ruleName).toBe('shield:postgres:block-truncate');
   });
+
+  it('shield verdict override allow → authorizeHeadless approves without race engine', async () => {
+    // Verify that a block rule overridden to allow passes cleanly through the
+    // headless path — not just evaluatePolicy — so the shield doesn't silently
+    // re-block it at a higher stack level.
+    mockNoNativeConfig(); // sets mode: 'standard' so evaluatePolicy result drives the decision
+    vi.spyOn(shieldsModule, 'readActiveShields').mockReturnValue(['postgres']);
+    vi.spyOn(shieldsModule, 'readShieldOverrides').mockReturnValue({
+      postgres: { 'shield:postgres:block-drop-table': 'allow' },
+    });
+    _resetConfigCache();
+    const result = await authorizeHeadless('mcp__postgres__query', { sql: 'DROP TABLE users' });
+    expect(result.approved).toBe(true);
+    expect(result.checkedBy).toBe('local-policy');
+  });
 });
 
 // ── authorizeHeadless — smart rule hard block ─────────────────────────────────
