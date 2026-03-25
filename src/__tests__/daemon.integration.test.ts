@@ -139,7 +139,7 @@ describe('daemon /events — shields-status emitted on connect', () => {
 
   beforeAll(async () => {
     portWasFree = await isPortFree(DAEMON_PORT);
-    if (!portWasFree) return; // skip setup — tests will self-skip via it.skipIf
+    if (!portWasFree) return; // skip setup — tests will self-skip via ctx.skip()
 
     tmpHome = makeTempHome();
     fs.writeFileSync(
@@ -147,22 +147,29 @@ describe('daemon /events — shields-status emitted on connect', () => {
       JSON.stringify({ active: ['filesystem'] })
     );
 
-    daemonProc = spawn(process.execPath, [CLI, 'daemon', 'start'], {
-      env: { ...process.env, HOME: tmpHome, NODE9_TESTING: '1' },
-      stdio: 'pipe',
-    });
+    try {
+      daemonProc = spawn(process.execPath, [CLI, 'daemon', 'start'], {
+        env: { ...process.env, HOME: tmpHome, NODE9_TESTING: '1' },
+        stdio: 'pipe',
+      });
 
-    const ready = await waitForDaemon(6000);
-    if (!ready) {
-      daemonProc.kill();
-      throw new Error('Daemon did not start within 6s');
+      const ready = await waitForDaemon(6000);
+      if (!ready) {
+        daemonProc.kill();
+        throw new Error('Daemon did not start within 6s');
+      }
+
+      // Capture the initial SSE burst once — shared by all three tests below.
+      // 3000ms gives slow CI enough headroom; the daemon flushes the initial
+      // events synchronously so in practice this completes in <100ms.
+      const raw = await readSseStream(3000);
+      sseSnapshot = parseSseEvents(raw);
+    } catch (err) {
+      // Ensure tmpHome is always cleaned up even if daemon startup throws,
+      // so temp directories don't accumulate on CI on repeated failures.
+      if (tmpHome) cleanupDir(tmpHome);
+      throw err;
     }
-
-    // Capture the initial SSE burst once — shared by all three tests below.
-    // 3000ms gives slow CI enough headroom; the daemon flushes the initial
-    // events synchronously so in practice this completes in <100ms.
-    const raw = await readSseStream(3000);
-    sseSnapshot = parseSseEvents(raw);
   });
 
   afterAll(() => {

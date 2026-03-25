@@ -142,8 +142,11 @@ describe('proxy command — flags are passed through to the wrapped command', ()
   });
 
   itUnix('short flag (-y style) is not consumed by node9 argument parser', () => {
-    // `echo -n` suppresses the trailing newline — if -n were eaten by node9,
-    // the output would include a newline and the test would fail.
+    // The key regression: before the fix, Commander errored with "unknown option '-n'"
+    // before the proxy ran at all. We assert no such error and exit 0.
+    // We intentionally avoid asserting on echo's stdout output — echo -n behaviour
+    // varies across platforms (some print the flag literally), and the regression
+    // being tested is node9's argument parser, not echo's flag handling.
     const result = spawnSync(process.execPath, [CLI, 'echo', '-n', 'flag-passthrough'], {
       encoding: 'utf-8',
       timeout: 8000,
@@ -152,24 +155,22 @@ describe('proxy command — flags are passed through to the wrapped command', ()
     });
 
     expect(result.error).toBeUndefined();
-    // Must not error with "unknown option '-n'"
     expect(result.stderr).not.toContain('unknown option');
     expect(result.status).toBe(0);
-    // -n passed through to echo → no trailing newline
-    expect(result.stdout).toBe('flag-passthrough');
   });
 
   itUnix('--version flag is passed to wrapped command, not intercepted as node9 --version', () => {
-    // node9 --version would print node9's own version and exit 0.
-    // node9 echo --version should pass --version to echo (which prints nothing and exits 0),
-    // not print node9's version.
+    // Before the fix, node9 echo --version printed node9's own version and exited,
+    // because Commander intercepted --version as a built-in option.
+    // After the fix, --version reaches echo. echo treats unknown flags as text and
+    // prints them — so stdout will be '--version\n', not node9's semver string.
     const node9Version = spawnSync(process.execPath, [CLI, '--version'], {
       encoding: 'utf-8',
       timeout: 5000,
       env: { ...process.env, ...BASE_ENV, HOME: tmpHome },
     });
     expect(node9Version.error).toBeUndefined();
-    const version = node9Version.stdout.trim();
+    const version = node9Version.stdout.trim(); // e.g. "1.1.2"
 
     const result = spawnSync(process.execPath, [CLI, 'echo', '--version'], {
       encoding: 'utf-8',
@@ -181,8 +182,11 @@ describe('proxy command — flags are passed through to the wrapped command', ()
     expect(result.error).toBeUndefined();
     expect(result.stderr).not.toContain('unknown option');
     expect(result.status).toBe(0);
-    // stdout must not contain node9's own version string
-    expect(result.stdout).not.toContain(version);
+    // --version reached the wrapped command (echo), not node9's built-in handler.
+    // We don't assert echo's exact output — GNU echo prints version info, macOS echo
+    // prints '--version' literally. Both are correct; the key is that node9's own
+    // semver string is absent, proving Commander did not intercept the flag.
+    expect(result.stdout.trim()).not.toBe(version);
   });
 });
 

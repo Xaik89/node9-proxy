@@ -1730,28 +1730,12 @@ process.on('unhandledRejection', (reason) => {
 // command so Commander stops parsing options and passes everything — including
 // flags like -y, --config, --nexus-url — through to the action handler intact.
 // Without this, Commander errors on unknown flags before the handler ever runs.
-const KNOWN_SUBCOMMANDS = new Set([
-  'login',
-  'addto',
-  'setup',
-  'removefrom',
-  'uninstall',
-  'doctor',
-  'explain',
-  'init',
-  'audit',
-  'status',
-  'daemon',
-  'tail',
-  'check',
-  'log',
-  'pause',
-  'resume',
-  'undo',
-  'shield',
-]);
+//
+// Derived from registered commands at runtime so it stays in sync automatically
+// when new subcommands are added — no hand-maintained allowlist to forget to update.
+const knownSubcommands = new Set(program.commands.map((c) => c.name()));
 const firstArg = process.argv[2];
-if (firstArg && !firstArg.startsWith('-') && !KNOWN_SUBCOMMANDS.has(firstArg)) {
+if (firstArg && !firstArg.startsWith('-') && !knownSubcommands.has(firstArg)) {
   process.argv.splice(2, 0, '--');
 }
 
