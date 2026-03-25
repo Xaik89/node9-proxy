@@ -938,6 +938,29 @@ describe('Safe by Default — advisory SQL rules', () => {
     expect(result.decision).toBe('block');
     expect(result.ruleName).toBe('shield:postgres:block-drop-column');
   });
+
+  it('shield verdict override downgrades block → review', async () => {
+    vi.spyOn(shieldsModule, 'readActiveShields').mockReturnValue(['postgres']);
+    vi.spyOn(shieldsModule, 'readShieldOverrides').mockReturnValue({
+      postgres: { 'shield:postgres:block-drop-table': 'review' },
+    });
+    _resetConfigCache();
+    const result = await evaluatePolicy('mcp__postgres__query', { sql: 'DROP TABLE users' });
+    expect(result.decision).toBe('review');
+    expect(result.ruleName).toBe('shield:postgres:block-drop-table');
+  });
+
+  it('shield verdict override does not affect other rules in the same shield', async () => {
+    vi.spyOn(shieldsModule, 'readActiveShields').mockReturnValue(['postgres']);
+    vi.spyOn(shieldsModule, 'readShieldOverrides').mockReturnValue({
+      postgres: { 'shield:postgres:block-drop-table': 'review' },
+    });
+    _resetConfigCache();
+    // TRUNCATE has no override — should still block
+    const result = await evaluatePolicy('mcp__postgres__query', { sql: 'TRUNCATE TABLE events' });
+    expect(result.decision).toBe('block');
+    expect(result.ruleName).toBe('shield:postgres:block-truncate');
+  });
 });
 
 // ── authorizeHeadless — smart rule hard block ─────────────────────────────────

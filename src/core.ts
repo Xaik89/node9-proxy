@@ -13,7 +13,7 @@ import { parse } from 'sh-syntax';
 import { askNativePopup, sendDesktopNotification } from './ui/native';
 import { computeRiskMetadata, RiskMetadata } from './context-sniper';
 import { sanitizeConfig } from './config-schema';
-import { readActiveShields, getShield } from './shields';
+import { readActiveShields, readShieldOverrides, getShield } from './shields';
 import { scanArgs, scanFilePath, type DlpMatch } from './dlp';
 
 // ── Feature file paths ────────────────────────────────────────────────────────
@@ -2265,14 +2265,22 @@ export function getConfig(cwd?: string): Config {
   // Shields are applied after user config so they cannot be overridden locally.
   // Rules are sourced from the in-memory catalog, not from config.json — so
   // enabling a shield never mutates the user's config file.
+  // Per-rule verdict overrides (from `node9 shield set`) are applied here.
+  const shieldOverrides = readShieldOverrides();
   for (const shieldName of readActiveShields()) {
     const shield = getShield(shieldName);
     if (!shield) continue;
     // Deduplicate smartRules by name — prevents duplicates if the user also
     // has the same rule name in their config (shouldn't happen, but be safe).
     const existingRuleNames = new Set(mergedPolicy.smartRules.map((r) => r.name));
+    const ruleOverrides = shieldOverrides[shieldName] ?? {};
     for (const rule of shield.smartRules) {
-      if (!existingRuleNames.has(rule.name)) mergedPolicy.smartRules.push(rule);
+      if (!existingRuleNames.has(rule.name)) {
+        const overrideVerdict = rule.name ? ruleOverrides[rule.name] : undefined;
+        mergedPolicy.smartRules.push(
+          overrideVerdict !== undefined ? { ...rule, verdict: overrideVerdict } : rule
+        );
+      }
     }
     const existingWords = new Set(mergedPolicy.dangerousWords);
     for (const word of shield.dangerousWords) {

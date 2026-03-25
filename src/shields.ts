@@ -202,35 +202,105 @@ export function listShields(): ShieldDefinition[] {
   return Object.values(SHIELDS);
 }
 
-// --- Shield state (which shields are active) ---
+// --- Shield state (active shields + per-rule verdict overrides) ---
 
 const SHIELDS_STATE_FILE = path.join(os.homedir(), '.node9', 'shields.json');
 
-export function readActiveShields(): string[] {
+export type ShieldVerdict = 'allow' | 'review' | 'block';
+// overrides: { shieldName: { fullRuleName: verdict } }
+export type ShieldOverrides = Record<string, Record<string, ShieldVerdict>>;
+
+interface ShieldsFile {
+  active: string[];
+  overrides?: ShieldOverrides;
+}
+
+function readShieldsFile(): ShieldsFile {
   try {
     const raw = fs.readFileSync(SHIELDS_STATE_FILE, 'utf-8');
-    if (!raw.trim()) return []; // empty file — treat same as missing
-    const parsed = JSON.parse(raw) as { active?: unknown };
-    if (Array.isArray(parsed.active)) {
-      // Validate each element is a non-empty string that refers to a known shield
-      return parsed.active.filter(
-        (e): e is string => typeof e === 'string' && e.length > 0 && e in SHIELDS
-      );
-    }
+    if (!raw.trim()) return { active: [] };
+    const parsed = JSON.parse(raw) as Partial<ShieldsFile>;
+    const active = Array.isArray(parsed.active)
+      ? parsed.active.filter(
+          (e): e is string => typeof e === 'string' && e.length > 0 && e in SHIELDS
+        )
+      : [];
+    return { active, overrides: parsed.overrides };
   } catch (err: unknown) {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-      // Unexpected error (permissions, parse failure) — log but don't crash
       process.stderr.write(`[node9] Warning: could not read shields state: ${String(err)}\n`);
     }
+    return { active: [] };
   }
-  return [];
+}
+
+function writeShieldsFile(data: ShieldsFile): void {
+  fs.mkdirSync(path.dirname(SHIELDS_STATE_FILE), { recursive: true });
+  const tmp = `${SHIELDS_STATE_FILE}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+  // Omit overrides key if empty — keeps the file clean for users who never use overrides
+  const toWrite: ShieldsFile = { active: data.active };
+  if (data.overrides && Object.keys(data.overrides).length > 0) toWrite.overrides = data.overrides;
+  fs.writeFileSync(tmp, JSON.stringify(toWrite, null, 2), { mode: 0o600 });
+  fs.renameSync(tmp, SHIELDS_STATE_FILE);
+}
+
+export function readActiveShields(): string[] {
+  return readShieldsFile().active;
 }
 
 export function writeActiveShields(active: string[]): void {
-  // mkdirSync is idempotent with recursive:true — avoids existsSync TOCTOU window
-  fs.mkdirSync(path.dirname(SHIELDS_STATE_FILE), { recursive: true });
-  // Use random suffix to avoid pid collision on concurrent invocations
-  const tmp = `${SHIELDS_STATE_FILE}.${crypto.randomBytes(6).toString('hex')}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify({ active }, null, 2), { mode: 0o600 });
-  fs.renameSync(tmp, SHIELDS_STATE_FILE);
+  const current = readShieldsFile();
+  writeShieldsFile({ ...current, active });
+}
+
+export function readShieldOverrides(): ShieldOverrides {
+  return readShieldsFile().overrides ?? {};
+}
+
+export function writeShieldOverride(
+  shieldName: string,
+  ruleName: string,
+  verdict: ShieldVerdict
+): void {
+  const current = readShieldsFile();
+  const overrides = { ...(current.overrides ?? {}) };
+  overrides[shieldName] = { ...(overrides[shieldName] ?? {}), [ruleName]: verdict };
+  writeShieldsFile({ ...current, overrides });
+}
+
+export function clearShieldOverride(shieldName: string, ruleName: string): void {
+  const current = readShieldsFile();
+  const overrides = { ...(current.overrides ?? {}) };
+  if (overrides[shieldName]) {
+    const updated = { ...overrides[shieldName] };
+    delete updated[ruleName];
+    if (Object.keys(updated).length === 0) {
+      delete overrides[shieldName];
+    } else {
+      overrides[shieldName] = updated;
+    }
+  }
+  writeShieldsFile({ ...current, overrides });
+}
+
+/**
+ * Resolves a short rule identifier to the full rule name within a shield.
+ * Accepts three forms (case-insensitive):
+ *   - Full name:            "shield:postgres:block-drop-table"
+ *   - Without shield prefix: "block-drop-table"
+ *   - Operation only:       "drop-table"
+ */
+export function resolveShieldRule(shieldName: string, identifier: string): string | null {
+  const shield = SHIELDS[shieldName];
+  if (!shield) return null;
+  const id = identifier.toLowerCase();
+  for (const rule of shield.smartRules) {
+    if (!rule.name) continue;
+    if (rule.name === id) return rule.name;
+    const withoutShieldPrefix = rule.name.replace(`shield:${shieldName}:`, '');
+    if (withoutShieldPrefix === id) return rule.name;
+    const operation = withoutShieldPrefix.replace(/^(block|review|allow)-/, '');
+    if (operation === id) return rule.name;
+  }
+  return null;
 }

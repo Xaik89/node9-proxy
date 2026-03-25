@@ -8,9 +8,13 @@ import {
   SHIELDS,
   getShield,
   resolveShieldName,
+  resolveShieldRule,
   listShields,
   readActiveShields,
   writeActiveShields,
+  readShieldOverrides,
+  writeShieldOverride,
+  clearShieldOverride,
 } from '../shields.js';
 import { DEFAULT_CONFIG } from '../core.js';
 
@@ -126,6 +130,116 @@ describe('writeActiveShields', () => {
     const written = writeFileSyncSpy.mock.calls[0][1] as string;
     expect(JSON.parse(written)).toEqual({ active: ['postgres', 'github'] });
     expect(renameSyncSpy).toHaveBeenCalledOnce();
+  });
+
+  it('preserves existing overrides when updating active list', () => {
+    // Simulate file already having an override
+    readFileSyncSpy.mockReturnValueOnce(
+      JSON.stringify({
+        active: ['postgres'],
+        overrides: { postgres: { 'shield:postgres:block-drop-table': 'review' } },
+      })
+    );
+    writeActiveShields(['postgres', 'github']);
+    const written = writeFileSyncSpy.mock.calls[0][1] as string;
+    const parsed = JSON.parse(written);
+    expect(parsed.active).toEqual(['postgres', 'github']);
+    expect(parsed.overrides.postgres['shield:postgres:block-drop-table']).toBe('review');
+  });
+});
+
+// ── resolveShieldRule ──────────────────────────────────────────────────────────
+describe('resolveShieldRule', () => {
+  it('resolves by full rule name', () => {
+    expect(resolveShieldRule('postgres', 'shield:postgres:block-drop-table')).toBe(
+      'shield:postgres:block-drop-table'
+    );
+  });
+
+  it('resolves by name without shield prefix', () => {
+    expect(resolveShieldRule('postgres', 'block-drop-table')).toBe(
+      'shield:postgres:block-drop-table'
+    );
+  });
+
+  it('resolves by operation name (strips verdict prefix)', () => {
+    expect(resolveShieldRule('postgres', 'drop-table')).toBe('shield:postgres:block-drop-table');
+    expect(resolveShieldRule('postgres', 'truncate')).toBe('shield:postgres:block-truncate');
+    expect(resolveShieldRule('postgres', 'grant-revoke')).toBe(
+      'shield:postgres:review-grant-revoke'
+    );
+  });
+
+  it('is case-insensitive', () => {
+    expect(resolveShieldRule('postgres', 'DROP-TABLE')).toBe('shield:postgres:block-drop-table');
+  });
+
+  it('returns null for unknown rule', () => {
+    expect(resolveShieldRule('postgres', 'unknown-rule')).toBeNull();
+  });
+
+  it('returns null for unknown shield', () => {
+    expect(resolveShieldRule('mysql', 'drop-table')).toBeNull();
+  });
+});
+
+// ── writeShieldOverride / readShieldOverrides / clearShieldOverride ───────────
+describe('shield overrides', () => {
+  it('writeShieldOverride stores override in shields.json', () => {
+    readFileSyncSpy.mockReturnValueOnce(JSON.stringify({ active: ['postgres'] }));
+    writeShieldOverride('postgres', 'shield:postgres:block-drop-table', 'review');
+    const written = writeFileSyncSpy.mock.calls[0][1] as string;
+    const parsed = JSON.parse(written);
+    expect(parsed.overrides.postgres['shield:postgres:block-drop-table']).toBe('review');
+  });
+
+  it('readShieldOverrides returns empty object when no overrides', () => {
+    readFileSyncSpy.mockReturnValueOnce(JSON.stringify({ active: ['postgres'] }));
+    expect(readShieldOverrides()).toEqual({});
+  });
+
+  it('readShieldOverrides returns stored overrides', () => {
+    readFileSyncSpy.mockReturnValue(
+      JSON.stringify({
+        active: ['postgres'],
+        overrides: { postgres: { 'shield:postgres:block-drop-table': 'review' } },
+      })
+    );
+    expect(readShieldOverrides()).toEqual({
+      postgres: { 'shield:postgres:block-drop-table': 'review' },
+    });
+  });
+
+  it('clearShieldOverride removes the specific override', () => {
+    readFileSyncSpy.mockReturnValueOnce(
+      JSON.stringify({
+        active: ['postgres'],
+        overrides: {
+          postgres: {
+            'shield:postgres:block-drop-table': 'review',
+            'shield:postgres:block-truncate': 'review',
+          },
+        },
+      })
+    );
+    clearShieldOverride('postgres', 'shield:postgres:block-drop-table');
+    const written = writeFileSyncSpy.mock.calls[0][1] as string;
+    const parsed = JSON.parse(written);
+    expect(parsed.overrides.postgres['shield:postgres:block-drop-table']).toBeUndefined();
+    expect(parsed.overrides.postgres['shield:postgres:block-truncate']).toBe('review');
+  });
+
+  it('clearShieldOverride removes overrides key entirely when last override cleared', () => {
+    readFileSyncSpy.mockReturnValueOnce(
+      JSON.stringify({
+        active: ['postgres'],
+        overrides: { postgres: { 'shield:postgres:block-drop-table': 'review' } },
+      })
+    );
+    clearShieldOverride('postgres', 'shield:postgres:block-drop-table');
+    const written = writeFileSyncSpy.mock.calls[0][1] as string;
+    const parsed = JSON.parse(written);
+    expect(parsed.overrides).toBeUndefined();
   });
 });
 

@@ -36,7 +36,12 @@ import {
   listShields,
   readActiveShields,
   writeActiveShields,
+  readShieldOverrides,
+  writeShieldOverride,
+  clearShieldOverride,
   resolveShieldName,
+  resolveShieldRule,
+  type ShieldVerdict,
 } from './shields';
 import { confirm } from '@inquirer/prompts';
 
@@ -1688,26 +1693,212 @@ shieldCmd
 
 shieldCmd
   .command('status')
-  .description('Show which shields are currently active')
+  .description('Show active shields and their individual rules with verdicts')
   .action(() => {
     const active = readActiveShields();
     if (active.length === 0) {
-      console.log(chalk.yellow('\nℹ️  No shields are active.\n'));
-      console.log(`Run ${chalk.cyan('node9 shield list')} to see available shields.\n`);
+      console.error(chalk.yellow('\nℹ️  No shields are active.\n'));
+      console.error(`Run ${chalk.cyan('node9 shield list')} to see available shields.\n`);
       return;
     }
-    console.log(chalk.bold('\n🛡️  Active Shields\n'));
+    const overrides = readShieldOverrides();
+    console.error(chalk.bold('\n🛡️  Active Shields\n'));
     for (const name of active) {
       const shield = getShield(name);
       if (!shield) continue;
-      console.log(`  ${chalk.green('●')} ${chalk.cyan(name)}`);
-      console.log(
+      console.error(`  ${chalk.green('●')} ${chalk.cyan(name)} — ${shield.description}`);
+      const ruleOverrides = overrides[name] ?? {};
+      for (const rule of shield.smartRules) {
+        const shortName = rule.name ? rule.name.replace(`shield:${name}:`, '') : '(unnamed)';
+        const overrideVerdict = rule.name ? ruleOverrides[rule.name] : undefined;
+        const effectiveVerdict = overrideVerdict ?? rule.verdict;
+        const verdictLabel =
+          effectiveVerdict === 'block'
+            ? chalk.red('block ')
+            : effectiveVerdict === 'review'
+              ? chalk.yellow('review')
+              : chalk.green('allow ');
+        const overrideNote = overrideVerdict
+          ? chalk.gray(` ← overridden (was: ${rule.verdict})`)
+          : '';
+        console.error(
+          `    ${verdictLabel}  ${shortName.padEnd(24)} ${chalk.gray(rule.reason ?? '')}${overrideNote}`
+        );
+      }
+      if (shield.dangerousWords.length > 0) {
+        console.error(chalk.gray(`    words: ${shield.dangerousWords.join(', ')}`));
+      }
+      console.error('');
+    }
+    if (Object.keys(overrides).length > 0) {
+      console.error(
         chalk.gray(
-          `    ${shield.smartRules.length} smart rules · ${shield.dangerousWords.length} dangerous words`
+          `  Tip: run ${chalk.cyan('node9 shield unset <shield> <rule>')} to remove an override.\n`
         )
       );
     }
-    console.log('');
+  });
+
+shieldCmd
+  .command('set <service> <rule> <verdict>')
+  .description('Override the verdict for a specific shield rule (block or review)')
+  .action((service: string, rule: string, verdict: string) => {
+    const name = resolveShieldName(service);
+    if (!name) {
+      console.error(chalk.red(`\n❌ Unknown shield: "${service}"\n`));
+      console.error(`Run ${chalk.cyan('node9 shield list')} to see available shields.\n`);
+      process.exit(1);
+    }
+    if (!readActiveShields().includes(name)) {
+      console.error(chalk.red(`\n❌ Shield "${name}" is not active. Enable it first:\n`));
+      console.error(`  ${chalk.cyan(`node9 shield enable ${name}`)}\n`);
+      process.exit(1);
+    }
+    if (verdict !== 'block' && verdict !== 'review' && verdict !== 'allow') {
+      console.error(chalk.red(`\n❌ Invalid verdict "${verdict}". Use: block, review, or allow\n`));
+      process.exit(1);
+    }
+    const ruleName = resolveShieldRule(name, rule);
+    if (!ruleName) {
+      const shield = getShield(name)!;
+      console.error(chalk.red(`\n❌ Unknown rule "${rule}" for shield "${name}".\n`));
+      console.error('  Available rules:');
+      for (const r of shield.smartRules) {
+        const short = r.name ? r.name.replace(`shield:${name}:`, '') : '';
+        console.error(`    ${chalk.cyan(short)}`);
+      }
+      console.error('');
+      process.exit(1);
+    }
+    writeShieldOverride(name, ruleName, verdict as ShieldVerdict);
+    const shortName = ruleName.replace(`shield:${name}:`, '');
+    const verdictLabel =
+      verdict === 'block'
+        ? chalk.red('block')
+        : verdict === 'review'
+          ? chalk.yellow('review')
+          : chalk.green('allow');
+    console.error(chalk.green(`\n✅  ${name}/${shortName} → ${verdictLabel}\n`));
+    console.error(
+      chalk.gray(`   Run ${chalk.cyan('node9 shield status')} to see all active rules.\n`)
+    );
+  });
+
+shieldCmd
+  .command('unset <service> <rule>')
+  .description('Remove a verdict override, restoring the shield default')
+  .action((service: string, rule: string) => {
+    const name = resolveShieldName(service);
+    if (!name) {
+      console.error(chalk.red(`\n❌ Unknown shield: "${service}"\n`));
+      process.exit(1);
+    }
+    const ruleName = resolveShieldRule(name, rule);
+    if (!ruleName) {
+      console.error(chalk.red(`\n❌ Unknown rule "${rule}" for shield "${name}".\n`));
+      process.exit(1);
+    }
+    clearShieldOverride(name, ruleName);
+    const shortName = ruleName.replace(`shield:${name}:`, '');
+    console.error(
+      chalk.green(`\n✅  Override removed — ${name}/${shortName} restored to default.\n`)
+    );
+  });
+
+// ── config show ──────────────────────────────────────────────────────────────
+program
+  .command('config show')
+  .description('Show the full effective runtime configuration including shields and advisory rules')
+  .action(() => {
+    const config = getConfig();
+    const active = readActiveShields();
+    const overrides = readShieldOverrides();
+
+    console.error(chalk.bold('\n🔍  Node9 Effective Configuration\n'));
+
+    // ── Mode ────────────────────────────────────────────────────────────────
+    const modeLabel =
+      config.settings.mode === 'audit'
+        ? chalk.blue('audit')
+        : config.settings.mode === 'strict'
+          ? chalk.red('strict')
+          : chalk.white('standard');
+    console.error(`  Mode: ${modeLabel}\n`);
+
+    // ── Active Shields ───────────────────────────────────────────────────────
+    if (active.length > 0) {
+      console.error(chalk.bold('  ── Active Shields ─────────────────────────────────────────'));
+      for (const name of active) {
+        const shield = getShield(name);
+        if (!shield) continue;
+        const ruleOverrides = overrides[name] ?? {};
+        console.error(`\n  ${chalk.green('●')} ${chalk.cyan(name)}`);
+        for (const rule of shield.smartRules) {
+          const shortName = rule.name ? rule.name.replace(`shield:${name}:`, '') : '(unnamed)';
+          const overrideVerdict = rule.name ? ruleOverrides[rule.name] : undefined;
+          const effectiveVerdict = overrideVerdict ?? rule.verdict;
+          const vLabel =
+            effectiveVerdict === 'block'
+              ? chalk.red('block ')
+              : effectiveVerdict === 'review'
+                ? chalk.yellow('review')
+                : chalk.green('allow ');
+          const note = overrideVerdict ? chalk.gray(` ← overridden`) : '';
+          console.error(`    ${vLabel}  ${shortName}${note}`);
+        }
+      }
+      console.error('');
+    } else {
+      console.error(chalk.gray('  No shields active. Run `node9 shield list` to see options.\n'));
+    }
+
+    // ── Built-in Rules ───────────────────────────────────────────────────────
+    console.error(chalk.bold('  ── Built-in Rules (always on) ────────────────────────────'));
+    for (const rule of config.policy.smartRules) {
+      // Skip shield rules (already shown above) and advisory rules (shown below)
+      const isShieldRule = rule.name?.startsWith('shield:');
+      const isAdvisory = [
+        'review-rm',
+        'allow-rm-safe-paths',
+        'review-drop-table-sql',
+        'review-truncate-sql',
+        'review-drop-column-sql',
+      ].includes(rule.name ?? '');
+      if (isShieldRule || isAdvisory) continue;
+      const vLabel =
+        rule.verdict === 'block'
+          ? chalk.red('block ')
+          : rule.verdict === 'review'
+            ? chalk.yellow('review')
+            : chalk.green('allow ');
+      console.error(`    ${vLabel}  ${chalk.gray(rule.name ?? rule.tool)}`);
+    }
+    console.error('');
+
+    // ── Advisory Rules ───────────────────────────────────────────────────────
+    console.error(chalk.bold('  ── Safe by Default (advisory, overridable) ────────────────'));
+    const advisoryNames = new Set([
+      'review-rm',
+      'allow-rm-safe-paths',
+      'review-drop-table-sql',
+      'review-truncate-sql',
+      'review-drop-column-sql',
+    ]);
+    for (const rule of config.policy.smartRules) {
+      if (!advisoryNames.has(rule.name ?? '')) continue;
+      const vLabel =
+        rule.verdict === 'block'
+          ? chalk.red('block ')
+          : rule.verdict === 'review'
+            ? chalk.yellow('review')
+            : chalk.green('allow ');
+      console.error(`    ${vLabel}  ${chalk.gray(rule.name ?? rule.tool)}`);
+    }
+    console.error('');
+
+    // ── Dangerous Words ──────────────────────────────────────────────────────
+    console.error(chalk.bold('  ── Dangerous Words ────────────────────────────────────────'));
+    console.error(`    ${chalk.gray(config.policy.dangerousWords.join(', '))}\n`);
   });
 
 // Daemon registers its own keep-alive unhandledRejection handler in startDaemon().
