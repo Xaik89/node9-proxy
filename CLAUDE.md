@@ -10,6 +10,7 @@ Before committing or opening a PR, verify all of the following:
 - [ ] `npm run lint` passes (catches `require()` imports, unused vars, etc.)
 - [ ] `npm run format:check` passes (run `npm run format` to fix)
 - [ ] No `console.log` in hook or proxy code paths — use `console.error` (stdout must stay clean for JSON-RPC / MCP)
+- [ ] **Review your own diff before committing** — run `git diff` and check for logical correctness issues that automated checks miss: missing `return` after `res.end()`, silent `catch {}` blocks swallowing errors, double event-listener registration, fall-through in route handlers
 
 ## Test Rules
 
