@@ -590,8 +590,9 @@ export function startDaemon(): void {
         const s = getGlobalSettings();
         res.writeHead(200, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ ...s, autoStarted }));
-      } catch {
-        res.writeHead(500).end();
+      } catch (err) {
+        console.error(chalk.red('[node9 daemon] GET /settings failed:'), err);
+        return res.writeHead(500).end();
       }
     }
 
@@ -623,8 +624,9 @@ export function startDaemon(): void {
         const s = getGlobalSettings();
         res.writeHead(200, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ hasKey: hasStoredSlackKey(), enabled: s.slackEnabled }));
-      } catch {
-        res.writeHead(500).end();
+      } catch (err) {
+        console.error(chalk.red('[node9 daemon] GET /slack-status failed:'), err);
+        return res.writeHead(500).end();
       }
     }
 
@@ -799,6 +801,19 @@ export function startDaemon(): void {
     process.exit(1);
   });
 
+  // Safety net: an unhandled rejection in the async request handler must never
+  // crash the daemon and disconnect all SSE clients. Guarded against double-
+  // registration (e.g. tests calling startDaemon more than once). Logs to stderr
+  // so rejections are visible in production without silently swallowing them.
+  if (process.listenerCount('unhandledRejection') === 0) {
+    process.on('unhandledRejection', (reason) => {
+      console.error(
+        chalk.red('[node9 daemon] unhandled rejection — keeping daemon alive:'),
+        reason
+      );
+    });
+  }
+
   server.listen(DAEMON_PORT, DAEMON_HOST, () => {
     atomicWriteSync(
       DAEMON_PID_FILE,
@@ -806,12 +821,6 @@ export function startDaemon(): void {
       { mode: 0o600 }
     );
     console.log(chalk.green(`🛡️  Node9 Guard LIVE: http://127.0.0.1:${DAEMON_PORT}`));
-  });
-
-  // Safety net: an unhandled rejection in any async request handler must never
-  // crash the daemon and disconnect all SSE clients. Log to stderr for diagnosis.
-  process.on('unhandledRejection', (reason) => {
-    console.error(chalk.red('[node9 daemon] unhandled rejection — keeping daemon alive:'), reason);
   });
 
   // ── Flight Recorder — Unix socket for all tool call activity ─────────────
