@@ -124,7 +124,69 @@ describe('proxy command — stdout must stay clean for stdio protocols (MCP / JS
   );
 });
 
-// ── 2. Log command cross-cwd audit write ──────────────────────────────────────
+// ── 2. Proxy flag pass-through ────────────────────────────────────────────────
+// Regression: Commander parsed flags like -y, --config as node9 options and
+// errored with "unknown option" before the proxy action handler ever ran.
+// Fix: inject '--' before the command when not a known node9 subcommand so
+// Commander stops parsing options and passes everything through intact.
+
+describe('proxy command — flags are passed through to the wrapped command', () => {
+  let tmpHome: string;
+
+  beforeEach(() => {
+    tmpHome = makeTempHome({ settings: { mode: 'audit', autoStartDaemon: false } });
+  });
+
+  afterEach(() => {
+    cleanupDir(tmpHome);
+  });
+
+  itUnix('short flag (-y style) is not consumed by node9 argument parser', () => {
+    // `echo -n` suppresses the trailing newline — if -n were eaten by node9,
+    // the output would include a newline and the test would fail.
+    const result = spawnSync(process.execPath, [CLI, 'echo', '-n', 'flag-passthrough'], {
+      encoding: 'utf-8',
+      timeout: 8000,
+      cwd: os.tmpdir(),
+      env: { ...process.env, ...BASE_ENV, HOME: tmpHome },
+    });
+
+    expect(result.error).toBeUndefined();
+    // Must not error with "unknown option '-n'"
+    expect(result.stderr).not.toContain('unknown option');
+    expect(result.status).toBe(0);
+    // -n passed through to echo → no trailing newline
+    expect(result.stdout).toBe('flag-passthrough');
+  });
+
+  itUnix('--version flag is passed to wrapped command, not intercepted as node9 --version', () => {
+    // node9 --version would print node9's own version and exit 0.
+    // node9 echo --version should pass --version to echo (which prints nothing and exits 0),
+    // not print node9's version.
+    const node9Version = spawnSync(process.execPath, [CLI, '--version'], {
+      encoding: 'utf-8',
+      timeout: 5000,
+      env: { ...process.env, ...BASE_ENV, HOME: tmpHome },
+    });
+    expect(node9Version.error).toBeUndefined();
+    const version = node9Version.stdout.trim();
+
+    const result = spawnSync(process.execPath, [CLI, 'echo', '--version'], {
+      encoding: 'utf-8',
+      timeout: 8000,
+      cwd: os.tmpdir(),
+      env: { ...process.env, ...BASE_ENV, HOME: tmpHome },
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(result.stderr).not.toContain('unknown option');
+    expect(result.status).toBe(0);
+    // stdout must not contain node9's own version string
+    expect(result.stdout).not.toContain(version);
+  });
+});
+
+// ── 3. Log command cross-cwd audit write ──────────────────────────────────────
 // Regression: `node9 log` silently failed to write audit.log when payload.cwd
 // pointed to a project dir different from the binary's process.cwd(). The root
 // cause was getConfig() reading the wrong config (wrong project), which caused

@@ -1725,4 +1725,34 @@ process.on('unhandledRejection', (reason) => {
   }
 });
 
+// If the first argument is not a known node9 subcommand and doesn't start with
+// '-', we are in proxy mode (e.g. `node9 npx -y @pkg`). Inject '--' before the
+// command so Commander stops parsing options and passes everything — including
+// flags like -y, --config, --nexus-url — through to the action handler intact.
+// Without this, Commander errors on unknown flags before the handler ever runs.
+const KNOWN_SUBCOMMANDS = new Set([
+  'login',
+  'addto',
+  'setup',
+  'removefrom',
+  'uninstall',
+  'doctor',
+  'explain',
+  'init',
+  'audit',
+  'status',
+  'daemon',
+  'tail',
+  'check',
+  'log',
+  'pause',
+  'resume',
+  'undo',
+  'shield',
+]);
+const firstArg = process.argv[2];
+if (firstArg && !firstArg.startsWith('-') && !KNOWN_SUBCOMMANDS.has(firstArg)) {
+  process.argv.splice(2, 0, '--');
+}
+
 program.parse();
