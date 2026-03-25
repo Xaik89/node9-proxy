@@ -12,6 +12,10 @@ import chalk from 'chalk';
 import { authorizeHeadless, getGlobalSettings, getConfig, _resetConfigCache } from '../core';
 import { SHIELDS, readActiveShields, writeActiveShields } from '../shields';
 
+// Module-level flag prevents double-registration if startDaemon() is called
+// more than once (e.g. in tests). A boolean is race-safe unlike listenerCount checks.
+let daemonRejectionHandlerRegistered = false;
+
 const ACTIVITY_SOCKET_PATH =
   process.platform === 'win32'
     ? '\\\\.\\pipe\\node9-activity'
@@ -592,7 +596,8 @@ export function startDaemon(): void {
         return res.end(JSON.stringify({ ...s, autoStarted }));
       } catch (err) {
         console.error(chalk.red('[node9 daemon] GET /settings failed:'), err);
-        return res.writeHead(500).end();
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: 'internal' }));
       }
     }
 
@@ -626,7 +631,8 @@ export function startDaemon(): void {
         return res.end(JSON.stringify({ hasKey: hasStoredSlackKey(), enabled: s.slackEnabled }));
       } catch (err) {
         console.error(chalk.red('[node9 daemon] GET /slack-status failed:'), err);
-        return res.writeHead(500).end();
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: 'internal' }));
       }
     }
 
@@ -802,10 +808,20 @@ export function startDaemon(): void {
   });
 
   // Safety net: an unhandled rejection in the async request handler must never
-  // crash the daemon and disconnect all SSE clients. Guarded against double-
-  // registration (e.g. tests calling startDaemon more than once). Logs to stderr
-  // so rejections are visible in production without silently swallowing them.
-  if (process.listenerCount('unhandledRejection') === 0) {
+  // crash the daemon and disconnect all SSE clients.
+  //
+  // cli.ts registers a process-level unhandledRejection handler that calls
+  // process.exit(1) for non-check commands. We must replace it here so the
+  // daemon survives rejections instead of exiting. The module-level flag
+  // prevents double-registration if startDaemon() is called more than once.
+  //
+  // NOTE: The critical approval path (POST /check, POST /decide) has its own
+  // per-request try/catch and .catch() — a rejection there is handled locally
+  // and never reaches this handler. This handler is a last-resort safety net
+  // for unexpected throws in non-critical routes only.
+  if (!daemonRejectionHandlerRegistered) {
+    daemonRejectionHandlerRegistered = true;
+    process.removeAllListeners('unhandledRejection');
     process.on('unhandledRejection', (reason) => {
       console.error(
         chalk.red('[node9 daemon] unhandled rejection — keeping daemon alive:'),
