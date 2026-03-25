@@ -1712,6 +1712,8 @@ shieldCmd
 
 process.on('unhandledRejection', (reason) => {
   const isCheckHook = process.argv[2] === 'check';
+  // Daemon registers its own keep-alive handler — let it handle rejections without exiting.
+  const isDaemon = process.argv[2] === 'daemon';
   if (isCheckHook) {
     if (process.env.NODE9_DEBUG === '1' || getConfig().settings.enableHookLogDebug) {
       const logPath = path.join(os.homedir(), '.node9', 'hook-debug.log');
@@ -1719,6 +1721,10 @@ process.on('unhandledRejection', (reason) => {
       fs.appendFileSync(logPath, `[${new Date().toISOString()}] UNHANDLED: ${msg}\n`);
     }
     process.exit(0);
+  } else if (isDaemon) {
+    // Daemon's own handler (registered in daemon/index.ts) takes over from here.
+    // This branch is a no-op — the daemon handler fires next in the listener chain.
+    return;
   } else {
     console.error('[Node9] Unhandled error:', reason);
     process.exit(1);
