@@ -1254,9 +1254,10 @@ program
           // regardless of the JSON block payload. Write directly to /dev/tty so
           // the message appears on the developer's screen without touching the
           // Claude Code pipe.
+          let ttyFd: number | null = null;
           try {
-            const tty = fs.openSync('/dev/tty', 'w');
-            const writeTty = (line: string) => fs.writeSync(tty, line + '\n');
+            ttyFd = fs.openSync('/dev/tty', 'w');
+            const writeTty = (line: string) => fs.writeSync(ttyFd!, line + '\n');
             if (
               blockedByContext.includes('DLP') ||
               blockedByContext.includes('Secret Detected') ||
@@ -1270,9 +1271,15 @@ program
             writeTty(chalk.gray(`   Triggered by: ${blockedByContext}`));
             if (result?.changeHint) writeTty(chalk.cyan(`   To change:  ${result.changeHint}`));
             writeTty('');
-            fs.closeSync(tty);
           } catch {
             // /dev/tty unavailable (CI, non-interactive) — skip visual output
+          } finally {
+            if (ttyFd !== null)
+              try {
+                fs.closeSync(ttyFd);
+              } catch {
+                /* ignore */
+              }
           }
 
           // 4. THE NEGOTIATION PROMPT: Context-specific instruction for the AI
