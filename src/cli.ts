@@ -260,7 +260,7 @@ async function runProxy(targetCommand: string) {
         const toolArgs = message.params?.arguments || message.params?.tool_input || {};
 
         // Use our Race Engine to authorize
-        const result = await authorizeHeadless(sanitize(name), toolArgs, true, {
+        const result = await authorizeHeadless(sanitize(name), toolArgs, {
           agent: 'Proxy/MCP',
         });
 
@@ -1313,10 +1313,7 @@ program
           await createShadowSnapshot(toolName, toolInput, config.policy.snapshot.ignorePaths);
         }
 
-        // Pass to Headless authorization
-        // allowTerminalFallback=true: enables Racer 4 (/dev/tty card in the Claude
-        // terminal) alongside Racer 3 (tail). User can respond from either terminal.
-        const result = await authorizeHeadless(toolName, toolInput, true, meta);
+        const result = await authorizeHeadless(toolName, toolInput, meta);
 
         if (result.approved) {
           // Only write to stderr in debug mode — Claude Code treats any stderr
@@ -1346,7 +1343,7 @@ program
           }
           const daemonReady = await autoStartDaemonAndWait();
           if (daemonReady) {
-            const retry = await authorizeHeadless(toolName, toolInput, true, meta);
+            const retry = await authorizeHeadless(toolName, toolInput, meta);
             if (retry.approved) {
               if (retry.checkedBy && process.env.NODE9_DEBUG === '1')
                 process.stderr.write(`✓ node9 [${retry.checkedBy}]: "${toolName}" allowed\n`);
@@ -1574,9 +1571,13 @@ program
       }
 
       const fullCommand = commandArgs.join(' ');
-      let result = await authorizeHeadless('shell', { command: fullCommand }, true, {
-        agent: 'Terminal',
-      });
+      let result = await authorizeHeadless(
+        'shell',
+        { command: fullCommand },
+        {
+          agent: 'Terminal',
+        }
+      );
 
       if (
         result.noApprovalMechanism &&
@@ -1587,10 +1588,6 @@ program
         console.error(chalk.cyan('\n🛡️  Node9: Starting approval daemon automatically...'));
         const daemonReady = await autoStartDaemonAndWait();
         if (daemonReady) result = await authorizeHeadless('shell', { command: fullCommand });
-      }
-
-      if (result.noApprovalMechanism && process.stdout.isTTY) {
-        result = await authorizeHeadless('shell', { command: fullCommand }, true);
       }
 
       if (!result.approved) {

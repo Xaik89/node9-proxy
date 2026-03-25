@@ -466,7 +466,6 @@ export function startDaemon(): void {
         authorizeHeadless(
           toolName,
           args,
-          false,
           {
             agent: typeof agent === 'string' ? agent : undefined,
             mcpServer: typeof mcpServer === 'string' ? mcpServer : undefined,

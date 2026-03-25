@@ -1,6 +1,5 @@
 // src/core.ts
 import chalk from 'chalk';
-import { askTerminalApproval, isTTYAvailable } from './ui/terminal-approval';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -1548,20 +1547,18 @@ async function resolveViaDaemon(
 }
 
 /**
- * Authorization state machine — 6 states based on:
+ * Authorization state machine:
  *   hasSlack()      = credentials.json exists AND slackEnabled
  *   isDaemonRunning = local approval daemon on localhost:7391
- *   allowTerminalFallback = caller allows interactive Y/N
  *
  * State table:
  *  hasSlack | daemon | result
  *  -------- | ------ | ------
  *  true     | yes    | Slack authority + daemon viewer card
  *  true     | no     | Slack authority only (no browser)
- *  false    | yes    | Browser authority
+ *  false    | yes    | Browser/tail authority
  *  false    | no     | noApprovalMechanism  (CLI auto-starts daemon if autoStartDaemon=true)
- *  false    | no+TTY | terminal Y/N prompt  (when allowTerminalFallback=true)
- *  false    | no+noTTY | block
+ *  false    | no     | block
  */
 export interface AuthResult {
   approved: boolean;
@@ -1624,7 +1621,6 @@ function notifyActivity(data: {
 export async function authorizeHeadless(
   toolName: string,
   args: unknown,
-  allowTerminalFallback = false,
   meta?: { agent?: string; mcpServer?: string },
   options?: { calledFromDaemon?: boolean }
 ): Promise<AuthResult> {
@@ -1633,7 +1629,7 @@ export async function authorizeHeadless(
     const actId = randomUUID();
     const actTs = Date.now();
     await notifyActivity({ id: actId, ts: actTs, tool: toolName, args, status: 'pending' });
-    const result = await _authorizeHeadlessCore(toolName, args, allowTerminalFallback, meta, {
+    const result = await _authorizeHeadlessCore(toolName, args, meta, {
       ...options,
       activityId: actId,
     });
@@ -1655,13 +1651,12 @@ export async function authorizeHeadless(
     }
     return result;
   }
-  return _authorizeHeadlessCore(toolName, args, allowTerminalFallback, meta, options);
+  return _authorizeHeadlessCore(toolName, args, meta, options);
 }
 
 async function _authorizeHeadlessCore(
   toolName: string,
   args: unknown,
-  allowTerminalFallback = false,
   meta?: { agent?: string; mcpServer?: string },
   options?: { calledFromDaemon?: boolean; activityId?: string }
 ): Promise<AuthResult> {
@@ -2066,44 +2061,6 @@ async function _authorizeHeadlessCore(
     );
   }
 
-  // 🏁 RACER 4: Terminal Prompt ([A]/[D] via /dev/tty)
-  // Requires the daemon (to POST /decision) and a usable TTY.
-  if (approvers.terminal && allowTerminalFallback && daemonEntryId && isTTYAvailable()) {
-    racePromises.push(
-      (async () => {
-        if (isRemoteLocked) {
-          // Admin policy: only Slack/cloud can approve — hold until another racer wins.
-          writeTty(chalk.yellow(`⚡ LOCKED BY ADMIN POLICY: Waiting for Slack Approval...\n`));
-          await new Promise<never>((_, reject) => {
-            signal.addEventListener('abort', () => reject(new Error('Aborted by SaaS')));
-          });
-        }
-
-        const timeoutMs = config.settings.approvalTimeoutMs ?? 120_000;
-        const key = await askTerminalApproval(
-          daemonEntryId!,
-          toolName,
-          args,
-          riskMetadata,
-          signal,
-          DAEMON_PORT,
-          timeoutMs
-        );
-
-        const isApproved = key === 'allow';
-        return {
-          approved: isApproved,
-          reason: isApproved
-            ? undefined
-            : 'The human user typed [D] in the terminal to reject this action.',
-          checkedBy: isApproved ? 'terminal' : undefined,
-          blockedBy: isApproved ? undefined : 'local-decision',
-          blockedByLabel: 'User Decision (Terminal)',
-        };
-      })()
-    );
-  }
-
   // 🏆 RESOLVE THE RACE
   if (racePromises.length === 0) {
     return {
@@ -2425,7 +2382,7 @@ export function getCredentials() {
 }
 
 export async function authorizeAction(toolName: string, args: unknown): Promise<boolean> {
-  const result = await authorizeHeadless(toolName, args, true);
+  const result = await authorizeHeadless(toolName, args);
   return result.approved;
 }
 
