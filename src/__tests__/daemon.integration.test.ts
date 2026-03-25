@@ -255,4 +255,132 @@ describe('daemon /events — shields-status emitted on connect', () => {
     expect(sseSnapshot.has('decisions'), 'decisions event must still be present').toBe(true);
     expect(sseSnapshot.has('shields-status'), 'shields-status event must be present').toBe(true);
   });
+
+  it('csrf token is emitted in the initial SSE payload', ({ skip }) => {
+    if (!portWasFree) skip();
+
+    expect(
+      sseSnapshot.has('csrf'),
+      `csrf event must be present in initial SSE payload.\nGot events: ${[...sseSnapshot.keys()].join(', ')}`
+    ).toBe(true);
+    const payload = sseSnapshot.get('csrf') as { token: string } | undefined;
+    expect(payload?.token).toBeTruthy();
+    expect(typeof payload?.token).toBe('string');
+  });
+
+  it('csrf token is the same across two SSE connections (re-emit, not regenerate)', async ({
+    skip,
+  }) => {
+    if (!portWasFree) skip();
+
+    const [raw1, raw2] = await Promise.all([readSseStream(1500), readSseStream(1500)]);
+    const events1 = parseSseEvents(raw1);
+    const events2 = parseSseEvents(raw2);
+    const token1 = (events1.get('csrf') as { token: string } | undefined)?.token;
+    const token2 = (events2.get('csrf') as { token: string } | undefined)?.token;
+    expect(token1).toBeTruthy();
+    expect(token1).toBe(token2); // same token, not a fresh UUID on reconnect
+  });
+});
+
+// ── POST /decision idempotency ─────────────────────────────────────────────────
+
+describe('daemon POST /decision — idempotency', () => {
+  let tmpHome: string;
+  let daemonProc: ChildProcess;
+  let portWasFree = false;
+  let csrfToken = '';
+
+  beforeAll(async () => {
+    portWasFree = await isPortFree(DAEMON_PORT);
+    if (!portWasFree) return;
+
+    tmpHome = makeTempHome();
+    daemonProc = spawn(process.execPath, [CLI, 'daemon', 'start'], {
+      env: makeEnv(tmpHome),
+      stdio: 'pipe',
+    });
+
+    const ready = await waitForDaemon(6000);
+    if (!ready) {
+      daemonProc.kill();
+      throw new Error('Daemon did not start within 6s');
+    }
+
+    // Acquire CSRF token from SSE
+    const raw = await readSseStream(1500);
+    const events = parseSseEvents(raw);
+    csrfToken = (events.get('csrf') as { token: string } | undefined)?.token ?? '';
+  });
+
+  afterAll(() => {
+    if (!portWasFree) return;
+    spawnSync(process.execPath, [CLI, 'daemon', 'stop'], {
+      env: makeEnv(tmpHome),
+      timeout: 3000,
+    });
+    if (tmpHome) cleanupDir(tmpHome);
+  });
+
+  it('second POST /decision returns 409 with the first decision (first write wins)', async ({
+    skip,
+  }) => {
+    if (!portWasFree) skip();
+    expect(csrfToken, 'csrf token must be available').toBeTruthy();
+
+    // Register an entry
+    const checkRes = await fetch(`http://127.0.0.1:${DAEMON_PORT}/check`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ toolName: 'bash', args: { command: 'echo test' } }),
+    });
+    expect(checkRes.ok).toBe(true);
+    const { id } = (await checkRes.json()) as { id: string };
+
+    // First POST /decision → 200
+    const d1 = await fetch(`http://127.0.0.1:${DAEMON_PORT}/decision/${id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Node9-Token': csrfToken },
+      body: JSON.stringify({ decision: 'allow' }),
+    });
+    expect(d1.status).toBe(200);
+
+    // Second POST /decision (different decision) → 409, first decision preserved
+    const d2 = await fetch(`http://127.0.0.1:${DAEMON_PORT}/decision/${id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Node9-Token': csrfToken },
+      body: JSON.stringify({ decision: 'deny' }),
+    });
+    expect(d2.status).toBe(409);
+    const body = (await d2.json()) as { conflict: boolean; decision: string };
+    expect(body.conflict).toBe(true);
+    expect(body.decision).toBe('allow'); // first write wins
+  });
+
+  it('first POST /decision with deny also returns 409 on second call', async ({ skip }) => {
+    if (!portWasFree) skip();
+
+    const checkRes = await fetch(`http://127.0.0.1:${DAEMON_PORT}/check`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ toolName: 'bash', args: { command: 'echo test2' } }),
+    });
+    const { id } = (await checkRes.json()) as { id: string };
+
+    const d1 = await fetch(`http://127.0.0.1:${DAEMON_PORT}/decision/${id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Node9-Token': csrfToken },
+      body: JSON.stringify({ decision: 'deny' }),
+    });
+    expect(d1.status).toBe(200);
+
+    const d2 = await fetch(`http://127.0.0.1:${DAEMON_PORT}/decision/${id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Node9-Token': csrfToken },
+      body: JSON.stringify({ decision: 'allow' }),
+    });
+    expect(d2.status).toBe(409);
+    const body = (await d2.json()) as { conflict: boolean; decision: string };
+    expect(body.decision).toBe('deny');
+  });
 });

@@ -4,7 +4,7 @@ import path from 'path';
 import chalk from 'chalk';
 import { smartTruncate, extractContext } from '../context-sniper';
 
-const isTestEnv = () => {
+export const isTestEnv = () => {
   return (
     process.env.NODE_ENV === 'test' ||
     process.env.VITEST === 'true' ||
@@ -15,7 +15,7 @@ const isTestEnv = () => {
   );
 };
 
-function formatArgs(
+export function formatArgs(
   args: unknown,
   matchedField?: string,
   matchedWord?: string

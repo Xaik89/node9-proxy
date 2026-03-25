@@ -317,7 +317,7 @@ export function startDaemon(): void {
             mcpServer: e.mcpServer,
           })),
           orgName: getOrgName(),
-          autoDenyMs: AUTO_DENY_MS,
+          autoDenyMs: getConfig().settings.approvalTimeoutMs ?? AUTO_DENY_MS,
         })}\n\n`
       );
       res.write(`event: decisions\ndata: ${JSON.stringify(readPersistentDecisions())}\n\n`);
@@ -331,6 +331,10 @@ export function startDaemon(): void {
           })),
         })}\n\n`
       );
+      // Emit the CSRF token on every connection so reconnecting clients
+      // (including the terminal racer) can acquire it without a browser tab.
+      // Always re-emit the existing token — never generate a new one.
+      res.write(`event: csrf\ndata: ${JSON.stringify({ token: csrfToken })}\n\n`);
       // Replay recent activity history so late-joining browsers see the feed
       for (const item of activityRing) {
         res.write(`event: ${item.event}\ndata: ${JSON.stringify(item.data)}\n\n`);
@@ -396,7 +400,7 @@ export function startDaemon(): void {
               pending.delete(id);
               broadcast('remove', { id });
             }
-          }, AUTO_DENY_MS),
+          }, getConfig().settings.approvalTimeoutMs ?? AUTO_DENY_MS),
         };
         pending.set(id, entry);
 
@@ -528,6 +532,13 @@ export function startDaemon(): void {
         const id = pathname.split('/').pop()!;
         const entry = pending.get(id);
         if (!entry) return res.writeHead(404).end();
+        // Idempotency: first write wins. If a decision is already recorded
+        // (earlyDecision set, or waiter already resolved and entry deleted),
+        // return 409 with the existing decision rather than overwriting it.
+        if (entry.earlyDecision !== null) {
+          res.writeHead(409, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ conflict: true, decision: entry.earlyDecision }));
+        }
         const { decision, persist, trustDuration, reason } = JSON.parse(await readBody(req)) as {
           decision: string;
           persist?: boolean;
