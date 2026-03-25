@@ -12,6 +12,10 @@ import chalk from 'chalk';
 import { authorizeHeadless, getGlobalSettings, getConfig, _resetConfigCache } from '../core';
 import { SHIELDS, readActiveShields, writeActiveShields } from '../shields';
 
+// Module-level flag prevents double-registration if startDaemon() is called
+// more than once (e.g. in tests). A boolean is race-safe unlike listenerCount checks.
+let daemonRejectionHandlerRegistered = false;
+
 const ACTIVITY_SOCKET_PATH =
   process.platform === 'win32'
     ? '\\\\.\\pipe\\node9-activity'
@@ -586,9 +590,15 @@ export function startDaemon(): void {
     }
 
     if (req.method === 'GET' && pathname === '/settings') {
-      const s = getGlobalSettings();
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ ...s, autoStarted }));
+      try {
+        const s = getGlobalSettings();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ ...s, autoStarted }));
+      } catch (err) {
+        console.error(chalk.red('[node9 daemon] GET /settings failed:'), err);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: 'internal' }));
+      }
     }
 
     // ── Updated POST /settings to handle new config schema ─────────────────
@@ -615,9 +625,15 @@ export function startDaemon(): void {
     }
 
     if (req.method === 'GET' && pathname === '/slack-status') {
-      const s = getGlobalSettings();
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ hasKey: hasStoredSlackKey(), enabled: s.slackEnabled }));
+      try {
+        const s = getGlobalSettings();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ hasKey: hasStoredSlackKey(), enabled: s.slackEnabled }));
+      } catch (err) {
+        console.error(chalk.red('[node9 daemon] GET /slack-status failed:'), err);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: 'internal' }));
+      }
     }
 
     if (req.method === 'POST' && pathname === '/slack-key') {
@@ -790,6 +806,29 @@ export function startDaemon(): void {
     console.error(chalk.red('\n🛑 Node9 Daemon Error:'), e.message);
     process.exit(1);
   });
+
+  // Safety net: an unhandled rejection in the async request handler must never
+  // crash the daemon and disconnect all SSE clients.
+  //
+  // cli.ts does not register an unhandledRejection handler for daemon mode,
+  // so this is the only handler in the process — no ordering dependency.
+  // Module-level flag prevents double-registration if startDaemon() is called
+  // more than once (e.g. in tests).
+  //
+  // NOTE: The critical approval path (POST /check, POST /decide) has its own
+  // per-request try/catch and .catch() — a rejection there is handled locally
+  // and never reaches this handler. This handler is a last-resort safety net
+  // for unexpected throws in non-critical routes only.
+  if (!daemonRejectionHandlerRegistered) {
+    daemonRejectionHandlerRegistered = true;
+    // cli.ts skips registering its exit-on-rejection handler for daemon mode,
+    // so this is the only unhandledRejection handler in the process. No ordering
+    // dependency. Logs with stack trace so systematic failures are visible.
+    process.on('unhandledRejection', (reason) => {
+      const stack = reason instanceof Error ? reason.stack : String(reason);
+      console.error(chalk.red('[node9 daemon] unhandled rejection — keeping daemon alive:'), stack);
+    });
+  }
 
   server.listen(DAEMON_PORT, DAEMON_HOST, () => {
     atomicWriteSync(

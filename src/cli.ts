@@ -1710,20 +1710,25 @@ shieldCmd
     console.log('');
   });
 
-process.on('unhandledRejection', (reason) => {
-  const isCheckHook = process.argv[2] === 'check';
-  if (isCheckHook) {
-    if (process.env.NODE9_DEBUG === '1' || getConfig().settings.enableHookLogDebug) {
-      const logPath = path.join(os.homedir(), '.node9', 'hook-debug.log');
-      const msg = reason instanceof Error ? reason.message : String(reason);
-      fs.appendFileSync(logPath, `[${new Date().toISOString()}] UNHANDLED: ${msg}\n`);
+// Daemon registers its own keep-alive unhandledRejection handler in startDaemon().
+// Skip registration here entirely for daemon mode to avoid any ordering dependency
+// between this handler and the daemon's handler.
+if (process.argv[2] !== 'daemon') {
+  process.on('unhandledRejection', (reason) => {
+    const isCheckHook = process.argv[2] === 'check';
+    if (isCheckHook) {
+      if (process.env.NODE9_DEBUG === '1' || getConfig().settings.enableHookLogDebug) {
+        const logPath = path.join(os.homedir(), '.node9', 'hook-debug.log');
+        const msg = reason instanceof Error ? reason.message : String(reason);
+        fs.appendFileSync(logPath, `[${new Date().toISOString()}] UNHANDLED: ${msg}\n`);
+      }
+      process.exit(0);
+    } else {
+      console.error('[Node9] Unhandled error:', reason);
+      process.exit(1);
     }
-    process.exit(0);
-  } else {
-    console.error('[Node9] Unhandled error:', reason);
-    process.exit(1);
-  }
-});
+  });
+}
 
 // If the first argument is not a known node9 subcommand and doesn't start with
 // '-', we are in proxy mode (e.g. `node9 npx -y @pkg`). Inject '--' before the
