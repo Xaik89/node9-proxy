@@ -384,3 +384,113 @@ describe('daemon POST /decision — idempotency', () => {
     expect(body.decision).toBe('deny');
   });
 });
+
+// ── POST /decision source tracking ────────────────────────────────────────────
+// Regression for: label always said "Browser Dashboard" regardless of which
+// channel actually submitted the decision. Fix: POST /decision accepts an
+// optional `source` field that is returned by GET /wait/:id.
+
+describe('daemon POST /decision — source tracking', () => {
+  let tmpHome: string;
+  let daemonProc: ChildProcess;
+  let portWasFree = false;
+  let csrfToken = '';
+
+  beforeAll(async () => {
+    portWasFree = await isPortFree(DAEMON_PORT);
+    if (!portWasFree) return;
+
+    tmpHome = makeTempHome();
+    daemonProc = spawn(process.execPath, [CLI, 'daemon', 'start'], {
+      env: makeEnv(tmpHome),
+      stdio: 'pipe',
+    });
+
+    const ready = await waitForDaemon(6000);
+    if (!ready) {
+      daemonProc.kill();
+      throw new Error('Daemon did not start within 6s');
+    }
+
+    const raw = await readSseStream(1500);
+    const events = parseSseEvents(raw);
+    csrfToken = (events.get('csrf') as { token: string } | undefined)?.token ?? '';
+  });
+
+  afterAll(() => {
+    if (!portWasFree) return;
+    spawnSync(process.execPath, [CLI, 'daemon', 'stop'], {
+      env: makeEnv(tmpHome),
+      timeout: 3000,
+    });
+    if (tmpHome) cleanupDir(tmpHome);
+  });
+
+  async function registerEntry(label: string): Promise<string> {
+    const res = await fetch(`http://127.0.0.1:${DAEMON_PORT}/check`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ toolName: 'bash', args: { command: `echo ${label}` } }),
+    });
+    const { id } = (await res.json()) as { id: string };
+    return id;
+  }
+
+  it('GET /wait returns source=terminal when POST /decision included source:terminal', async ({
+    skip,
+  }) => {
+    if (!portWasFree) skip();
+    expect(csrfToken).toBeTruthy();
+
+    const id = await registerEntry('source-terminal');
+
+    // POST decision with source before GET /wait connects (earlyDecision path)
+    await fetch(`http://127.0.0.1:${DAEMON_PORT}/decision/${id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Node9-Token': csrfToken },
+      body: JSON.stringify({ decision: 'deny', source: 'terminal' }),
+    });
+
+    const waitRes = await fetch(`http://127.0.0.1:${DAEMON_PORT}/wait/${id}`);
+    expect(waitRes.ok).toBe(true);
+    const body = (await waitRes.json()) as { decision: string; source?: string };
+    expect(body.decision).toBe('deny');
+    expect(body.source).toBe('terminal');
+  });
+
+  it('GET /wait returns source=browser when POST /decision included source:browser', async ({
+    skip,
+  }) => {
+    if (!portWasFree) skip();
+
+    const id = await registerEntry('source-browser');
+
+    await fetch(`http://127.0.0.1:${DAEMON_PORT}/decision/${id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Node9-Token': csrfToken },
+      body: JSON.stringify({ decision: 'allow', source: 'browser' }),
+    });
+
+    const waitRes = await fetch(`http://127.0.0.1:${DAEMON_PORT}/wait/${id}`);
+    const body = (await waitRes.json()) as { decision: string; source?: string };
+    expect(body.decision).toBe('allow');
+    expect(body.source).toBe('browser');
+  });
+
+  it('GET /wait returns no source field when POST /decision omits source', async ({ skip }) => {
+    if (!portWasFree) skip();
+
+    const id = await registerEntry('source-omitted');
+
+    await fetch(`http://127.0.0.1:${DAEMON_PORT}/decision/${id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Node9-Token': csrfToken },
+      body: JSON.stringify({ decision: 'deny' }),
+    });
+
+    const waitRes = await fetch(`http://127.0.0.1:${DAEMON_PORT}/wait/${id}`);
+    const body = (await waitRes.json()) as { decision: string; source?: string };
+    expect(body.decision).toBe('deny');
+    expect(body.source).toBeUndefined();
+  });
+});

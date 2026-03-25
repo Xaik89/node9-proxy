@@ -157,10 +157,16 @@ interface PendingEntry {
   waiter: ((d: Decision, reason?: string) => void) | null;
   earlyDecision: Decision | null;
   earlyReason?: string;
+  decisionSource?: string; // 'browser', 'terminal', or undefined (cloud/auto)
+}
+
+interface SseClient {
+  res: http.ServerResponse;
+  capabilities: string[];
 }
 
 const pending = new Map<string, PendingEntry>();
-const sseClients = new Set<http.ServerResponse>();
+const sseClients = new Set<SseClient>();
 let abandonTimer: ReturnType<typeof setTimeout> | null = null;
 let daemonServer: http.Server | null = null;
 let hadBrowserClient = false; // true once at least one SSE client has connected
@@ -211,11 +217,15 @@ function broadcast(event: string, data: unknown) {
   const msg = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
   sseClients.forEach((client) => {
     try {
-      client.write(msg);
+      client.res.write(msg);
     } catch {
       sseClients.delete(client);
     }
   });
+}
+
+export function hasInteractiveClient(): boolean {
+  return [...sseClients].some((c) => c.capabilities.includes('input'));
 }
 
 function openBrowser(url: string) {
@@ -285,7 +295,8 @@ export function startDaemon(): void {
   resetIdleTimer(); // Start the clock
 
   const server = http.createServer(async (req, res) => {
-    const { pathname } = new URL(req.url || '/', `http://${req.headers.host}`);
+    const reqUrl = new URL(req.url || '/', `http://${req.headers.host}`);
+    const { pathname } = reqUrl;
 
     if (req.method === 'GET' && pathname === '/') {
       res.writeHead(200, { 'Content-Type': 'text/html' });
@@ -293,6 +304,14 @@ export function startDaemon(): void {
     }
 
     if (req.method === 'GET' && pathname === '/events') {
+      const capParam = reqUrl.searchParams.get('capabilities') ?? '';
+      const capabilities = capParam
+        ? capParam
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean)
+        : [];
+
       res.writeHead(200, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
@@ -303,7 +322,8 @@ export function startDaemon(): void {
         abandonTimer = null;
       }
       hadBrowserClient = true;
-      sseClients.add(res);
+      const sseClient: SseClient = { res, capabilities };
+      sseClients.add(sseClient);
       res.write(
         `event: init\ndata: ${JSON.stringify({
           requests: Array.from(pending.values()).map((e) => ({
@@ -340,7 +360,7 @@ export function startDaemon(): void {
         res.write(`event: ${item.event}\ndata: ${JSON.stringify(item.data)}\n\n`);
       }
       return req.on('close', () => {
-        sseClients.delete(res);
+        sseClients.delete(sseClient);
         if (sseClients.size === 0 && pending.size > 0) {
           // Give 10s if browser was already open (page reload / brief disconnect),
           // 15s on cold-start (browser needs time to open and connect SSE).
@@ -418,7 +438,11 @@ export function startDaemon(): void {
         }
 
         const browserEnabled = getConfig().settings.approvers?.browser !== false;
-        if (browserEnabled) {
+        const terminalEnabled = getConfig().settings.approvers?.terminal !== false;
+        // Broadcast 'add' when the browser dashboard is on OR when an interactive
+        // tail client is connected (terminal approver). Without this, tail never
+        // receives new requests when browser is disabled.
+        if (browserEnabled || (terminalEnabled && hasInteractiveClient())) {
           broadcast('add', {
             id,
             toolName,
@@ -431,7 +455,7 @@ export function startDaemon(): void {
           // When auto-started, the CLI already called openBrowserLocal() before
           // the request was registered, so the browser is already opening.
           // Skip here to avoid opening a duplicate tab.
-          if (sseClients.size === 0 && !autoStarted)
+          if (browserEnabled && sseClients.size === 0 && !autoStarted)
             openBrowser(`http://127.0.0.1:${DAEMON_PORT}/`);
         }
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -510,17 +534,22 @@ export function startDaemon(): void {
       if (!entry) return res.writeHead(404).end();
       if (entry.earlyDecision) {
         clearTimeout(entry.timer); // cancel the 30s cleanup timer set by POST /decision
+        const source = entry.decisionSource;
         pending.delete(id);
         // POST /decision already broadcast 'remove' — don't send a duplicate
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        const body: { decision: Decision; reason?: string } = { decision: entry.earlyDecision };
+        const body: { decision: Decision; reason?: string; source?: string } = {
+          decision: entry.earlyDecision,
+        };
         if (entry.earlyReason) body.reason = entry.earlyReason;
+        if (source) body.source = source;
         return res.end(JSON.stringify(body));
       }
       entry.waiter = (d, reason?) => {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        const body: { decision: Decision; reason?: string } = { decision: d };
+        const body: { decision: Decision; reason?: string; source?: string } = { decision: d };
         if (reason) body.reason = reason;
+        if (entry.decisionSource) body.source = entry.decisionSource;
         res.end(JSON.stringify(body));
       };
       return;
@@ -539,11 +568,14 @@ export function startDaemon(): void {
           res.writeHead(409, { 'Content-Type': 'application/json' });
           return res.end(JSON.stringify({ conflict: true, decision: entry.earlyDecision }));
         }
-        const { decision, persist, trustDuration, reason } = JSON.parse(await readBody(req)) as {
+        const { decision, persist, trustDuration, reason, source } = JSON.parse(
+          await readBody(req)
+        ) as {
           decision: string;
           persist?: boolean;
           trustDuration?: string;
           reason?: string;
+          source?: string;
         };
 
         // Trust session
@@ -578,6 +610,7 @@ export function startDaemon(): void {
         });
         clearTimeout(entry.timer);
 
+        if (source) entry.decisionSource = source;
         if (entry.waiter) {
           // GET /wait/:id is already connected — respond and clean up now
           entry.waiter(resolvedDecision, reason);

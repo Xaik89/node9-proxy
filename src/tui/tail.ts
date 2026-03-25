@@ -1,10 +1,11 @@
-// src/tui/tail.ts — Terminal Flight Recorder
+// src/tui/tail.ts — Terminal Flight Recorder + Interactive Approvals
 import http from 'http';
 import chalk from 'chalk';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import readline from 'readline';
+import tty from 'tty';
 import { spawn } from 'child_process';
 import { DAEMON_PORT } from '../daemon';
 
@@ -41,6 +42,7 @@ interface ActivityItem {
   tool: string;
   args: unknown;
   ts: number;
+  status?: string;
 }
 
 interface ResultItem {
@@ -49,10 +51,39 @@ interface ResultItem {
   label?: string;
 }
 
+interface ApprovalRequest {
+  id: string;
+  toolName: string;
+  args: unknown;
+  riskMetadata?: {
+    tier?: number;
+    blockedByLabel?: string;
+    matchedField?: string;
+    matchedWord?: string;
+  };
+  timestamp?: number;
+}
+
 export interface TailOptions {
   history?: boolean;
   clear?: boolean;
 }
+
+// ── ANSI helpers ──────────────────────────────────────────────────────────────
+
+const RESET = '\x1B[0m';
+const BOLD = '\x1B[1m';
+const RED = '\x1B[31m';
+const YELLOW = '\x1B[33m';
+const CYAN = '\x1B[36m';
+const GRAY = '\x1B[90m';
+const GREEN = '\x1B[32m';
+const HIDE_CURSOR = '\x1B[?25l';
+const SHOW_CURSOR = '\x1B[?25h';
+const ERASE_DOWN = '\x1B[J';
+const MOVE_UP = (n: number) => `\x1B[${n}A`;
+
+// ── Activity feed rendering ───────────────────────────────────────────────────
 
 function formatBase(activity: ActivityItem): string {
   const time = new Date(activity.ts).toLocaleTimeString([], { hour12: false });
@@ -85,6 +116,8 @@ function renderPending(activity: ActivityItem): void {
   if (!process.stdout.isTTY) return;
   process.stdout.write(`${formatBase(activity)}  ${chalk.yellow('● …')}\r`);
 }
+
+// ── Daemon startup ────────────────────────────────────────────────────────────
 
 async function ensureDaemon(): Promise<number> {
   // Read the port from PID file if it exists, then verify the daemon is alive
@@ -131,6 +164,69 @@ async function ensureDaemon(): Promise<number> {
   console.error(chalk.red('❌ Daemon failed to start. Try: node9 daemon start'));
   process.exit(1);
 }
+
+// ── POST /decision ────────────────────────────────────────────────────────────
+
+function postDecisionHttp(
+  id: string,
+  decision: 'allow' | 'deny',
+  csrfToken: string,
+  port: number
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({ decision, source: 'terminal' });
+    const req = http.request(
+      {
+        hostname: '127.0.0.1',
+        port,
+        path: `/decision/${id}`,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body),
+          'X-Node9-Token': csrfToken,
+        },
+      },
+      (res) => {
+        res.resume();
+        // 200 = success, 409 = idempotent conflict (another racer already decided) — both ok
+        if (res.statusCode === 200 || res.statusCode === 409) resolve();
+        else reject(new Error(`POST /decision returned ${res.statusCode}`));
+      }
+    );
+    req.on('error', reject);
+    req.end(body);
+  });
+}
+
+// ── Approval card ─────────────────────────────────────────────────────────────
+
+function buildCardLines(req: ApprovalRequest): string[] {
+  const argsStr = JSON.stringify(req.args ?? {}).replace(/\s+/g, ' ');
+  const argsPreview = argsStr.length > 60 ? argsStr.slice(0, 60) + '…' : argsStr;
+
+  const tierLabel =
+    req.riskMetadata?.tier != null
+      ? req.riskMetadata.tier <= 2
+        ? `${YELLOW}⚠  Tier ${req.riskMetadata.tier}`
+        : `${RED}🛑 Tier ${req.riskMetadata.tier}`
+      : `${YELLOW}⚠  Review`;
+  const blockedBy = req.riskMetadata?.blockedByLabel ?? 'Policy rule';
+
+  return [
+    ``,
+    `${BOLD}${CYAN}╔══ Node9 Approval Required ══╗${RESET}`,
+    `${CYAN}║${RESET} Tool:    ${BOLD}${req.toolName}${RESET}`,
+    `${CYAN}║${RESET} Reason:  ${tierLabel} — ${blockedBy}${RESET}`,
+    `${CYAN}║${RESET} Args:    ${GRAY}${argsPreview}${RESET}`,
+    `${CYAN}╚${RESET}`,
+    ``,
+    `  ${BOLD}${GREEN}[A]${RESET} Allow   ${BOLD}${RED}[D]${RESET} Deny`,
+    ``,
+  ];
+}
+
+// ── Main export ───────────────────────────────────────────────────────────────
 
 export async function startTail(options: TailOptions = {}): Promise<void> {
   const port = await ensureDaemon();
@@ -179,9 +275,106 @@ export async function startTail(options: TailOptions = {}): Promise<void> {
   }
 
   const connectionTime = Date.now();
-  const pending = new Map<string, ActivityItem>();
+  const activityPending = new Map<string, ActivityItem>();
+
+  // ── Approval state ──────────────────────────────────────────────────────────
+  let csrfToken = '';
+  const approvalQueue: ApprovalRequest[] = [];
+  let cardActive = false;
+  // Number of lines the current card occupies (for clearing)
+  let cardLineCount = 0;
+
+  const canApprove = process.stdout.isTTY && process.stdin.isTTY;
+
+  function clearCard(): void {
+    if (cardLineCount > 0) {
+      process.stdout.write(MOVE_UP(cardLineCount) + ERASE_DOWN);
+      cardLineCount = 0;
+    }
+  }
+
+  function printCard(req: ApprovalRequest): void {
+    process.stdout.write(HIDE_CURSOR);
+    const lines = buildCardLines(req);
+    for (const line of lines) process.stdout.write(line + '\n');
+    cardLineCount = lines.length;
+  }
+
+  function showNextCard(): void {
+    if (cardActive || approvalQueue.length === 0 || !canApprove) return;
+    cardActive = true;
+    const req = approvalQueue[0];
+    printCard(req);
+
+    // Use tty.ReadStream on fd 0 to keep raw-mode scoped; process.stdin is the
+    // same fd but we avoid mutating it for the duration of the card.
+    const ttyRead = new tty.ReadStream(0);
+    let settled = false;
+
+    const settle = (decision: 'allow' | 'deny') => {
+      if (settled) return;
+      settled = true;
+
+      try {
+        ttyRead.setRawMode(false);
+      } catch {
+        /* ignore */
+      }
+      ttyRead.pause();
+      ttyRead.removeAllListeners();
+
+      clearCard();
+      process.stdout.write(SHOW_CURSOR);
+
+      // POST decision best-effort; 409 = another racer already won
+      postDecisionHttp(req.id, decision, csrfToken, port).catch((err) => {
+        try {
+          fs.appendFileSync(
+            path.join(os.homedir(), '.node9', 'hook-debug.log'),
+            `[tail] POST /decision failed: ${String(err)}\n`
+          );
+        } catch {
+          /* ignore */
+        }
+      });
+
+      // Print outcome in the activity feed
+      const decisionLabel =
+        decision === 'allow'
+          ? chalk.green('✓ ALLOWED (terminal)')
+          : chalk.red('✗ DENIED (terminal)');
+      console.log(`${chalk.cyan('◆')} ${chalk.bold(req.toolName.padEnd(16))}  ${decisionLabel}`);
+
+      approvalQueue.shift();
+      cardActive = false;
+      showNextCard();
+    };
+
+    try {
+      ttyRead.setRawMode(true);
+    } catch {
+      // Can't set raw mode — skip approval card, auto-deny
+      ttyRead.destroy();
+      cardActive = false;
+      return;
+    }
+
+    ttyRead.resume();
+    ttyRead.on('data', (key: Buffer) => {
+      const k = key.toString().toLowerCase();
+      if (k === 'a') {
+        settle('allow');
+      } else if (k === 'd' || k === '\r' || k === '\n' || k === '\x03' /* Ctrl-C */) {
+        settle('deny');
+      }
+    });
+    ttyRead.on('error', () => settle('deny'));
+  }
 
   console.log(chalk.cyan.bold(`\n🛰️  Node9 tail  `) + chalk.dim(`→ localhost:${port}`));
+  if (canApprove) {
+    console.log(chalk.dim('Interactive approvals enabled. [A] Allow  [D] Deny'));
+  }
   if (options.history) {
     console.log(chalk.dim('Showing history + live events. Press Ctrl+C to exit.\n'));
   } else {
@@ -191,6 +384,8 @@ export async function startTail(options: TailOptions = {}): Promise<void> {
   }
 
   process.on('SIGINT', () => {
+    clearCard();
+    process.stdout.write(SHOW_CURSOR);
     if (process.stdout.isTTY) {
       readline.clearLine(process.stdout, 0);
       readline.cursorTo(process.stdout, 0);
@@ -199,7 +394,9 @@ export async function startTail(options: TailOptions = {}): Promise<void> {
     process.exit(0);
   });
 
-  const req = http.get(`http://127.0.0.1:${port}/events`, (res) => {
+  // Connect with capabilities=input so the daemon knows this is an interactive terminal
+  const sseUrl = `http://127.0.0.1:${port}/events?capabilities=input`;
+  const req = http.get(sseUrl, (res) => {
     if (res.statusCode !== 200) {
       console.error(chalk.red(`Failed to connect: HTTP ${res.statusCode}`));
       process.exit(1);
@@ -228,6 +425,8 @@ export async function startTail(options: TailOptions = {}): Promise<void> {
     });
 
     rl.on('close', () => {
+      clearCard();
+      process.stdout.write(SHOW_CURSOR);
       if (process.stdout.isTTY) {
         readline.clearLine(process.stdout, 0);
         readline.cursorTo(process.stdout, 0);
@@ -238,6 +437,71 @@ export async function startTail(options: TailOptions = {}): Promise<void> {
   });
 
   function handleMessage(event: string, rawData: string): void {
+    // ── CSRF token ───────────────────────────────────────────────────────────
+    if (event === 'csrf') {
+      try {
+        const parsed = JSON.parse(rawData) as { token: string };
+        if (parsed.token) csrfToken = parsed.token;
+      } catch {}
+      return;
+    }
+
+    // ── Initial payload ──────────────────────────────────────────────────────
+    if (event === 'init') {
+      try {
+        const parsed = JSON.parse(rawData) as {
+          requests?: ApprovalRequest[];
+        };
+        // Queue any requests that were pending before we connected
+        if (canApprove && Array.isArray(parsed.requests)) {
+          for (const r of parsed.requests) {
+            approvalQueue.push(r);
+          }
+          showNextCard();
+        }
+      } catch {}
+      return;
+    }
+
+    // ── New approval request ─────────────────────────────────────────────────
+    if (event === 'add') {
+      if (canApprove) {
+        try {
+          const parsed = JSON.parse(rawData) as ApprovalRequest;
+          approvalQueue.push(parsed);
+          showNextCard();
+        } catch {}
+      }
+      return;
+    }
+
+    // ── Request resolved (by another racer) ──────────────────────────────────
+    if (event === 'remove') {
+      try {
+        const { id } = JSON.parse(rawData) as { id: string };
+        const idx = approvalQueue.findIndex((r) => r.id === id);
+        if (idx !== -1) {
+          if (idx === 0 && cardActive) {
+            // Current card was resolved externally — clear and move on
+            // The ttyRead listener will settle on the next keypress naturally,
+            // but we remove the entry so it doesn't get a second decision.
+            approvalQueue.splice(idx, 1);
+            // Note: we leave cardActive=true; the ttyRead.on('data') settle()
+            // call will shift() which will now shift index 0 (the new head).
+            // To avoid shifting the wrong entry, we clear and let settle() no-op:
+            clearCard();
+            process.stdout.write(SHOW_CURSOR);
+            // Show next card only after the current ttyRead settle() completes.
+            // We do not call showNextCard() here to avoid double-raw-mode.
+          } else {
+            approvalQueue.splice(idx, 1);
+          }
+        }
+      } catch {}
+      return;
+    }
+
+    // ── Activity feed ────────────────────────────────────────────────────────
     let data: ActivityItem & ResultItem;
     try {
       data = JSON.parse(rawData) as ActivityItem & ResultItem;
@@ -255,7 +519,7 @@ export async function startTail(options: TailOptions = {}): Promise<void> {
         return;
       }
 
-      pending.set(data.id, data);
+      activityPending.set(data.id, data);
 
       // Show pending indicator immediately for slow operations (bash, sql, agent)
       const slowTool = /bash|shell|query|sql|agent/i.test(data.tool);
@@ -263,10 +527,10 @@ export async function startTail(options: TailOptions = {}): Promise<void> {
     }
 
     if (event === 'activity-result') {
-      const original = pending.get(data.id);
+      const original = activityPending.get(data.id);
       if (original) {
         renderResult(original, data);
-        pending.delete(data.id);
+        activityPending.delete(data.id);
       }
     }
   }

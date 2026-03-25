@@ -1473,7 +1473,7 @@ async function registerDaemonEntry(
 async function waitForDaemonDecision(
   id: string,
   signal?: AbortSignal
-): Promise<'allow' | 'deny' | 'abandoned'> {
+): Promise<{ decision: 'allow' | 'deny' | 'abandoned'; source?: string }> {
   const base = `http://${DAEMON_HOST}:${DAEMON_PORT}`;
   const waitCtrl = new AbortController();
   const waitTimer = setTimeout(() => waitCtrl.abort(), 120_000);
@@ -1481,11 +1481,11 @@ async function waitForDaemonDecision(
   if (signal) signal.addEventListener('abort', onAbort);
   try {
     const waitRes = await fetch(`${base}/wait/${id}`, { signal: waitCtrl.signal });
-    if (!waitRes.ok) return 'deny';
-    const { decision } = (await waitRes.json()) as { decision: string };
-    if (decision === 'allow') return 'allow';
-    if (decision === 'abandoned') return 'abandoned';
-    return 'deny';
+    if (!waitRes.ok) return { decision: 'deny' };
+    const { decision, source } = (await waitRes.json()) as { decision: string; source?: string };
+    if (decision === 'allow') return { decision: 'allow', source };
+    if (decision === 'abandoned') return { decision: 'abandoned', source };
+    return { decision: 'deny', source };
   } finally {
     clearTimeout(waitTimer);
     if (signal) signal.removeEventListener('abort', onAbort);
@@ -2009,31 +2009,50 @@ async function _authorizeHeadlessCore(
     }
   }
 
-  // 🏁 RACER 3: Browser Dashboard
+  // 🏁 RACER 3: Browser Dashboard or node9 tail (interactive terminal)
+  // Both channels resolve via POST /decision/{id} — same waitForDaemonDecision poll.
   // Skip when cloudEnforced — notifyDaemonViewer already created a viewer card on
   // the dashboard. Running a second entry would create a duplicate card.
-  if (approvers.browser && daemonEntryId && !cloudEnforced) {
+  if (daemonEntryId && !cloudEnforced && (approvers.browser || approvers.terminal)) {
     racePromises.push(
       (async () => {
         if (!approvers.native && !cloudEnforced) {
-          console.error(
-            chalk.yellow('\n🛡️  Node9: Action suspended — waiting for browser approval.')
-          );
-          console.error(chalk.cyan(`   URL → http://${DAEMON_HOST}:${DAEMON_PORT}/\n`));
+          if (approvers.browser) {
+            console.error(
+              chalk.yellow('\n🛡️  Node9: Action suspended — waiting for browser approval.')
+            );
+            console.error(chalk.cyan(`   URL → http://${DAEMON_HOST}:${DAEMON_PORT}/\n`));
+          } else {
+            console.error(
+              chalk.yellow('\n🛡️  Node9: Action suspended — waiting for terminal approval.')
+            );
+            console.error(chalk.cyan(`   Run \`node9 tail\` in another terminal to approve.\n`));
+          }
         }
 
-        const daemonDecision = await waitForDaemonDecision(daemonEntryId!, signal);
+        const { decision: daemonDecision, source: decisionSource } = await waitForDaemonDecision(
+          daemonEntryId!,
+          signal
+        );
         if (daemonDecision === 'abandoned') throw new Error('Abandoned');
 
         const isApproved = daemonDecision === 'allow';
+        const via =
+          decisionSource === 'terminal'
+            ? 'Terminal (node9 tail)'
+            : decisionSource === 'browser'
+              ? 'Browser Dashboard'
+              : approvers.browser
+                ? 'Browser Dashboard'
+                : 'Terminal (node9 tail)';
         return {
           approved: isApproved,
           reason: isApproved
             ? undefined
-            : 'The human user rejected this action via the Node9 Browser Dashboard.',
+            : `The human user rejected this action via the Node9 ${via}.`,
           checkedBy: isApproved ? 'daemon' : undefined,
           blockedBy: isApproved ? undefined : 'local-decision',
-          blockedByLabel: 'User Decision (Browser)',
+          blockedByLabel: `User Decision (${via})`,
         };
       })()
     );
