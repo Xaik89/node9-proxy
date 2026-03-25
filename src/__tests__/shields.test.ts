@@ -182,6 +182,34 @@ describe('resolveShieldRule', () => {
   it('returns null for unknown shield', () => {
     expect(resolveShieldRule('mysql', 'drop-table')).toBeNull();
   });
+
+  it('first-match wins when two rules share an operation suffix (documents ambiguity risk)', () => {
+    // Temporarily inject an ambiguous rule to prove the first-match-wins behavior.
+    // This guards against future catalog additions that accidentally share a suffix.
+    const originalRules = SHIELDS.postgres.smartRules;
+    SHIELDS.postgres.smartRules = [
+      {
+        name: 'shield:postgres:block-drop-table',
+        tool: '*',
+        conditions: [{ field: 'sql', op: 'matches', value: 'DROP\\s+TABLE', flags: 'i' }],
+        verdict: 'block',
+        reason: 'test',
+      },
+      {
+        name: 'shield:postgres:review-drop-table',
+        tool: '*',
+        conditions: [{ field: 'sql', op: 'matches', value: 'DROP\\s+TABLE', flags: 'i' }],
+        verdict: 'review',
+        reason: 'test duplicate',
+      },
+    ];
+    try {
+      // Both rules have operation suffix "drop-table"; the first entry wins silently.
+      expect(resolveShieldRule('postgres', 'drop-table')).toBe('shield:postgres:block-drop-table');
+    } finally {
+      SHIELDS.postgres.smartRules = originalRules;
+    }
+  });
 });
 
 // ── writeShieldOverride / readShieldOverrides / clearShieldOverride ───────────
@@ -192,6 +220,39 @@ describe('shield overrides', () => {
     const written = writeFileSyncSpy.mock.calls[0][1] as string;
     const parsed = JSON.parse(written);
     expect(parsed.overrides.postgres['shield:postgres:block-drop-table']).toBe('review');
+  });
+
+  it('writeShieldOverride accepts allow verdict with no guard (storage primitive — CLI is the gatekeeper)', () => {
+    // The allow-requires-force guard lives in the CLI, not here.
+    // This test documents that the function itself does NOT enforce it so
+    // any future non-CLI caller (daemon, tests) is aware of the contract.
+    readFileSyncSpy.mockReturnValueOnce(JSON.stringify({ active: ['postgres'] }));
+    expect(() =>
+      writeShieldOverride('postgres', 'shield:postgres:block-drop-table', 'allow')
+    ).not.toThrow();
+    const written = writeFileSyncSpy.mock.calls[0][1] as string;
+    expect(JSON.parse(written).overrides.postgres['shield:postgres:block-drop-table']).toBe(
+      'allow'
+    );
+  });
+
+  it('concurrent writeShieldOverride calls — stale read causes last write to lose earlier overrides (TOCTOU)', () => {
+    // Both calls read the same initial state before either writes.
+    // The second write overwrites the first without merging, silently losing it.
+    // This is the known TOCTOU limitation of the read-modify-write without a file lock.
+    const initial = JSON.stringify({ active: ['postgres'] });
+    readFileSyncSpy
+      .mockReturnValueOnce(initial) // first writeShieldOverride reads this
+      .mockReturnValueOnce(initial); // second writeShieldOverride also reads stale state
+
+    writeShieldOverride('postgres', 'shield:postgres:block-drop-table', 'review');
+    writeShieldOverride('postgres', 'shield:postgres:block-truncate', 'allow');
+
+    expect(writeFileSyncSpy).toHaveBeenCalledTimes(2);
+    // The second write only contains block-truncate; block-drop-table override is lost.
+    const secondWrite = JSON.parse(writeFileSyncSpy.mock.calls[1][1] as string);
+    expect(secondWrite.overrides.postgres['shield:postgres:block-truncate']).toBe('allow');
+    expect(secondWrite.overrides.postgres['shield:postgres:block-drop-table']).toBeUndefined();
   });
 
   it('readShieldOverrides returns empty object when no overrides', () => {
