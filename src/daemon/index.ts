@@ -810,10 +810,10 @@ export function startDaemon(): void {
   // Safety net: an unhandled rejection in the async request handler must never
   // crash the daemon and disconnect all SSE clients.
   //
-  // cli.ts registers a process-level unhandledRejection handler that calls
-  // process.exit(1) for non-check commands. We must replace it here so the
-  // daemon survives rejections instead of exiting. The module-level flag
-  // prevents double-registration if startDaemon() is called more than once.
+  // cli.ts does not register an unhandledRejection handler for daemon mode,
+  // so this is the only handler in the process — no ordering dependency.
+  // Module-level flag prevents double-registration if startDaemon() is called
+  // more than once (e.g. in tests).
   //
   // NOTE: The critical approval path (POST /check, POST /decide) has its own
   // per-request try/catch and .catch() — a rejection there is handled locally
@@ -821,11 +821,9 @@ export function startDaemon(): void {
   // for unexpected throws in non-critical routes only.
   if (!daemonRejectionHandlerRegistered) {
     daemonRejectionHandlerRegistered = true;
-    // Both this handler and cli.ts's handler fire independently for every
-    // unhandledRejection. cli.ts's handler returns early (no-op) for daemon
-    // mode — that no-op is what prevents process.exit(1). This handler logs
-    // the rejection with a stack trace and keeps the daemon alive.
-    // Includes stack trace so systematic failures are surfaced in logs.
+    // cli.ts skips registering its exit-on-rejection handler for daemon mode,
+    // so this is the only unhandledRejection handler in the process. No ordering
+    // dependency. Logs with stack trace so systematic failures are visible.
     process.on('unhandledRejection', (reason) => {
       const stack = reason instanceof Error ? reason.stack : String(reason);
       console.error(chalk.red('[node9 daemon] unhandled rejection — keeping daemon alive:'), stack);
