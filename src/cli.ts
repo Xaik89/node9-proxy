@@ -1297,7 +1297,9 @@ program
         }
 
         // Pass to Headless authorization
-        const result = await authorizeHeadless(toolName, toolInput, false, meta);
+        // allowTerminalFallback=true: enables Racer 4 (/dev/tty card in the Claude
+        // terminal) alongside Racer 3 (tail). User can respond from either terminal.
+        const result = await authorizeHeadless(toolName, toolInput, true, meta);
 
         if (result.approved) {
           // Only write to stderr in debug mode — Claude Code treats any stderr
@@ -1318,7 +1320,7 @@ program
           console.error(chalk.cyan('\n🛡️  Node9: Starting approval daemon automatically...'));
           const daemonReady = await autoStartDaemonAndWait();
           if (daemonReady) {
-            const retry = await authorizeHeadless(toolName, toolInput, false, meta);
+            const retry = await authorizeHeadless(toolName, toolInput, true, meta);
             if (retry.approved) {
               if (retry.checkedBy && process.env.NODE9_DEBUG === '1')
                 process.stderr.write(`✓ node9 [${retry.checkedBy}]: "${toolName}" allowed\n`);
