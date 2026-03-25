@@ -50,13 +50,26 @@ function makeTempHome(config: object): string {
 }
 
 function cleanupDir(dir: string) {
-  fs.rmSync(dir, { recursive: true, force: true });
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+  } catch (e: unknown) {
+    // On Windows, files may be briefly locked after spawnSync completes (EBUSY).
+    // Leave the temp dir for OS cleanup rather than failing the test.
+    if ((e as NodeJS.ErrnoException).code !== 'EBUSY') throw e;
+  }
 }
 
 const BASE_ENV = {
   NODE9_NO_AUTO_DAEMON: '1',
   NODE9_TESTING: '1',
 };
+
+/** Returns a process env with both HOME and USERPROFILE set to the isolated home dir.
+ *  Windows uses USERPROFILE; Unix uses HOME. Setting both ensures os.homedir() resolves
+ *  to the isolated directory on every platform. */
+function makeEnv(home: string): NodeJS.ProcessEnv {
+  return { ...process.env, ...BASE_ENV, HOME: home, USERPROFILE: home };
+}
 
 beforeAll(() => {
   if (!fs.existsSync(CLI)) {
@@ -88,7 +101,7 @@ describe('proxy command — stdout must stay clean for stdio protocols (MCP / JS
       encoding: 'utf-8',
       timeout: 8000,
       cwd: os.tmpdir(),
-      env: { ...process.env, ...BASE_ENV, HOME: tmpHome },
+      env: makeEnv(tmpHome),
     });
 
     // Guard: if spawn itself failed, result.error is set — fail loudly
@@ -110,7 +123,7 @@ describe('proxy command — stdout must stay clean for stdio protocols (MCP / JS
         encoding: 'utf-8',
         timeout: 8000,
         cwd: os.tmpdir(),
-        env: { ...process.env, ...BASE_ENV, HOME: tmpHome },
+        env: makeEnv(tmpHome),
       });
 
       expect(result.error).toBeUndefined();
@@ -151,7 +164,7 @@ describe('proxy command — flags are passed through to the wrapped command', ()
       encoding: 'utf-8',
       timeout: 8000,
       cwd: os.tmpdir(),
-      env: { ...process.env, ...BASE_ENV, HOME: tmpHome },
+      env: makeEnv(tmpHome),
     });
 
     expect(result.error).toBeUndefined();
@@ -167,7 +180,7 @@ describe('proxy command — flags are passed through to the wrapped command', ()
     const node9Version = spawnSync(process.execPath, [CLI, '--version'], {
       encoding: 'utf-8',
       timeout: 5000,
-      env: { ...process.env, ...BASE_ENV, HOME: tmpHome },
+      env: makeEnv(tmpHome),
     });
     expect(node9Version.error).toBeUndefined();
     const version = node9Version.stdout.trim(); // e.g. "1.1.2"
@@ -176,7 +189,7 @@ describe('proxy command — flags are passed through to the wrapped command', ()
       encoding: 'utf-8',
       timeout: 8000,
       cwd: os.tmpdir(),
-      env: { ...process.env, ...BASE_ENV, HOME: tmpHome },
+      env: makeEnv(tmpHome),
     });
 
     expect(result.error).toBeUndefined();
@@ -224,7 +237,7 @@ describe('log command — audit.log written when payload.cwd differs from proces
         encoding: 'utf-8',
         timeout: 5000,
         cwd: os.tmpdir(), // intentionally different from projectDir
-        env: { ...process.env, ...BASE_ENV, HOME: tmpHome },
+        env: makeEnv(tmpHome),
       });
       expect(r.error).toBeUndefined();
       expect(r.status).toBe(0);
@@ -256,7 +269,7 @@ describe('log command — audit.log written when payload.cwd differs from proces
       encoding: 'utf-8',
       timeout: 5000,
       cwd: os.tmpdir(),
-      env: { ...process.env, ...BASE_ENV, HOME: tmpHome },
+      env: makeEnv(tmpHome),
     });
     expect(r.error).toBeUndefined();
     expect(r.status).toBe(0);
@@ -287,7 +300,7 @@ describe('log command — audit.log written when payload.cwd differs from proces
       encoding: 'utf-8',
       timeout: 5000,
       cwd: os.tmpdir(),
-      env: { ...process.env, ...BASE_ENV, HOME: tmpHome },
+      env: makeEnv(tmpHome),
     });
     expect(r.error).toBeUndefined();
     expect(r.status).toBe(0);
@@ -325,7 +338,7 @@ describe('log command — audit.log written when payload.cwd differs from proces
         encoding: 'utf-8',
         timeout: 5000,
         cwd: os.tmpdir(),
-        env: { ...process.env, ...BASE_ENV, HOME: corruptHome },
+        env: makeEnv(corruptHome),
       });
       expect(r.error).toBeUndefined();
       // Exit code must be 0: the log command always exits 0 even on internal errors
