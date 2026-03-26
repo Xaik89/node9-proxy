@@ -279,7 +279,13 @@ describe('daemon /events — shields-status emitted on connect', () => {
     const token1 = (events1.get('csrf') as { token: string } | undefined)?.token;
     const token2 = (events2.get('csrf') as { token: string } | undefined)?.token;
     expect(token1).toBeTruthy();
-    expect(token1).toBe(token2); // same token, not a fresh UUID on reconnect
+    // Token is process-lifetime (one UUID per daemon start), not per-SSE-session.
+    // Threat model: the CSRF token prevents third-party web pages from submitting
+    // decisions via XSS (they can't read the SSE stream cross-origin). A static
+    // per-process token is sufficient because the daemon binds to 127.0.0.1 only
+    // and dies when the user's shell session ends. Per-reconnect rotation would
+    // break concurrent browser + tail sessions sharing the same daemon.
+    expect(token1).toBe(token2);
   });
 });
 
@@ -355,6 +361,34 @@ describe('daemon POST /decision — idempotency', () => {
     const body = (await d2.json()) as { conflict: boolean; decision: string };
     expect(body.conflict).toBe(true);
     expect(body.decision).toBe('allow'); // first write wins
+  });
+
+  it('same decision sent twice also returns 409 (allow→allow)', async ({ skip }) => {
+    if (!portWasFree) skip();
+
+    const checkRes = await fetch(`http://127.0.0.1:${DAEMON_PORT}/check`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ toolName: 'bash', args: { command: 'echo idempotent' } }),
+    });
+    const { id } = (await checkRes.json()) as { id: string };
+
+    const d1 = await fetch(`http://127.0.0.1:${DAEMON_PORT}/decision/${id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Node9-Token': csrfToken },
+      body: JSON.stringify({ decision: 'allow' }),
+    });
+    expect(d1.status).toBe(200);
+
+    // Same decision a second time — still 409; the first write always wins
+    const d2 = await fetch(`http://127.0.0.1:${DAEMON_PORT}/decision/${id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Node9-Token': csrfToken },
+      body: JSON.stringify({ decision: 'allow' }),
+    });
+    expect(d2.status).toBe(409);
+    const body = (await d2.json()) as { conflict: boolean; decision: string };
+    expect(body.decision).toBe('allow');
   });
 
   it('first POST /decision with deny also returns 409 on second call', async ({ skip }) => {
@@ -521,7 +555,7 @@ describe('daemon POST /decision — source tracking', () => {
     ['number', 123],
     ['object', { __proto__: { polluted: true } }],
   ])('POST /decision with source:%s does not store a source value', async (label, sourceValue) => {
-    if (!portWasFree) return; // skip via early return to satisfy ts type
+    if (!portWasFree) return; // port busy — daemon describe skips entirely
 
     const id = await registerEntry(`source-type-${label}`);
 
