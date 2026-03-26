@@ -1,5 +1,4 @@
 // src/core.ts
-import chalk from 'chalk';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -14,20 +13,6 @@ import { computeRiskMetadata, RiskMetadata } from './context-sniper';
 import { sanitizeConfig } from './config-schema';
 import { readActiveShields, readShieldOverrides, getShield } from './shields';
 import { scanArgs, scanFilePath, type DlpMatch } from './dlp';
-
-// ── Terminal output helper ────────────────────────────────────────────────────
-// Write directly to /dev/tty instead of stderr. Claude Code treats any stderr
-// output from a PreToolUse hook as a hook error and fails open (allows the tool
-// to proceed). /dev/tty is an out-of-band channel that bypasses this check.
-function writeTty(line: string): void {
-  try {
-    const tty = fs.openSync('/dev/tty', 'w');
-    fs.writeSync(tty, line + '\n');
-    fs.closeSync(tty);
-  } catch {
-    // /dev/tty unavailable (CI, non-interactive) — skip
-  }
-}
 
 // ── Feature file paths ────────────────────────────────────────────────────────
 const PAUSED_FILE = path.join(os.homedir(), '.node9', 'PAUSED');
@@ -1829,14 +1814,6 @@ async function _authorizeHeadlessCore(
       if (!initResult.pending) {
         // Shadow mode: allowed through, but warn the developer passively
         if (initResult.shadowMode) {
-          writeTty(
-            chalk.yellow(
-              `\n⚠️  Node9 Shadow Mode: Action allowed, but would have been blocked by company policy.`
-            )
-          );
-          if (initResult.shadowReason) {
-            writeTty(chalk.dim(`   Reason: ${initResult.shadowReason}\n`));
-          }
           return { approved: true, checkedBy: 'cloud' };
         }
         return {
@@ -1853,43 +1830,8 @@ async function _authorizeHeadlessCore(
       cloudRequestId = initResult.requestId || null;
       isRemoteLocked = !!initResult.remoteApprovalOnly; // 🔒 THE GOVERNANCE LOCK
       explainableLabel = 'Organization Policy (SaaS)';
-    } catch (err: unknown) {
-      const error = err as Error;
-      const isAuthError = error.message.includes('401') || error.message.includes('403');
-      const isNetworkError =
-        error.message.includes('fetch') ||
-        error.name === 'AbortError' ||
-        error.message.includes('ECONNREFUSED');
-
-      const reason = isAuthError
-        ? 'Invalid or missing API key. Run `node9 login` to generate a key (must start with n9_live_).'
-        : isNetworkError
-          ? 'Could not reach the Node9 cloud. Check your network or API URL.'
-          : error.message;
-
-      writeTty(
-        chalk.yellow(`\n⚠️  Node9: Cloud API Handshake failed — ${reason}`) +
-          chalk.dim(`\n   Falling back to local rules...\n`)
-      );
-    }
-  }
-
-  // ── TERMINAL STATUS ─────────────────────────────────────────────────────────
-  // Print before the race so the message is guaranteed to show regardless of
-  // which channel wins (cloud message was previously lost when native popup
-  // resolved first and aborted the race before pollNode9SaaS could print it).
-  // Skip when called from the daemon — the CLI already printed this message.
-  if (!options?.calledFromDaemon) {
-    if (cloudEnforced && cloudRequestId) {
-      writeTty(chalk.yellow('\n🛡️  Node9: Action suspended — waiting for Organization approval.'));
-      writeTty(chalk.cyan('   Dashboard  → ') + chalk.bold('Mission Control > Activity Feed\n'));
-    } else if (!cloudEnforced) {
-      const cloudOffReason = !creds?.apiKey
-        ? 'no API key — run `node9 login` to connect'
-        : 'privacy mode (cloud disabled)';
-      writeTty(
-        chalk.dim(`\n🛡️  Node9: intercepted "${toolName}" — cloud off (${cloudOffReason})\n`)
-      );
+    } catch {
+      // Cloud API handshake failed — fall through to local rules silently
     }
   }
 
@@ -2021,18 +1963,6 @@ async function _authorizeHeadlessCore(
   if (daemonEntryId && !cloudEnforced && (approvers.browser || approvers.terminal)) {
     racePromises.push(
       (async () => {
-        if (!approvers.native && !cloudEnforced) {
-          if (approvers.browser) {
-            writeTty(chalk.yellow('\n🛡️  Node9: Action suspended — waiting for browser approval.'));
-            writeTty(chalk.cyan(`   URL → http://${DAEMON_HOST}:${DAEMON_PORT}/\n`));
-          } else {
-            writeTty(
-              chalk.yellow('\n🛡️  Node9: Action suspended — waiting for terminal approval.')
-            );
-            writeTty(chalk.cyan(`   Run \`node9 tail\` in another terminal to approve.\n`));
-          }
-        }
-
         const { decision: daemonDecision, source: decisionSource } = await waitForDaemonDecision(
           daemonEntryId!,
           signal
@@ -2513,11 +2443,9 @@ async function pollNode9SaaS(
       const { status, reason } = (await statusRes.json()) as { status: string; reason?: string };
 
       if (status === 'APPROVED') {
-        writeTty(chalk.green('✅  Approved via Cloud.\n'));
         return { approved: true, reason };
       }
       if (status === 'DENIED' || status === 'AUTO_BLOCKED' || status === 'TIMED_OUT') {
-        writeTty(chalk.red('❌  Denied via Cloud.\n'));
         return { approved: false, reason };
       }
     } catch {
