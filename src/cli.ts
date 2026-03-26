@@ -1155,6 +1155,10 @@ program
       stdio: 'inherit',
       env: { ...process.env, NODE9_WATCH_MODE: '1' },
     });
+    if (result.error) {
+      console.error(chalk.red(`❌ Failed to run command: ${result.error.message}`));
+      process.exit(1);
+    }
     process.exit(result.status ?? 0);
   });
 

@@ -618,7 +618,8 @@ export function startDaemon(): void {
         });
         clearTimeout(entry.timer);
 
-        if (source) entry.decisionSource = source;
+        const VALID_SOURCES = new Set(['terminal', 'browser', 'native']);
+        if (source && VALID_SOURCES.has(source)) entry.decisionSource = source;
         if (entry.waiter) {
           // GET /wait/:id is already connected — respond and clean up now
           entry.waiter(resolvedDecision, reason);

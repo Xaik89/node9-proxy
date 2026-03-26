@@ -430,7 +430,7 @@ describe('daemon POST /decision — source tracking', () => {
     const res = await fetch(`http://127.0.0.1:${DAEMON_PORT}/check`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ toolName: 'bash', args: { command: `echo ${label}` } }),
+      body: JSON.stringify({ toolName: 'bash', args: { command: `echo register-${label}` } }),
     });
     const { id } = (await res.json()) as { id: string };
     return id;
@@ -492,5 +492,50 @@ describe('daemon POST /decision — source tracking', () => {
     const body = (await waitRes.json()) as { decision: string; source?: string };
     expect(body.decision).toBe('deny');
     expect(body.source).toBeUndefined();
+  });
+
+  it('POST /decision with invalid source value is ignored (source not stored)', async ({
+    skip,
+  }) => {
+    if (!portWasFree) skip();
+
+    const id = await registerEntry('source-invalid');
+
+    await fetch(`http://127.0.0.1:${DAEMON_PORT}/decision/${id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Node9-Token': csrfToken },
+      body: JSON.stringify({ decision: 'allow', source: 'injected-value' }),
+    });
+
+    const waitRes = await fetch(`http://127.0.0.1:${DAEMON_PORT}/wait/${id}`);
+    const body = (await waitRes.json()) as { decision: string; source?: string };
+    expect(body.decision).toBe('allow');
+    expect(body.source).toBeUndefined(); // invalid source silently dropped
+  });
+
+  it('POST /decision without CSRF token returns 403', async ({ skip }) => {
+    if (!portWasFree) skip();
+
+    const id = await registerEntry('csrf-missing');
+
+    const res = await fetch(`http://127.0.0.1:${DAEMON_PORT}/decision/${id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' }, // no X-Node9-Token
+      body: JSON.stringify({ decision: 'allow' }),
+    });
+    expect(res.status).toBe(403);
+  });
+
+  it('POST /decision with wrong CSRF token returns 403', async ({ skip }) => {
+    if (!portWasFree) skip();
+
+    const id = await registerEntry('csrf-wrong');
+
+    const res = await fetch(`http://127.0.0.1:${DAEMON_PORT}/decision/${id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Node9-Token': 'wrong-token' },
+      body: JSON.stringify({ decision: 'allow' }),
+    });
+    expect(res.status).toBe(403);
   });
 });
