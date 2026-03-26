@@ -1569,6 +1569,8 @@ export interface AuthResult {
     | 'trust'
     | 'paused'
     | 'audit';
+  /** Structured decision source from the winning racer — used for cloud audit reporting. */
+  decisionSource?: 'terminal' | 'browser' | 'native' | 'cloud' | 'timeout' | 'local';
 }
 
 // ── Flight Recorder — fire-and-forget socket notify ──────────────────────────
@@ -1802,9 +1804,8 @@ async function _authorizeHeadlessCore(
     return { approved: true };
   }
 
-  // ── THE HANDSHAKE (Phase 4.1: Remote Lock Check) ──────────────────────────
+  // ── THE HANDSHAKE (Phase 4.1: Cloud Init) ────────────────────────────────
   let cloudRequestId: string | null = null;
-  let isRemoteLocked = false;
   const cloudEnforced = approvers.cloud && !!creds?.apiKey;
 
   if (cloudEnforced) {
@@ -1828,7 +1829,8 @@ async function _authorizeHeadlessCore(
       }
 
       cloudRequestId = initResult.requestId || null;
-      isRemoteLocked = !!initResult.remoteApprovalOnly; // 🔒 THE GOVERNANCE LOCK
+      // remoteApprovalOnly is noted but not enforced — local UI always has control.
+      // Hard blocks are handled by Shields before the UI opens.
       explainableLabel = 'Organization Policy (SaaS)';
     } catch {
       // Cloud API handshake failed — fall through to local rules silently
@@ -1864,16 +1866,43 @@ async function _authorizeHeadlessCore(
   let viewerId: string | null = null;
   const internalToken = getInternalToken();
 
+  // Pre-register a daemon entry shared by Racers 3 (browser/terminal) and, when
+  // cloudEnforced, by RACER 1 as well (reusing the same card — no duplicate).
+  // notifyDaemonViewer is moved here (out of RACER 1) so viewerId is known before
+  // the race starts, allowing RACER 3 to use it as its entry ID.
+  let daemonEntryId: string | null = null;
+  if (
+    (approvers.browser || approvers.terminal) &&
+    isDaemonRunning() &&
+    !options?.calledFromDaemon
+  ) {
+    if (cloudEnforced && cloudRequestId) {
+      // Cloud path: create a single card via notifyDaemonViewer so RACER 3
+      // (terminal/browser) shares the same daemon entry — no duplicate card.
+      // Local UI always participates in the race regardless of cloud policy.
+      viewerId = await notifyDaemonViewer(toolName, args, meta, riskMetadata).catch(() => null);
+      daemonEntryId = viewerId;
+    } else {
+      try {
+        daemonEntryId = await registerDaemonEntry(
+          toolName,
+          args,
+          meta,
+          riskMetadata,
+          options?.activityId,
+          options?.cwd
+        );
+      } catch {
+        // Daemon unreachable — skip both racers gracefully
+      }
+    }
+  }
+
   // 🏁 RACER 1: Cloud SaaS Channel (The Poller)
   if (cloudEnforced && cloudRequestId) {
     racePromises.push(
       (async () => {
         try {
-          if (isDaemonRunning() && internalToken && !options?.calledFromDaemon) {
-            viewerId = await notifyDaemonViewer(toolName, args, meta, riskMetadata).catch(
-              () => null
-            );
-          }
           const cloudResult = await pollNode9SaaS(cloudRequestId, creds!, signal);
 
           return {
@@ -1901,13 +1930,12 @@ async function _authorizeHeadlessCore(
   if (approvers.native && !isManual && !options?.calledFromDaemon) {
     racePromises.push(
       (async () => {
-        // Pass isRemoteLocked so the popup knows to hide the "Allow" button
         const decision = await askNativePopup(
           toolName,
           args,
           meta?.agent,
           explainableLabel,
-          isRemoteLocked,
+          false,
           signal,
           policyMatchedField,
           policyMatchedWord
@@ -1927,41 +1955,17 @@ async function _authorizeHeadlessCore(
           checkedBy: isApproved ? 'daemon' : undefined,
           blockedBy: isApproved ? undefined : 'local-decision',
           blockedByLabel: 'User Decision (Native)',
+          decisionSource: 'native',
         };
       })()
     );
   }
 
-  // Pre-register a daemon entry shared by Racers 3 (browser) and 4 (terminal).
-  // Both racers need the same entry ID: Racer 3 long-polls GET /wait/{id},
-  // Racer 4 posts the keypress decision via POST /decision/{id}.
-  // notifyDaemonViewer (Slack/cloud path) uses a separate entry — don't touch it.
-  let daemonEntryId: string | null = null;
-  if (
-    (approvers.browser || approvers.terminal) &&
-    isDaemonRunning() &&
-    !options?.calledFromDaemon &&
-    !cloudEnforced
-  ) {
-    try {
-      daemonEntryId = await registerDaemonEntry(
-        toolName,
-        args,
-        meta,
-        riskMetadata,
-        options?.activityId,
-        options?.cwd
-      );
-    } catch {
-      // Daemon unreachable — skip both racers gracefully
-    }
-  }
-
   // 🏁 RACER 3: Browser Dashboard or node9 tail (interactive terminal)
   // Both channels resolve via POST /decision/{id} — same waitForDaemonDecision poll.
-  // Skip when cloudEnforced — notifyDaemonViewer already created a viewer card on
-  // the dashboard. Running a second entry would create a duplicate card.
-  if (daemonEntryId && !cloudEnforced && (approvers.browser || approvers.terminal)) {
+  // When cloudEnforced, daemonEntryId == viewerId (same card, no duplicate).
+  // Local UI always participates in the race — cloud remoteApprovalOnly is not enforced.
+  if (daemonEntryId && (approvers.browser || approvers.terminal)) {
     racePromises.push(
       (async () => {
         const { decision: daemonDecision, source: decisionSource } = await waitForDaemonDecision(
@@ -1971,14 +1975,13 @@ async function _authorizeHeadlessCore(
         if (daemonDecision === 'abandoned') throw new Error('Abandoned');
 
         const isApproved = daemonDecision === 'allow';
-        const via =
-          decisionSource === 'terminal'
-            ? 'Terminal (node9 tail)'
-            : decisionSource === 'browser'
-              ? 'Browser Dashboard'
-              : approvers.browser
-                ? 'Browser Dashboard'
-                : 'Terminal (node9 tail)';
+        const src: 'terminal' | 'browser' =
+          decisionSource === 'terminal' || decisionSource === 'browser'
+            ? decisionSource
+            : approvers.browser
+              ? 'browser'
+              : 'terminal';
+        const via = src === 'terminal' ? 'Terminal (node9 tail)' : 'Browser Dashboard';
         return {
           approved: isApproved,
           reason: isApproved
@@ -1987,6 +1990,7 @@ async function _authorizeHeadlessCore(
           checkedBy: isApproved ? 'daemon' : undefined,
           blockedBy: isApproved ? undefined : 'local-decision',
           blockedByLabel: `User Decision (${via})`,
+          decisionSource: src,
         };
       })()
     );
@@ -2059,7 +2063,12 @@ async function _authorizeHeadlessCore(
   // We await this (not fire-and-forget) because the CLI process may exit
   // immediately after this function returns, killing any in-flight fetch.
   if (cloudRequestId && creds && finalResult.checkedBy !== 'cloud') {
-    await resolveNode9SaaS(cloudRequestId, creds, finalResult.approved);
+    await resolveNode9SaaS(
+      cloudRequestId,
+      creds,
+      finalResult.approved,
+      finalResult.decisionSource ?? finalResult.checkedBy ?? 'local'
+    );
   }
 
   if (!isManual) {
@@ -2463,20 +2472,33 @@ async function pollNode9SaaS(
 async function resolveNode9SaaS(
   requestId: string,
   creds: { apiKey: string; apiUrl: string },
-  approved: boolean
+  approved: boolean,
+  decidedBy?: string
 ): Promise<void> {
   try {
     const resolveUrl = `${creds.apiUrl}/requests/${requestId}`;
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 5000);
-    await fetch(resolveUrl, {
+    const res = await fetch(resolveUrl, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${creds.apiKey}` },
-      body: JSON.stringify({ decision: approved ? 'APPROVED' : 'DENIED' }),
+      body: JSON.stringify({
+        decision: approved ? 'APPROVED' : 'DENIED',
+        ...(decidedBy && { decidedBy }),
+      }),
       signal: ctrl.signal,
     });
     clearTimeout(timer);
-  } catch {
-    /* fire-and-forget — don't block the proxy on a network error */
+    if (!res.ok) {
+      fs.appendFileSync(
+        HOOK_DEBUG_LOG,
+        `[resolve-cloud] PATCH ${resolveUrl} → HTTP ${res.status}\n`
+      );
+    }
+  } catch (err) {
+    fs.appendFileSync(
+      HOOK_DEBUG_LOG,
+      `[resolve-cloud] PATCH failed for ${requestId}: ${(err as Error).message}\n`
+    );
   }
 }

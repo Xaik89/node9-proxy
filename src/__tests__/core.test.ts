@@ -1598,3 +1598,84 @@ describe('getConfig — nonexistent cwd falls back to global config', () => {
     expect(ambient.settings.mode).toBe('strict');
   });
 });
+
+// ── resolveNode9SaaS — decidedBy when local racer wins ────────────────────────
+// Regression test: when native popup wins the race while cloud is pending,
+// resolveNode9SaaS must PATCH with decidedBy:'native' so Mission Control
+// doesn't stay stuck on PENDING.
+
+describe('resolveNode9SaaS — decidedBy field when local racer wins', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    delete process.env.NODE9_API_KEY;
+    _resetConfigCache();
+  });
+
+  it('sends decidedBy:native to cloud PATCH when native popup wins the race', async () => {
+    // Arrange: enable cloud + native only (no browser/terminal = no daemon needed).
+    // mode:'standard' required — DEFAULT_CONFIG.settings.mode is 'audit', which
+    // would return {checkedBy:'audit'} before reaching the race engine.
+    // Use a 'review'-verdict command (git push, not --force which is 'block').
+    mockGlobalConfig({
+      settings: {
+        mode: 'standard',
+        approvalTimeoutMs: 0,
+        approvers: { cloud: true, native: true, browser: false, terminal: false },
+      },
+    });
+    process.env.NODE9_API_KEY = 'test-key';
+
+    // The core's isTestEnv guard disables approvers.native when VITEST/NODE9_TESTING/
+    // NODE_ENV=test are set, even though askNativePopup is fully mocked. Temporarily
+    // unset them so the native racer actually participates; restore in finally.
+    const savedVitest = process.env.VITEST;
+    const savedTesting = process.env.NODE9_TESTING;
+    const savedNodeEnv = process.env.NODE_ENV;
+    delete process.env.VITEST;
+    delete process.env.NODE9_TESTING;
+    delete process.env.NODE_ENV;
+
+    // Make native popup approve immediately
+    const { askNativePopup: nativeMock } = await import('../ui/native.js');
+    vi.mocked(nativeMock).mockResolvedValueOnce('allow');
+
+    // Track PATCH bodies sent to cloud
+    const patchBodies: Record<string, unknown>[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockImplementation((_url: string, opts: RequestInit) => {
+        if (opts?.method === 'PATCH') {
+          patchBodies.push(JSON.parse(opts.body as string));
+          return Promise.resolve({ ok: true, json: async () => ({}) });
+        }
+        if (opts?.method === 'POST') {
+          // initNode9SaaS — return pending so the race engine starts
+          return Promise.resolve({
+            ok: true,
+            json: async () => ({ pending: true, requestId: 'r1' }),
+          });
+        }
+        // GET poll — hang; aborted by AbortController when native wins
+        return new Promise(() => {});
+      })
+    );
+
+    let result: Awaited<ReturnType<typeof authorizeHeadless>>;
+    try {
+      // 'git push origin main' triggers review-git-push (verdict:'review', not 'block')
+      result = await authorizeHeadless('bash', { command: 'git push origin main' });
+    } finally {
+      process.env.VITEST = savedVitest;
+      process.env.NODE9_TESTING = savedTesting;
+      process.env.NODE_ENV = savedNodeEnv;
+    }
+
+    // Assert: native won
+    expect(result!.approved).toBe(true);
+    expect(result!.decisionSource).toBe('native');
+
+    // Assert: cloud was notified with the correct decidedBy field
+    expect(patchBodies).toHaveLength(1);
+    expect(patchBodies[0]).toMatchObject({ decision: 'APPROVED', decidedBy: 'native' });
+  });
+});

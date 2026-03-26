@@ -279,6 +279,10 @@ export function startDaemon(): void {
   const IDLE_TIMEOUT_MS = 12 * 60 * 60 * 1000; // 12 hours
   const watchMode = process.env.NODE9_WATCH_MODE === '1';
   let idleTimer: NodeJS.Timeout | undefined;
+  // Track if we've already opened the browser this session so we don't
+  // open duplicate tabs when node9 tail is also running (tail is an SSE
+  // client, so sseClients.size > 0 even when no browser is open).
+  let browserOpened = false;
   function resetIdleTimer() {
     if (watchMode) return; // Watch mode — never idle-timeout
     if (idleTimer) clearTimeout(idleTimer);
@@ -454,18 +458,28 @@ export function startDaemon(): void {
             slackDelegated: entry.slackDelegated,
             agent: entry.agent,
             mcpServer: entry.mcpServer,
+            interactive: terminalEnabled,
           });
-          // When auto-started, the CLI already called openBrowserLocal() before
-          // the request was registered, so the browser is already opening.
-          // Skip here to avoid opening a duplicate tab.
-          if (browserEnabled && sseClients.size === 0 && !autoStarted)
+          // Only the `node9 check` path (autoStartDaemonAndWait) pre-opens the
+          // browser before registering the request — it signals this via
+          // NODE9_BROWSER_OPENED=1 so we don't open a duplicate tab.
+          // `node9 tail`'s ensureDaemon() sets NODE9_AUTO_STARTED=1 for lifecycle
+          // purposes but does NOT pre-open the browser, so we must open it here.
+          const browserAlreadyOpened = process.env.NODE9_BROWSER_OPENED === '1';
+          if (browserEnabled && !browserOpened && !browserAlreadyOpened) {
+            browserOpened = true;
             openBrowser(`http://127.0.0.1:${DAEMON_PORT}/`);
+          }
         }
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ id }));
 
         // Run the full policy + cloud + native pipeline in the background.
         // Browser and terminal racers are skipped (no TTY, browser card already exists via SSE).
+        // Skip when slackDelegated: the hook process already owns the cloud race for this
+        // request — running a second initNode9SaaS here would create a duplicate pending
+        // cloud request that never gets resolved.
+        if (slackDelegated) return;
         authorizeHeadless(
           toolName,
           args,
@@ -563,6 +577,16 @@ export function startDaemon(): void {
         if (entry.decisionSource) body.source = entry.decisionSource;
         res.end(JSON.stringify(body));
       };
+      // When the CLI aborts the long-poll (e.g. native popup won the race),
+      // clean up the entry and dismiss the tail card immediately.
+      req.on('close', () => {
+        const e = pending.get(id);
+        if (e && e.waiter && e.earlyDecision === null) {
+          clearTimeout(e.timer);
+          pending.delete(id);
+          broadcast('remove', { id });
+        }
+      });
       return;
     }
 

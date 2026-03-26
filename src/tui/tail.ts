@@ -5,9 +5,9 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import readline from 'readline';
-import tty from 'tty';
-import { spawn } from 'child_process';
+import { spawn, execSync } from 'child_process';
 import { DAEMON_PORT } from '../daemon';
+import { getConfig } from '../core';
 
 const PID_FILE = path.join(os.homedir(), '.node9', 'daemon.pid');
 
@@ -81,7 +81,8 @@ const GREEN = '\x1B[32m';
 const HIDE_CURSOR = '\x1B[?25l';
 const SHOW_CURSOR = '\x1B[?25h';
 const ERASE_DOWN = '\x1B[J';
-const MOVE_UP = (n: number) => `\x1B[${n}A`;
+const SAVE_CURSOR = '\x1B7';
+const RESTORE_CURSOR = '\x1B8';
 
 // ── Activity feed rendering ───────────────────────────────────────────────────
 
@@ -283,18 +284,22 @@ export async function startTail(options: TailOptions = {}): Promise<void> {
   let cardActive = false;
   // Number of lines the current card occupies (for clearing)
   let cardLineCount = 0;
+  // Called when an external event (native popup, browser) resolves the active card
+  let cancelActiveCard: (() => void) | null = null;
 
   const canApprove = process.stdout.isTTY && process.stdin.isTTY;
+  // Enable keypress event parsing on stdin (idempotent — safe to call multiple times)
+  if (canApprove) readline.emitKeypressEvents(process.stdin);
 
   function clearCard(): void {
     if (cardLineCount > 0) {
-      process.stdout.write(MOVE_UP(cardLineCount) + ERASE_DOWN);
+      process.stdout.write(RESTORE_CURSOR + ERASE_DOWN);
       cardLineCount = 0;
     }
   }
 
   function printCard(req: ApprovalRequest): void {
-    process.stdout.write(HIDE_CURSOR);
+    process.stdout.write(HIDE_CURSOR + SAVE_CURSOR);
     const lines = buildCardLines(req);
     for (const line of lines) process.stdout.write(line + '\n');
     cardLineCount = lines.length;
@@ -302,27 +307,41 @@ export async function startTail(options: TailOptions = {}): Promise<void> {
 
   function showNextCard(): void {
     if (cardActive || approvalQueue.length === 0 || !canApprove) return;
+
+    // Attempt raw mode BEFORE rendering the card — if it fails we bail silently
+    // rather than leaving a stranded card with no key handler attached.
+    try {
+      process.stdin.setRawMode(true);
+    } catch {
+      cardActive = false;
+      return;
+    }
+
     cardActive = true;
     const req = approvalQueue[0];
     printCard(req);
 
-    // Use tty.ReadStream on fd 0 to keep raw-mode scoped; process.stdin is the
-    // same fd but we avoid mutating it for the duration of the card.
-    const ttyRead = new tty.ReadStream(0);
     let settled = false;
+    type KeypressCb = (str: string, key: { name?: string; ctrl?: boolean }) => void;
+    let onKeypress: KeypressCb | null = null;
+
+    const cleanup = () => {
+      const handler = onKeypress;
+      onKeypress = null;
+      if (handler) process.stdin.removeListener('keypress', handler);
+      try {
+        process.stdin.setRawMode(false);
+      } catch {
+        /* ignore */
+      }
+      process.stdin.pause();
+      cancelActiveCard = null;
+    };
 
     const settle = (decision: 'allow' | 'deny') => {
       if (settled) return;
       settled = true;
-
-      try {
-        ttyRead.setRawMode(false);
-      } catch {
-        /* ignore */
-      }
-      ttyRead.pause();
-      ttyRead.removeAllListeners();
-
+      cleanup();
       clearCard();
       process.stdout.write(SHOW_CURSOR);
 
@@ -350,28 +369,58 @@ export async function startTail(options: TailOptions = {}): Promise<void> {
       showNextCard();
     };
 
-    try {
-      ttyRead.setRawMode(true);
-    } catch {
-      // Can't set raw mode — skip approval card, auto-deny
-      ttyRead.destroy();
+    // Exposed so the 'remove' SSE event can dismiss the card when another
+    // racer (native popup, browser) already resolved the request.
+    cancelActiveCard = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      clearCard();
+      process.stdout.write(SHOW_CURSOR);
+      approvalQueue.shift();
       cardActive = false;
-      return;
-    }
+      showNextCard();
+    };
 
-    ttyRead.resume();
-    ttyRead.on('data', (key: Buffer) => {
-      const k = key.toString().toLowerCase();
-      if (k === 'a') {
+    process.stdin.resume();
+    // Use keypress events (requires emitKeypressEvents called at startup) —
+    // more reliable than raw 'data' buffer parsing across Node.js versions.
+    onKeypress = (_str: string, key: { name?: string; ctrl?: boolean }) => {
+      const name = key?.name ?? '';
+      if (name === 'a') {
         settle('allow');
-      } else if (k === 'd' || k === '\r' || k === '\n' || k === '\x03' /* Ctrl-C */) {
+      } else if (
+        name === 'd' ||
+        name === 'return' ||
+        name === 'enter' ||
+        (key?.ctrl && name === 'c')
+      ) {
         settle('deny');
       }
-    });
-    ttyRead.on('error', () => settle('deny'));
+    };
+    process.stdin.on('keypress', onKeypress);
   }
 
-  console.log(chalk.cyan.bold(`\n🛰️  Node9 tail  `) + chalk.dim(`→ localhost:${port}`));
+  const dashboardUrl = `http://127.0.0.1:${port}/`;
+
+  // Open the browser dashboard from the foreground process — more reliable than
+  // the daemon's detached spawn. Use execSync so failures throw and are caught.
+  // getConfig() reads the actual project config (approvers.browser), unlike
+  // GET /settings which only returns global settings and never includes approvers.
+  try {
+    const browserEnabled = getConfig().settings.approvers?.browser !== false;
+    if (browserEnabled) {
+      if (process.platform === 'darwin') execSync(`open "${dashboardUrl}"`, { stdio: 'ignore' });
+      else if (process.platform === 'win32')
+        execSync(`cmd /c start "" "${dashboardUrl}"`, { stdio: 'ignore' });
+      else execSync(`xdg-open "${dashboardUrl}"`, { stdio: 'ignore' });
+    }
+  } catch {
+    // Browser open failed — URL is printed in the banner below so the user
+    // can open it manually.
+  }
+
+  console.log(chalk.cyan.bold(`\n🛰️  Node9 tail  `) + chalk.dim(`→ ${dashboardUrl}`));
   if (canApprove) {
     console.log(chalk.dim('Interactive approvals enabled. [A] Allow  [D] Deny'));
   }
@@ -467,9 +516,14 @@ export async function startTail(options: TailOptions = {}): Promise<void> {
     if (event === 'add') {
       if (canApprove) {
         try {
-          const parsed = JSON.parse(rawData) as ApprovalRequest;
-          approvalQueue.push(parsed);
-          showNextCard();
+          const parsed = JSON.parse(rawData) as ApprovalRequest & { interactive?: boolean };
+          // Only show approval card when terminal approver is enabled in config.
+          // browser-only configs still receive 'add' events for the browser UI,
+          // but should not render a card in the tail terminal.
+          if (parsed.interactive !== false) {
+            approvalQueue.push(parsed);
+            showNextCard();
+          }
         } catch {}
       }
       return;
@@ -481,18 +535,10 @@ export async function startTail(options: TailOptions = {}): Promise<void> {
         const { id } = JSON.parse(rawData) as { id: string };
         const idx = approvalQueue.findIndex((r) => r.id === id);
         if (idx !== -1) {
-          if (idx === 0 && cardActive) {
-            // Current card was resolved externally — clear and move on
-            // The ttyRead listener will settle on the next keypress naturally,
-            // but we remove the entry so it doesn't get a second decision.
-            approvalQueue.splice(idx, 1);
-            // Note: we leave cardActive=true; the ttyRead.on('data') settle()
-            // call will shift() which will now shift index 0 (the new head).
-            // To avoid shifting the wrong entry, we clear and let settle() no-op:
-            clearCard();
-            process.stdout.write(SHOW_CURSOR);
-            // Show next card only after the current ttyRead settle() completes.
-            // We do not call showNextCard() here to avoid double-raw-mode.
+          if (idx === 0 && cardActive && cancelActiveCard) {
+            // Current card was resolved externally (native popup, browser, timeout).
+            // cancelActiveCard() stops raw-mode, clears the card, and advances the queue.
+            cancelActiveCard();
           } else {
             approvalQueue.splice(idx, 1);
           }

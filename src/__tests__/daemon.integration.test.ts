@@ -538,4 +538,41 @@ describe('daemon POST /decision — source tracking', () => {
     });
     expect(res.status).toBe(403);
   });
+
+  // Regression: POST /check with slackDelegated:true must NOT trigger the
+  // background authorizeHeadless call — that would create a duplicate cloud
+  // request (cloudRequestId2) that never gets resolved in Mission Control.
+  it('POST /check with slackDelegated:true creates entry but skips background auth', async ({
+    skip,
+  }) => {
+    if (!portWasFree) skip();
+
+    const checkRes = await fetch(`http://127.0.0.1:${DAEMON_PORT}/check`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        toolName: 'bash',
+        args: { command: 'git push' },
+        slackDelegated: true,
+      }),
+    });
+    expect(checkRes.ok).toBe(true);
+    const { id } = (await checkRes.json()) as { id: string };
+    expect(id).toBeTruthy();
+
+    // Give the daemon 200ms to run any background work — if background auth ran,
+    // it would resolve the entry immediately (audit mode auto-approves). The entry
+    // must stay pending because slackDelegated skips background auth entirely.
+    await new Promise((r) => setTimeout(r, 200));
+
+    // Resolve via /decision so GET /wait doesn't hang the test
+    const d = await fetch(`http://127.0.0.1:${DAEMON_PORT}/decision/${id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Node9-Token': csrfToken },
+      body: JSON.stringify({ decision: 'deny' }),
+    });
+    // If the entry was already auto-resolved by background auth, /decision returns 409.
+    // It must return 200 — the entry was still pending (background auth was skipped).
+    expect(d.status).toBe(200);
+  });
 });

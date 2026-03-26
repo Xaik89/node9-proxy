@@ -176,7 +176,9 @@ async function autoStartDaemonAndWait(): Promise<boolean> {
     const child = spawn(process.execPath, [process.argv[1], 'daemon'], {
       detached: true,
       stdio: 'ignore',
-      env: { ...process.env, NODE9_AUTO_STARTED: '1' },
+      // NODE9_BROWSER_OPENED=1 tells the daemon we will open the browser ourselves
+      // (openBrowserLocal below), so it must not open a duplicate tab on first approval.
+      env: { ...process.env, NODE9_AUTO_STARTED: '1', NODE9_BROWSER_OPENED: '1' },
     });
     child.unref();
     for (let i = 0; i < 20; i++) {
@@ -1580,7 +1582,14 @@ program
         process.exit(1);
       }
 
-      const fullCommand = commandArgs.join(' ');
+      // Allow "node9 shell <cmd>" as an alias for "node9 <cmd>"
+      const runArgs = firstArg === 'shell' ? commandArgs.slice(1) : commandArgs;
+      if (runArgs.length === 0) {
+        program.help();
+        return;
+      }
+
+      const fullCommand = runArgs.join(' ');
       let result = await authorizeHeadless(
         'shell',
         { command: fullCommand },
@@ -1598,6 +1607,15 @@ program
         console.error(chalk.cyan('\n🛡️  Node9: Starting approval daemon automatically...'));
         const daemonReady = await autoStartDaemonAndWait();
         if (daemonReady) result = await authorizeHeadless('shell', { command: fullCommand });
+      }
+
+      // Fallback: inline Y/N prompt when no approval channel is available
+      if (result.noApprovalMechanism && process.stdout.isTTY) {
+        const approved = await confirm({
+          message: `🛡️  Node9: Allow "${fullCommand}"?`,
+          default: false,
+        });
+        result = { approved, reason: approved ? undefined : 'Denied by user at terminal.' };
       }
 
       if (!result.approved) {

@@ -48,7 +48,7 @@ Node9 initiates a **Concurrent Race** across all enabled channels. The first cha
 Node9 records every tool call your AI agent makes in real-time — no polling, no log files, no refresh. Two ways to watch:
 
 <p align="center">
-  <img src="docs/flight-recorder.jpeg" width="100%">
+  <img src="https://github.com/user-attachments/assets/7b22e0fb-35ff-4088-8ee9-cc23216f362f" width="100%">
 </p>
 
 **Browser Dashboard** (`node9 daemon start` → `localhost:7391`)

@@ -63,7 +63,8 @@
     "prepublishOnly": "npm run validate",
     "test": "vitest --run",
     "test:watch": "vitest",
-    "test:ui": "vitest --ui"
+    "test:ui": "vitest --ui",
+    "dev:tail": "kill $(node -e \"try{process.stdout.write(String(JSON.parse(require('fs').readFileSync(require('os').homedir()+'/.node9/daemon.pid','utf8')).pid))}catch{}\") 2>/dev/null; npm run build && node dist/cli.js tail"
   },
   "dependencies": {
     "@inquirer/prompts": "^8.3.0",

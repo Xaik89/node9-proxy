@@ -751,7 +751,7 @@ describe('cloud race engine', () => {
   });
 });
 
-// ── 10. Malformed payload to `node9 check` ───────────────────────────────────
+// ── 11. Malformed payload to `node9 check` ───────────────────────────────────
 
 describe('malformed JSON payload', () => {
   // The CLI argument is a trust boundary: any process can call `node9 check <arg>`.
