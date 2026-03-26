@@ -336,14 +336,19 @@ describe('daemon POST /decision — idempotency', () => {
     if (!portWasFree) skip();
     expect(csrfToken, 'csrf token must be available').toBeTruthy();
 
-    // Register an entry
+    // No /wait consumer needed: the daemon's abandon timer only fires when an
+    // SSE connection *closes* while pending.size > 0 — it is not triggered here
+    // because no SSE client connects during this test. Entries added via
+    // POST /check after beforeAll's SSE stream closed are safe from eviction.
     const checkRes = await fetch(`http://127.0.0.1:${DAEMON_PORT}/check`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ toolName: 'bash', args: { command: 'echo test' } }),
     });
     expect(checkRes.ok).toBe(true);
-    const { id } = (await checkRes.json()) as { id: string };
+    const checkBody: unknown = await checkRes.json();
+    expect(checkBody).toMatchObject({ id: expect.any(String) });
+    const { id } = checkBody as { id: string };
 
     // First POST /decision → 200
     const d1 = await fetch(`http://127.0.0.1:${DAEMON_PORT}/decision/${id}`, {
@@ -360,9 +365,10 @@ describe('daemon POST /decision — idempotency', () => {
       body: JSON.stringify({ decision: 'deny' }),
     });
     expect(d2.status).toBe(409);
-    const body = (await d2.json()) as { conflict: boolean; decision: string };
-    expect(body.conflict).toBe(true);
-    expect(body.decision).toBe('allow'); // first write wins
+    const body: unknown = await d2.json();
+    // toMatchObject gives a clear failure message if the shape is wrong —
+    // an unchecked `as` cast would silently pass with a malformed response.
+    expect(body).toMatchObject({ conflict: true, decision: 'allow' }); // first write wins
   });
 
   it('same decision sent twice also returns 409 (allow→allow)', async ({ skip }) => {
@@ -373,7 +379,9 @@ describe('daemon POST /decision — idempotency', () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ toolName: 'bash', args: { command: 'echo idempotent' } }),
     });
-    const { id } = (await checkRes.json()) as { id: string };
+    const checkBody: unknown = await checkRes.json();
+    expect(checkBody).toMatchObject({ id: expect.any(String) });
+    const { id } = checkBody as { id: string };
 
     const d1 = await fetch(`http://127.0.0.1:${DAEMON_PORT}/decision/${id}`, {
       method: 'POST',
@@ -389,8 +397,8 @@ describe('daemon POST /decision — idempotency', () => {
       body: JSON.stringify({ decision: 'allow' }),
     });
     expect(d2.status).toBe(409);
-    const body = (await d2.json()) as { conflict: boolean; decision: string };
-    expect(body.decision).toBe('allow');
+    const body: unknown = await d2.json();
+    expect(body).toMatchObject({ decision: 'allow' });
   });
 
   it('first POST /decision with deny also returns 409 on second call', async ({ skip }) => {
@@ -401,7 +409,9 @@ describe('daemon POST /decision — idempotency', () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ toolName: 'bash', args: { command: 'echo test2' } }),
     });
-    const { id } = (await checkRes.json()) as { id: string };
+    const checkBody: unknown = await checkRes.json();
+    expect(checkBody).toMatchObject({ id: expect.any(String) });
+    const { id } = checkBody as { id: string };
 
     const d1 = await fetch(`http://127.0.0.1:${DAEMON_PORT}/decision/${id}`, {
       method: 'POST',
@@ -416,8 +426,8 @@ describe('daemon POST /decision — idempotency', () => {
       body: JSON.stringify({ decision: 'allow' }),
     });
     expect(d2.status).toBe(409);
-    const body = (await d2.json()) as { conflict: boolean; decision: string };
-    expect(body.decision).toBe('deny');
+    const body: unknown = await d2.json();
+    expect(body).toMatchObject({ decision: 'deny' });
   });
 });
 

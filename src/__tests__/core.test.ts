@@ -1605,26 +1605,11 @@ describe('getConfig — nonexistent cwd falls back to global config', () => {
 // doesn't stay stuck on PENDING.
 
 describe('resolveNode9SaaS — decidedBy field when local racer wins', () => {
-  // Safety net: restore all env vars that the test temporarily unsets to bypass
-  // the isTestEnv guard. The try/finally in the test body is the primary restore
-  // path; this afterEach catches any crash before the try block is entered.
-  const envSnapshot = {
-    VITEST: process.env.VITEST,
-    NODE9_TESTING: process.env.NODE9_TESTING,
-    NODE_ENV: process.env.NODE_ENV,
-    CI: process.env.CI,
-  };
   afterEach(() => {
     vi.unstubAllGlobals();
+    vi.unstubAllEnvs(); // restores env vars stubbed with vi.stubEnv below
     delete process.env.NODE9_API_KEY;
     _resetConfigCache();
-    // Restore isTestEnv vars so subsequent tests are not affected
-    if (envSnapshot.VITEST !== undefined) process.env.VITEST = envSnapshot.VITEST;
-    if (envSnapshot.NODE9_TESTING !== undefined)
-      process.env.NODE9_TESTING = envSnapshot.NODE9_TESTING;
-    if (envSnapshot.NODE_ENV !== undefined) process.env.NODE_ENV = envSnapshot.NODE_ENV;
-    if (envSnapshot.CI !== undefined) process.env.CI = envSnapshot.CI;
-    else delete process.env.CI;
   });
 
   it('sends decidedBy:native to cloud PATCH when native popup wins the race', async () => {
@@ -1641,18 +1626,18 @@ describe('resolveNode9SaaS — decidedBy field when local racer wins', () => {
     });
     process.env.NODE9_API_KEY = 'test-key';
 
-    // The core's isTestEnv guard disables approvers.native when any of
-    // VITEST / NODE9_TESTING / NODE_ENV=test / CI are set, even though
-    // askNativePopup is fully mocked. Temporarily unset all of them so
-    // the native racer participates; restore in finally.
-    const savedVitest = process.env.VITEST;
-    const savedTesting = process.env.NODE9_TESTING;
-    const savedNodeEnv = process.env.NODE_ENV;
-    const savedCI = process.env.CI;
-    delete process.env.VITEST;
-    delete process.env.NODE9_TESTING;
-    delete process.env.NODE_ENV;
-    delete process.env.CI;
+    // Disable the isTestEnv guard in _authorizeHeadlessCore so the native racer
+    // participates even though askNativePopup is mocked.
+    // vi.stubEnv saves originals; vi.unstubAllEnvs() in afterEach restores them.
+    // Setting to '' makes each var falsy / not equal to its trigger value:
+    //   VITEST / CI / NODE9_TESTING → !! '' = false
+    //   NODE_ENV → '' !== 'test'
+    // KEEP IN SYNC with the isTestEnv block in _authorizeHeadlessCore (core.ts).
+    // If a new env var is added there, add a corresponding vi.stubEnv call here.
+    vi.stubEnv('VITEST', '');
+    vi.stubEnv('NODE9_TESTING', '');
+    vi.stubEnv('NODE_ENV', '');
+    vi.stubEnv('CI', '');
 
     // Make native popup approve immediately
     const { askNativePopup: nativeMock } = await import('../ui/native.js');
@@ -1688,20 +1673,12 @@ describe('resolveNode9SaaS — decidedBy field when local racer wins', () => {
       })
     );
 
-    let result: Awaited<ReturnType<typeof authorizeHeadless>>;
-    try {
-      // 'git push origin main' triggers review-git-push (verdict:'review', not 'block')
-      result = await authorizeHeadless('bash', { command: 'git push origin main' });
-    } finally {
-      process.env.VITEST = savedVitest;
-      process.env.NODE9_TESTING = savedTesting;
-      process.env.NODE_ENV = savedNodeEnv;
-      process.env.CI = savedCI;
-    }
+    // 'git push origin main' triggers review-git-push (verdict:'review', not 'block')
+    const result = await authorizeHeadless('bash', { command: 'git push origin main' });
 
     // Assert: native won
-    expect(result!.approved).toBe(true);
-    expect(result!.decisionSource).toBe('native');
+    expect(result.approved).toBe(true);
+    expect(result.decisionSource).toBe('native');
 
     // Assert: cloud was notified with the correct decidedBy field
     expect(patchBodies).toHaveLength(1);
