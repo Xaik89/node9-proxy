@@ -23,7 +23,7 @@ import {
   teardownCursor,
 } from './setup';
 import { startDaemon, stopDaemon, daemonStatus, DAEMON_PORT, DAEMON_HOST } from './daemon/index';
-import { spawn, execSync } from 'child_process';
+import { spawn, execSync, spawnSync } from 'child_process';
 import { parseCommandString } from 'execa';
 import { execa } from 'execa';
 import chalk from 'chalk';
@@ -176,7 +176,9 @@ async function autoStartDaemonAndWait(): Promise<boolean> {
     const child = spawn(process.execPath, [process.argv[1], 'daemon'], {
       detached: true,
       stdio: 'ignore',
-      env: { ...process.env, NODE9_AUTO_STARTED: '1' },
+      // NODE9_BROWSER_OPENED=1 tells the daemon we will open the browser ourselves
+      // (openBrowserLocal below), so it must not open a duplicate tab on first approval.
+      env: { ...process.env, NODE9_AUTO_STARTED: '1', NODE9_BROWSER_OPENED: '1' },
     });
     child.unref();
     for (let i = 0; i < 20; i++) {
@@ -260,7 +262,7 @@ async function runProxy(targetCommand: string) {
         const toolArgs = message.params?.arguments || message.params?.tool_input || {};
 
         // Use our Race Engine to authorize
-        const result = await authorizeHeadless(sanitize(name), toolArgs, true, {
+        const result = await authorizeHeadless(sanitize(name), toolArgs, {
           agent: 'Proxy/MCP',
         });
 
@@ -1095,6 +1097,73 @@ program
     }
   });
 
+// node9 watch <command...> — runs a command under Node9 supervision with watch-mode daemon
+program
+  .command('watch')
+  .description('Run a command under Node9 watch mode (daemon stays alive for the session)')
+  .argument('<command>', 'Command to run')
+  .argument('[args...]', 'Arguments for the command')
+  .action(async (cmd: string, args: string[]) => {
+    // Ensure daemon is running in watch mode (never idle-exits)
+    let port = DAEMON_PORT;
+    try {
+      const res = await fetch(`http://127.0.0.1:${DAEMON_PORT}/settings`, {
+        signal: AbortSignal.timeout(500),
+      });
+      if (res.ok) {
+        const data = (await res.json()) as { port?: number };
+        if (typeof data.port === 'number') port = data.port;
+      } else {
+        throw new Error('not running');
+      }
+    } catch {
+      // Not running — start it with watch mode enabled
+      console.error(chalk.dim('🛡️  Starting Node9 daemon (watch mode)...'));
+      const child = spawn(process.execPath, [process.argv[1], 'daemon'], {
+        detached: true,
+        stdio: 'ignore',
+        env: { ...process.env, NODE9_AUTO_STARTED: '1', NODE9_WATCH_MODE: '1' },
+      });
+      child.unref();
+      // Wait up to 5s
+      let ready = false;
+      for (let i = 0; i < 20; i++) {
+        await new Promise((r) => setTimeout(r, 250));
+        try {
+          const r = await fetch(`http://127.0.0.1:${DAEMON_PORT}/settings`, {
+            signal: AbortSignal.timeout(500),
+          });
+          if (r.ok) {
+            ready = true;
+            break;
+          }
+        } catch {}
+      }
+      if (!ready) {
+        console.error(chalk.red('❌ Daemon failed to start. Try: node9 daemon start'));
+        process.exit(1);
+      }
+    }
+
+    console.error(
+      chalk.cyan.bold('🛡️  Node9 watch') +
+        chalk.dim(` → localhost:${port}`) +
+        chalk.dim(
+          '\n   Tip: run `node9 tail` in another terminal to review and approve AI actions.\n'
+        )
+    );
+
+    const result = spawnSync(cmd, args, {
+      stdio: 'inherit',
+      env: { ...process.env, NODE9_WATCH_MODE: '1' },
+    });
+    if (result.error) {
+      console.error(chalk.red(`❌ Failed to run command: ${result.error.message}`));
+      process.exit(1);
+    }
+    process.exit(result.status ?? 0);
+  });
+
 // 7. CHECK (Internal Hook - Upgraded with AI Negotiation Loop)
 program
   .command('check')
@@ -1185,25 +1254,42 @@ program
             blockedByContext.toLowerCase().includes('daemon') ||
             blockedByContext.toLowerCase().includes('decision');
 
-          // 3. Print to the human terminal for visibility
-          if (
-            blockedByContext.includes('DLP') ||
-            blockedByContext.includes('Secret Detected') ||
-            blockedByContext.includes('Credential Review')
-          ) {
-            console.error(chalk.bgRed.white.bold(`\n 🚨 NODE9 DLP ALERT — CREDENTIAL DETECTED `));
-            console.error(chalk.red.bold(`   A sensitive secret was found in the tool arguments!`));
-          } else {
-            console.error(chalk.red(`\n🛑 Node9 blocked "${toolName}"`));
+          // 3. Print to the human terminal for visibility.
+          // MUST NOT use stderr (console.error) — Claude Code treats any stderr
+          // output as a hook error and fails open, allowing the tool to proceed
+          // regardless of the JSON block payload. Write directly to /dev/tty so
+          // the message appears on the developer's screen without touching the
+          // Claude Code pipe.
+          let ttyFd: number | null = null;
+          try {
+            ttyFd = fs.openSync('/dev/tty', 'w');
+            const writeTty = (line: string) => fs.writeSync(ttyFd!, line + '\n');
+            if (
+              blockedByContext.includes('DLP') ||
+              blockedByContext.includes('Secret Detected') ||
+              blockedByContext.includes('Credential Review')
+            ) {
+              writeTty(chalk.bgRed.white.bold(`\n 🚨 NODE9 DLP ALERT — CREDENTIAL DETECTED `));
+              writeTty(chalk.red.bold(`   A sensitive secret was found in the tool arguments!`));
+            } else {
+              writeTty(chalk.red(`\n🛑 Node9 blocked "${toolName}"`));
+            }
+            writeTty(chalk.gray(`   Triggered by: ${blockedByContext}`));
+            if (result?.changeHint) writeTty(chalk.cyan(`   To change:  ${result.changeHint}`));
+            writeTty('');
+          } catch {
+            // /dev/tty unavailable (CI, non-interactive) — skip visual output
+          } finally {
+            if (ttyFd !== null)
+              try {
+                fs.closeSync(ttyFd);
+              } catch {
+                /* ignore */
+              }
           }
-          console.error(chalk.gray(`   Triggered by: ${blockedByContext}`));
-          if (result?.changeHint) console.error(chalk.cyan(`   To change:  ${result.changeHint}`));
-          console.error('');
 
           // 4. THE NEGOTIATION PROMPT: Context-specific instruction for the AI
           const aiFeedbackMessage = buildNegotiationMessage(blockedByContext, isHumanDecision, msg);
-
-          console.error(chalk.dim(`   (Detailed instructions sent to AI agent)`));
 
           // 5. Send the structured JSON back to the LLM agent
           process.stdout.write(
@@ -1233,8 +1319,11 @@ program
           await createShadowSnapshot(toolName, toolInput, config.policy.snapshot.ignorePaths);
         }
 
-        // Pass to Headless authorization
-        const result = await authorizeHeadless(toolName, toolInput, false, meta);
+        const safeCwdForAuth =
+          typeof payload.cwd === 'string' && path.isAbsolute(payload.cwd) ? payload.cwd : undefined;
+        const result = await authorizeHeadless(toolName, toolInput, meta, {
+          cwd: safeCwdForAuth,
+        });
 
         if (result.approved) {
           // Only write to stderr in debug mode — Claude Code treats any stderr
@@ -1252,10 +1341,21 @@ program
           !process.stdout.isTTY &&
           config.settings.autoStartDaemon
         ) {
-          console.error(chalk.cyan('\n🛡️  Node9: Starting approval daemon automatically...'));
+          try {
+            const tty = fs.openSync('/dev/tty', 'w');
+            fs.writeSync(
+              tty,
+              chalk.cyan('\n🛡️  Node9: Starting approval daemon automatically...\n')
+            );
+            fs.closeSync(tty);
+          } catch {
+            /* non-interactive env */
+          }
           const daemonReady = await autoStartDaemonAndWait();
           if (daemonReady) {
-            const retry = await authorizeHeadless(toolName, toolInput, false, meta);
+            const retry = await authorizeHeadless(toolName, toolInput, meta, {
+              cwd: safeCwdForAuth,
+            });
             if (retry.approved) {
               if (retry.checkedBy && process.env.NODE9_DEBUG === '1')
                 process.stderr.write(`✓ node9 [${retry.checkedBy}]: "${toolName}" allowed\n`);
@@ -1482,10 +1582,21 @@ program
         process.exit(1);
       }
 
-      const fullCommand = commandArgs.join(' ');
-      let result = await authorizeHeadless('shell', { command: fullCommand }, true, {
-        agent: 'Terminal',
-      });
+      // Allow "node9 shell <cmd>" as an alias for "node9 <cmd>"
+      const runArgs = firstArg === 'shell' ? commandArgs.slice(1) : commandArgs;
+      if (runArgs.length === 0) {
+        program.help();
+        return;
+      }
+
+      const fullCommand = runArgs.join(' ');
+      let result = await authorizeHeadless(
+        'shell',
+        { command: fullCommand },
+        {
+          agent: 'Terminal',
+        }
+      );
 
       if (
         result.noApprovalMechanism &&
@@ -1498,8 +1609,13 @@ program
         if (daemonReady) result = await authorizeHeadless('shell', { command: fullCommand });
       }
 
+      // Fallback: inline Y/N prompt when no approval channel is available
       if (result.noApprovalMechanism && process.stdout.isTTY) {
-        result = await authorizeHeadless('shell', { command: fullCommand }, true);
+        const approved = await confirm({
+          message: `🛡️  Node9: Allow "${fullCommand}"?`,
+          default: false,
+        });
+        result = { approved, reason: approved ? undefined : 'Denied by user at terminal.' };
       }
 
       if (!result.approved) {

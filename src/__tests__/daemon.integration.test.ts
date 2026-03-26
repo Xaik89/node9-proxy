@@ -194,7 +194,7 @@ describe('daemon /events — shields-status emitted on connect', () => {
       if (tmpHome) cleanupDir(tmpHome);
       throw err;
     }
-  });
+  }, 15_000); // waitForDaemon(6s) + readSseStream(3s) = 9s minimum; 15s gives CI headroom
 
   afterAll(() => {
     if (!portWasFree) return;
@@ -202,6 +202,7 @@ describe('daemon /events — shields-status emitted on connect', () => {
       env: makeEnv(tmpHome),
       timeout: 3000,
     });
+    if (daemonProc?.exitCode === null) daemonProc.kill(); // fallback: only if still running
     if (tmpHome) cleanupDir(tmpHome);
   });
 
@@ -254,5 +255,395 @@ describe('daemon /events — shields-status emitted on connect', () => {
     expect(sseSnapshot.has('init'), 'init event must still be present').toBe(true);
     expect(sseSnapshot.has('decisions'), 'decisions event must still be present').toBe(true);
     expect(sseSnapshot.has('shields-status'), 'shields-status event must be present').toBe(true);
+  });
+
+  it('csrf token is emitted in the initial SSE payload', ({ skip }) => {
+    if (!portWasFree) skip();
+
+    expect(
+      sseSnapshot.has('csrf'),
+      `csrf event must be present in initial SSE payload.\nGot events: ${[...sseSnapshot.keys()].join(', ')}`
+    ).toBe(true);
+    const payload = sseSnapshot.get('csrf') as { token: string } | undefined;
+    expect(payload?.token).toBeTruthy();
+    expect(typeof payload?.token).toBe('string');
+  });
+
+  it('csrf token is the same across two SSE connections (re-emit, not regenerate)', async ({
+    skip,
+  }) => {
+    if (!portWasFree) skip();
+
+    const [raw1, raw2] = await Promise.all([readSseStream(1500), readSseStream(1500)]);
+    const events1 = parseSseEvents(raw1);
+    const events2 = parseSseEvents(raw2);
+    const token1 = (events1.get('csrf') as { token: string } | undefined)?.token;
+    const token2 = (events2.get('csrf') as { token: string } | undefined)?.token;
+    expect(token1).toBeTruthy();
+    // Token is process-lifetime (one UUID per daemon start), not per-SSE-session.
+    // Threat model: the CSRF token prevents third-party web pages from submitting
+    // decisions via XSS (they can't read the SSE stream cross-origin). A static
+    // per-process token is sufficient because the daemon binds to 127.0.0.1 only
+    // and dies when the user's shell session ends. Per-reconnect rotation would
+    // break concurrent browser + tail sessions sharing the same daemon.
+    expect(token1).toBe(token2);
+  });
+});
+
+// ── POST /decision idempotency ─────────────────────────────────────────────────
+
+describe('daemon POST /decision — idempotency', () => {
+  let tmpHome: string;
+  let daemonProc: ChildProcess;
+  let portWasFree = false;
+  let csrfToken = '';
+
+  beforeAll(async () => {
+    portWasFree = await isPortFree(DAEMON_PORT);
+    if (!portWasFree) return;
+
+    tmpHome = makeTempHome();
+    daemonProc = spawn(process.execPath, [CLI, 'daemon', 'start'], {
+      env: makeEnv(tmpHome),
+      stdio: 'pipe',
+    });
+
+    const ready = await waitForDaemon(6000);
+    if (!ready) {
+      daemonProc.kill();
+      throw new Error('Daemon did not start within 6s');
+    }
+
+    // Acquire CSRF token from SSE
+    const raw = await readSseStream(1500);
+    const events = parseSseEvents(raw);
+    csrfToken = (events.get('csrf') as { token: string } | undefined)?.token ?? '';
+  }, 15_000); // waitForDaemon(6s) + readSseStream(1.5s) = 7.5s minimum; 15s gives CI headroom
+
+  afterAll(() => {
+    if (!portWasFree) return;
+    spawnSync(process.execPath, [CLI, 'daemon', 'stop'], {
+      env: makeEnv(tmpHome),
+      timeout: 3000,
+    });
+    if (daemonProc?.exitCode === null) daemonProc.kill(); // fallback: only if still running
+    if (tmpHome) cleanupDir(tmpHome);
+  });
+
+  it('second POST /decision returns 409 with the first decision (first write wins)', async ({
+    skip,
+  }) => {
+    if (!portWasFree) skip();
+    expect(csrfToken, 'csrf token must be available').toBeTruthy();
+
+    // No /wait consumer needed: the daemon's abandon timer only fires when an
+    // SSE connection *closes* while pending.size > 0 — it is not triggered here
+    // because no SSE client connects during this test. Entries added via
+    // POST /check after beforeAll's SSE stream closed are safe from eviction.
+    const checkRes = await fetch(`http://127.0.0.1:${DAEMON_PORT}/check`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ toolName: 'bash', args: { command: 'echo test' } }),
+    });
+    expect(checkRes.ok).toBe(true);
+    const checkBody: unknown = await checkRes.json();
+    expect(checkBody).toMatchObject({ id: expect.any(String) });
+    const { id } = checkBody as { id: string };
+
+    // First POST /decision → 200
+    const d1 = await fetch(`http://127.0.0.1:${DAEMON_PORT}/decision/${id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Node9-Token': csrfToken },
+      body: JSON.stringify({ decision: 'allow' }),
+    });
+    expect(d1.status).toBe(200);
+
+    // Second POST /decision (different decision) → 409, first decision preserved
+    const d2 = await fetch(`http://127.0.0.1:${DAEMON_PORT}/decision/${id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Node9-Token': csrfToken },
+      body: JSON.stringify({ decision: 'deny' }),
+    });
+    expect(d2.status).toBe(409);
+    const body: unknown = await d2.json();
+    // toMatchObject gives a clear failure message if the shape is wrong —
+    // an unchecked `as` cast would silently pass with a malformed response.
+    expect(body).toMatchObject({ conflict: true, decision: 'allow' }); // first write wins
+  });
+
+  it('same decision sent twice also returns 409 (allow→allow)', async ({ skip }) => {
+    if (!portWasFree) skip();
+
+    const checkRes = await fetch(`http://127.0.0.1:${DAEMON_PORT}/check`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ toolName: 'bash', args: { command: 'echo idempotent' } }),
+    });
+    const checkBody: unknown = await checkRes.json();
+    expect(checkBody).toMatchObject({ id: expect.any(String) });
+    const { id } = checkBody as { id: string };
+
+    const d1 = await fetch(`http://127.0.0.1:${DAEMON_PORT}/decision/${id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Node9-Token': csrfToken },
+      body: JSON.stringify({ decision: 'allow' }),
+    });
+    expect(d1.status).toBe(200);
+
+    // Same decision a second time — still 409; the first write always wins
+    const d2 = await fetch(`http://127.0.0.1:${DAEMON_PORT}/decision/${id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Node9-Token': csrfToken },
+      body: JSON.stringify({ decision: 'allow' }),
+    });
+    expect(d2.status).toBe(409);
+    const body: unknown = await d2.json();
+    expect(body).toMatchObject({ decision: 'allow' });
+  });
+
+  it('first POST /decision with deny also returns 409 on second call', async ({ skip }) => {
+    if (!portWasFree) skip();
+
+    const checkRes = await fetch(`http://127.0.0.1:${DAEMON_PORT}/check`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ toolName: 'bash', args: { command: 'echo test2' } }),
+    });
+    const checkBody: unknown = await checkRes.json();
+    expect(checkBody).toMatchObject({ id: expect.any(String) });
+    const { id } = checkBody as { id: string };
+
+    const d1 = await fetch(`http://127.0.0.1:${DAEMON_PORT}/decision/${id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Node9-Token': csrfToken },
+      body: JSON.stringify({ decision: 'deny' }),
+    });
+    expect(d1.status).toBe(200);
+
+    const d2 = await fetch(`http://127.0.0.1:${DAEMON_PORT}/decision/${id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Node9-Token': csrfToken },
+      body: JSON.stringify({ decision: 'allow' }),
+    });
+    expect(d2.status).toBe(409);
+    const body: unknown = await d2.json();
+    expect(body).toMatchObject({ decision: 'deny' });
+  });
+});
+
+// ── POST /decision source tracking ────────────────────────────────────────────
+// Regression for: label always said "Browser Dashboard" regardless of which
+// channel actually submitted the decision. Fix: POST /decision accepts an
+// optional `source` field that is returned by GET /wait/:id.
+
+describe('daemon POST /decision — source tracking', () => {
+  let tmpHome: string;
+  let daemonProc: ChildProcess;
+  let portWasFree = false;
+  let csrfToken = '';
+
+  beforeAll(async () => {
+    portWasFree = await isPortFree(DAEMON_PORT);
+    if (!portWasFree) return;
+
+    tmpHome = makeTempHome();
+    daemonProc = spawn(process.execPath, [CLI, 'daemon', 'start'], {
+      env: makeEnv(tmpHome),
+      stdio: 'pipe',
+    });
+
+    const ready = await waitForDaemon(6000);
+    if (!ready) {
+      daemonProc.kill();
+      throw new Error('Daemon did not start within 6s');
+    }
+
+    const raw = await readSseStream(1500);
+    const events = parseSseEvents(raw);
+    csrfToken = (events.get('csrf') as { token: string } | undefined)?.token ?? '';
+  }, 15_000); // waitForDaemon(6s) + readSseStream(1.5s) = 7.5s minimum; 15s gives CI headroom
+
+  afterAll(() => {
+    if (!portWasFree) return;
+    spawnSync(process.execPath, [CLI, 'daemon', 'stop'], {
+      env: makeEnv(tmpHome),
+      timeout: 3000,
+    });
+    if (daemonProc?.exitCode === null) daemonProc.kill(); // fallback: only if still running
+    if (tmpHome) cleanupDir(tmpHome);
+  });
+
+  async function registerEntry(label: string): Promise<string> {
+    const res = await fetch(`http://127.0.0.1:${DAEMON_PORT}/check`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ toolName: 'bash', args: { command: `echo register-${label}` } }),
+    });
+    const { id } = (await res.json()) as { id: string };
+    return id;
+  }
+
+  it('GET /wait returns source=terminal when POST /decision included source:terminal', async ({
+    skip,
+  }) => {
+    if (!portWasFree) skip();
+    expect(csrfToken).toBeTruthy();
+
+    const id = await registerEntry('source-terminal');
+
+    // POST decision with source before GET /wait connects (earlyDecision path)
+    await fetch(`http://127.0.0.1:${DAEMON_PORT}/decision/${id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Node9-Token': csrfToken },
+      body: JSON.stringify({ decision: 'deny', source: 'terminal' }),
+    });
+
+    const waitRes = await fetch(`http://127.0.0.1:${DAEMON_PORT}/wait/${id}`);
+    expect(waitRes.ok).toBe(true);
+    const body = (await waitRes.json()) as { decision: string; source?: string };
+    expect(body.decision).toBe('deny');
+    expect(body.source).toBe('terminal');
+  });
+
+  it('GET /wait returns source=browser when POST /decision included source:browser', async ({
+    skip,
+  }) => {
+    if (!portWasFree) skip();
+
+    const id = await registerEntry('source-browser');
+
+    await fetch(`http://127.0.0.1:${DAEMON_PORT}/decision/${id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Node9-Token': csrfToken },
+      body: JSON.stringify({ decision: 'allow', source: 'browser' }),
+    });
+
+    const waitRes = await fetch(`http://127.0.0.1:${DAEMON_PORT}/wait/${id}`);
+    const body = (await waitRes.json()) as { decision: string; source?: string };
+    expect(body.decision).toBe('allow');
+    expect(body.source).toBe('browser');
+  });
+
+  it('GET /wait returns no source field when POST /decision omits source', async ({ skip }) => {
+    if (!portWasFree) skip();
+
+    const id = await registerEntry('source-omitted');
+
+    await fetch(`http://127.0.0.1:${DAEMON_PORT}/decision/${id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Node9-Token': csrfToken },
+      body: JSON.stringify({ decision: 'deny' }),
+    });
+
+    const waitRes = await fetch(`http://127.0.0.1:${DAEMON_PORT}/wait/${id}`);
+    const body = (await waitRes.json()) as { decision: string; source?: string };
+    expect(body.decision).toBe('deny');
+    expect(body.source).toBeUndefined();
+  });
+
+  it('POST /decision with invalid source value is ignored (source not stored)', async ({
+    skip,
+  }) => {
+    if (!portWasFree) skip();
+
+    const id = await registerEntry('source-invalid');
+
+    await fetch(`http://127.0.0.1:${DAEMON_PORT}/decision/${id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Node9-Token': csrfToken },
+      body: JSON.stringify({ decision: 'allow', source: 'injected-value' }),
+    });
+
+    const waitRes = await fetch(`http://127.0.0.1:${DAEMON_PORT}/wait/${id}`);
+    const body = (await waitRes.json()) as { decision: string; source?: string };
+    expect(body.decision).toBe('allow');
+    expect(body.source).toBeUndefined(); // invalid source silently dropped
+  });
+
+  // source field injection boundary: non-string and prototype-pollution attempts
+  // must be rejected — the implementation uses a VALID_SOURCES allowlist Set,
+  // these tests make the boundary explicit.
+  it.each([
+    ['null', null],
+    ['number', 123],
+    ['object', { __proto__: { polluted: true } }],
+  ])('POST /decision with source:%s does not store a source value', async (label, sourceValue) => {
+    if (!portWasFree) return; // port busy — daemon describe skips entirely
+
+    const id = await registerEntry(`source-type-${label}`);
+
+    await fetch(`http://127.0.0.1:${DAEMON_PORT}/decision/${id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Node9-Token': csrfToken },
+      body: JSON.stringify({ decision: 'allow', source: sourceValue }),
+    });
+
+    const waitRes = await fetch(`http://127.0.0.1:${DAEMON_PORT}/wait/${id}`);
+    const body = (await waitRes.json()) as { decision: string; source?: string };
+    expect(body.decision).toBe('allow');
+    expect(body.source).toBeUndefined();
+  });
+
+  it('POST /decision without CSRF token returns 403', async ({ skip }) => {
+    if (!portWasFree) skip();
+
+    const id = await registerEntry('csrf-missing');
+
+    const res = await fetch(`http://127.0.0.1:${DAEMON_PORT}/decision/${id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' }, // no X-Node9-Token
+      body: JSON.stringify({ decision: 'allow' }),
+    });
+    expect(res.status).toBe(403);
+  });
+
+  it('POST /decision with wrong CSRF token returns 403', async ({ skip }) => {
+    if (!portWasFree) skip();
+
+    const id = await registerEntry('csrf-wrong');
+
+    const res = await fetch(`http://127.0.0.1:${DAEMON_PORT}/decision/${id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Node9-Token': 'wrong-token' },
+      body: JSON.stringify({ decision: 'allow' }),
+    });
+    expect(res.status).toBe(403);
+  });
+
+  // Regression: POST /check with slackDelegated:true must NOT trigger the
+  // background authorizeHeadless call — that would create a duplicate cloud
+  // request (cloudRequestId2) that never gets resolved in Mission Control.
+  it('POST /check with slackDelegated:true creates entry but skips background auth', async ({
+    skip,
+  }) => {
+    if (!portWasFree) skip();
+
+    const checkRes = await fetch(`http://127.0.0.1:${DAEMON_PORT}/check`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        toolName: 'bash',
+        args: { command: 'git push' },
+        slackDelegated: true,
+      }),
+    });
+    expect(checkRes.ok).toBe(true);
+    const { id } = (await checkRes.json()) as { id: string };
+    expect(id).toBeTruthy();
+
+    // Give the daemon 500ms to run any background work — if background auth ran,
+    // it would resolve the entry immediately (audit mode auto-approves). The entry
+    // must stay pending because slackDelegated skips background auth entirely.
+    await new Promise((r) => setTimeout(r, 500));
+
+    // Resolve via /decision so GET /wait doesn't hang the test
+    const d = await fetch(`http://127.0.0.1:${DAEMON_PORT}/decision/${id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Node9-Token': csrfToken },
+      body: JSON.stringify({ decision: 'deny' }),
+    });
+    // If the entry was already auto-resolved by background auth, /decision returns 409.
+    // It must return 200 — the entry was still pending (background auth was skipped).
+    expect(d.status).toBe(200);
   });
 });

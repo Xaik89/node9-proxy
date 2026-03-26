@@ -1,6 +1,4 @@
 // src/core.ts
-import chalk from 'chalk';
-import { confirm } from '@inquirer/prompts';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -10,7 +8,7 @@ import { spawnSync } from 'child_process';
 import pm from 'picomatch';
 import safeRegex from 'safe-regex2';
 import { parse } from 'sh-syntax';
-import { askNativePopup, sendDesktopNotification } from './ui/native';
+import { askNativePopup } from './ui/native';
 import { computeRiskMetadata, RiskMetadata } from './context-sniper';
 import { sanitizeConfig } from './config-schema';
 import { readActiveShields, readShieldOverrides, getShield } from './shields';
@@ -516,6 +514,7 @@ interface Config {
     enableUndo?: boolean;
     enableHookLogDebug?: boolean;
     approvalTimeoutMs?: number;
+    approvalTimeoutSeconds?: number;
     flightRecorder?: boolean;
     approvers: { native: boolean; browser: boolean; cloud: boolean; terminal: boolean };
     environment?: string;
@@ -572,7 +571,7 @@ export const DEFAULT_CONFIG: Config = {
     autoStartDaemon: true,
     enableUndo: true, // 🔥 ALWAYS TRUE BY DEFAULT for the safety net
     enableHookLogDebug: true,
-    approvalTimeoutMs: 30000, // 30-second auto-deny timeout
+    approvalTimeoutMs: 120_000, // 120-second auto-deny timeout
     flightRecorder: true,
     approvers: { native: true, browser: true, cloud: false, terminal: true },
   },
@@ -1428,24 +1427,24 @@ export function getPersistentDecision(toolName: string): 'allow' | 'deny' | null
   return null;
 }
 
-async function askDaemon(
+/**
+ * Register a new approval entry with the daemon and return its ID.
+ * Both the browser racer (GET /wait) and the terminal racer (POST /decision)
+ * share this entry — it must be created before the race starts.
+ */
+async function registerDaemonEntry(
   toolName: string,
   args: unknown,
   meta?: { agent?: string; mcpServer?: string },
-  signal?: AbortSignal,
   riskMetadata?: RiskMetadata,
-  activityId?: string
-): Promise<'allow' | 'deny' | 'abandoned'> {
+  activityId?: string,
+  cwd?: string
+): Promise<string> {
   const base = `http://${DAEMON_HOST}:${DAEMON_PORT}`;
-
-  // Custom abort logic for Node 18 compatibility
-  const checkCtrl = new AbortController();
-  const checkTimer = setTimeout(() => checkCtrl.abort(), 5000);
-  const onAbort = () => checkCtrl.abort();
-  if (signal) signal.addEventListener('abort', onAbort);
-
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 5000);
   try {
-    const checkRes = await fetch(`${base}/check`, {
+    const res = await fetch(`${base}/check`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -1456,34 +1455,39 @@ async function askDaemon(
         fromCLI: true,
         // Pass the flight-recorder ID so the daemon uses the same UUID for
         // activity-result as the CLI used for the pending activity event.
-        // Without this, the two UUIDs never match and tail.ts never resolves
-        // the pending item.
         activityId,
         ...(riskMetadata && { riskMetadata }),
+        ...(cwd && { cwd }),
       }),
-      signal: checkCtrl.signal,
+      signal: ctrl.signal,
     });
-    if (!checkRes.ok) throw new Error('Daemon fail');
-    const { id } = (await checkRes.json()) as { id: string };
-
-    const waitCtrl = new AbortController();
-    const waitTimer = setTimeout(() => waitCtrl.abort(), 120_000);
-    const onWaitAbort = () => waitCtrl.abort();
-    if (signal) signal.addEventListener('abort', onWaitAbort);
-
-    try {
-      const waitRes = await fetch(`${base}/wait/${id}`, { signal: waitCtrl.signal });
-      if (!waitRes.ok) return 'deny';
-      const { decision } = (await waitRes.json()) as { decision: string };
-      if (decision === 'allow') return 'allow';
-      if (decision === 'abandoned') return 'abandoned';
-      return 'deny';
-    } finally {
-      clearTimeout(waitTimer);
-      if (signal) signal.removeEventListener('abort', onWaitAbort);
-    }
+    if (!res.ok) throw new Error('Daemon fail');
+    const { id } = (await res.json()) as { id: string };
+    return id;
   } finally {
-    clearTimeout(checkTimer);
+    clearTimeout(timer);
+  }
+}
+
+/** Long-poll the daemon for a decision on an already-registered entry. */
+async function waitForDaemonDecision(
+  id: string,
+  signal?: AbortSignal
+): Promise<{ decision: 'allow' | 'deny' | 'abandoned'; source?: string }> {
+  const base = `http://${DAEMON_HOST}:${DAEMON_PORT}`;
+  const waitCtrl = new AbortController();
+  const waitTimer = setTimeout(() => waitCtrl.abort(), 120_000);
+  const onAbort = () => waitCtrl.abort();
+  if (signal) signal.addEventListener('abort', onAbort);
+  try {
+    const waitRes = await fetch(`${base}/wait/${id}`, { signal: waitCtrl.signal });
+    if (!waitRes.ok) return { decision: 'deny' };
+    const { decision, source } = (await waitRes.json()) as { decision: string; source?: string };
+    if (decision === 'allow') return { decision: 'allow', source };
+    if (decision === 'abandoned') return { decision: 'abandoned', source };
+    return { decision: 'deny', source };
+  } finally {
+    clearTimeout(waitTimer);
     if (signal) signal.removeEventListener('abort', onAbort);
   }
 }
@@ -1530,20 +1534,18 @@ async function resolveViaDaemon(
 }
 
 /**
- * Authorization state machine — 6 states based on:
+ * Authorization state machine:
  *   hasSlack()      = credentials.json exists AND slackEnabled
  *   isDaemonRunning = local approval daemon on localhost:7391
- *   allowTerminalFallback = caller allows interactive Y/N
  *
  * State table:
  *  hasSlack | daemon | result
  *  -------- | ------ | ------
  *  true     | yes    | Slack authority + daemon viewer card
  *  true     | no     | Slack authority only (no browser)
- *  false    | yes    | Browser authority
+ *  false    | yes    | Browser/tail authority
  *  false    | no     | noApprovalMechanism  (CLI auto-starts daemon if autoStartDaemon=true)
- *  false    | no+TTY | terminal Y/N prompt  (when allowTerminalFallback=true)
- *  false    | no+noTTY | block
+ *  false    | no     | block
  */
 export interface AuthResult {
   approved: boolean;
@@ -1567,6 +1569,8 @@ export interface AuthResult {
     | 'trust'
     | 'paused'
     | 'audit';
+  /** Structured decision source from the winning racer — used for cloud audit reporting. */
+  decisionSource?: 'terminal' | 'browser' | 'native' | 'cloud' | 'timeout' | 'local';
 }
 
 // ── Flight Recorder — fire-and-forget socket notify ──────────────────────────
@@ -1606,16 +1610,15 @@ function notifyActivity(data: {
 export async function authorizeHeadless(
   toolName: string,
   args: unknown,
-  allowTerminalFallback = false,
   meta?: { agent?: string; mcpServer?: string },
-  options?: { calledFromDaemon?: boolean }
+  options?: { calledFromDaemon?: boolean; cwd?: string }
 ): Promise<AuthResult> {
   // Skip socket notification when called from daemon — daemon already broadcasts via SSE
   if (!options?.calledFromDaemon) {
     const actId = randomUUID();
     const actTs = Date.now();
     await notifyActivity({ id: actId, ts: actTs, tool: toolName, args, status: 'pending' });
-    const result = await _authorizeHeadlessCore(toolName, args, allowTerminalFallback, meta, {
+    const result = await _authorizeHeadlessCore(toolName, args, meta, {
       ...options,
       activityId: actId,
     });
@@ -1637,22 +1640,21 @@ export async function authorizeHeadless(
     }
     return result;
   }
-  return _authorizeHeadlessCore(toolName, args, allowTerminalFallback, meta, options);
+  return _authorizeHeadlessCore(toolName, args, meta, options);
 }
 
 async function _authorizeHeadlessCore(
   toolName: string,
   args: unknown,
-  allowTerminalFallback = false,
   meta?: { agent?: string; mcpServer?: string },
-  options?: { calledFromDaemon?: boolean; activityId?: string }
+  options?: { calledFromDaemon?: boolean; activityId?: string; cwd?: string }
 ): Promise<AuthResult> {
   if (process.env.NODE9_PAUSED === '1') return { approved: true, checkedBy: 'paused' };
   const pauseState = checkPause();
   if (pauseState.paused) return { approved: true, checkedBy: 'paused' };
 
   const creds = getCredentials();
-  const config = getConfig();
+  const config = getConfig(options?.cwd);
 
   // 1. Check if we are in any kind of test environment (Vitest, CI, or E2E)
   const isTestEnv = !!(
@@ -1733,10 +1735,8 @@ async function _authorizeHeadlessCore(
         if (approvers.cloud && creds?.apiKey) {
           await auditLocalAllow(toolName, args, 'audit-mode', creds, meta);
         }
-        sendDesktopNotification(
-          'Node9 Audit Mode',
-          `Would have blocked "${toolName}" (${policyResult.blockedByLabel || 'Local Config'}) — running in audit mode`
-        );
+        // Note: desktop notification intentionally omitted — notify-send routes through
+        // the browser on many Linux setups (Firefox as D-Bus handler), causing spurious popups.
       }
     }
     return { approved: true, checkedBy: 'audit' };
@@ -1804,9 +1804,8 @@ async function _authorizeHeadlessCore(
     return { approved: true };
   }
 
-  // ── THE HANDSHAKE (Phase 4.1: Remote Lock Check) ──────────────────────────
+  // ── THE HANDSHAKE (Phase 4.1: Cloud Init) ────────────────────────────────
   let cloudRequestId: string | null = null;
-  let isRemoteLocked = false;
   const cloudEnforced = approvers.cloud && !!creds?.apiKey;
 
   if (cloudEnforced) {
@@ -1816,14 +1815,6 @@ async function _authorizeHeadlessCore(
       if (!initResult.pending) {
         // Shadow mode: allowed through, but warn the developer passively
         if (initResult.shadowMode) {
-          console.error(
-            chalk.yellow(
-              `\n⚠️  Node9 Shadow Mode: Action allowed, but would have been blocked by company policy.`
-            )
-          );
-          if (initResult.shadowReason) {
-            console.error(chalk.dim(`   Reason: ${initResult.shadowReason}\n`));
-          }
           return { approved: true, checkedBy: 'cloud' };
         }
         return {
@@ -1838,49 +1829,11 @@ async function _authorizeHeadlessCore(
       }
 
       cloudRequestId = initResult.requestId || null;
-      isRemoteLocked = !!initResult.remoteApprovalOnly; // 🔒 THE GOVERNANCE LOCK
+      // remoteApprovalOnly is noted but not enforced — local UI always has control.
+      // Hard blocks are handled by Shields before the UI opens.
       explainableLabel = 'Organization Policy (SaaS)';
-    } catch (err: unknown) {
-      const error = err as Error;
-      const isAuthError = error.message.includes('401') || error.message.includes('403');
-      const isNetworkError =
-        error.message.includes('fetch') ||
-        error.name === 'AbortError' ||
-        error.message.includes('ECONNREFUSED');
-
-      const reason = isAuthError
-        ? 'Invalid or missing API key. Run `node9 login` to generate a key (must start with n9_live_).'
-        : isNetworkError
-          ? 'Could not reach the Node9 cloud. Check your network or API URL.'
-          : error.message;
-
-      console.error(
-        chalk.yellow(`\n⚠️  Node9: Cloud API Handshake failed — ${reason}`) +
-          chalk.dim(`\n   Falling back to local rules...\n`)
-      );
-    }
-  }
-
-  // ── TERMINAL STATUS ─────────────────────────────────────────────────────────
-  // Print before the race so the message is guaranteed to show regardless of
-  // which channel wins (cloud message was previously lost when native popup
-  // resolved first and aborted the race before pollNode9SaaS could print it).
-  // Skip when called from the daemon — the CLI already printed this message.
-  if (!options?.calledFromDaemon) {
-    if (cloudEnforced && cloudRequestId) {
-      console.error(
-        chalk.yellow('\n🛡️  Node9: Action suspended — waiting for Organization approval.')
-      );
-      console.error(
-        chalk.cyan('   Dashboard  → ') + chalk.bold('Mission Control > Activity Feed\n')
-      );
-    } else if (!cloudEnforced) {
-      const cloudOffReason = !creds?.apiKey
-        ? 'no API key — run `node9 login` to connect'
-        : 'privacy mode (cloud disabled)';
-      console.error(
-        chalk.dim(`\n🛡️  Node9: intercepted "${toolName}" — cloud off (${cloudOffReason})\n`)
-      );
+    } catch {
+      // Cloud API handshake failed — fall through to local rules silently
     }
   }
 
@@ -1913,16 +1866,43 @@ async function _authorizeHeadlessCore(
   let viewerId: string | null = null;
   const internalToken = getInternalToken();
 
+  // Pre-register a daemon entry shared by Racers 3 (browser/terminal) and, when
+  // cloudEnforced, by RACER 1 as well (reusing the same card — no duplicate).
+  // notifyDaemonViewer is moved here (out of RACER 1) so viewerId is known before
+  // the race starts, allowing RACER 3 to use it as its entry ID.
+  let daemonEntryId: string | null = null;
+  if (
+    (approvers.browser || approvers.terminal) &&
+    isDaemonRunning() &&
+    !options?.calledFromDaemon
+  ) {
+    if (cloudEnforced && cloudRequestId) {
+      // Cloud path: create a single card via notifyDaemonViewer so RACER 3
+      // (terminal/browser) shares the same daemon entry — no duplicate card.
+      // Local UI always participates in the race regardless of cloud policy.
+      viewerId = await notifyDaemonViewer(toolName, args, meta, riskMetadata).catch(() => null);
+      daemonEntryId = viewerId;
+    } else {
+      try {
+        daemonEntryId = await registerDaemonEntry(
+          toolName,
+          args,
+          meta,
+          riskMetadata,
+          options?.activityId,
+          options?.cwd
+        );
+      } catch {
+        // Daemon unreachable — skip both racers gracefully
+      }
+    }
+  }
+
   // 🏁 RACER 1: Cloud SaaS Channel (The Poller)
   if (cloudEnforced && cloudRequestId) {
     racePromises.push(
       (async () => {
         try {
-          if (isDaemonRunning() && internalToken && !options?.calledFromDaemon) {
-            viewerId = await notifyDaemonViewer(toolName, args, meta, riskMetadata).catch(
-              () => null
-            );
-          }
           const cloudResult = await pollNode9SaaS(cloudRequestId, creds!, signal);
 
           return {
@@ -1950,13 +1930,12 @@ async function _authorizeHeadlessCore(
   if (approvers.native && !isManual && !options?.calledFromDaemon) {
     racePromises.push(
       (async () => {
-        // Pass isRemoteLocked so the popup knows to hide the "Allow" button
         const decision = await askNativePopup(
           toolName,
           args,
           meta?.agent,
           explainableLabel,
-          isRemoteLocked,
+          false,
           signal,
           policyMatchedField,
           policyMatchedWord
@@ -1976,116 +1955,43 @@ async function _authorizeHeadlessCore(
           checkedBy: isApproved ? 'daemon' : undefined,
           blockedBy: isApproved ? undefined : 'local-decision',
           blockedByLabel: 'User Decision (Native)',
+          decisionSource: 'native',
         };
       })()
     );
   }
 
-  // 🏁 RACER 3: Browser Dashboard
-  // Skip when cloudEnforced — notifyDaemonViewer already created a viewer card on
-  // the dashboard. Running askDaemon on top would create a second duplicate entry,
-  // open a second browser tab, and fire a second daemon authorizeHeadless call.
-  if (approvers.browser && isDaemonRunning() && !options?.calledFromDaemon && !cloudEnforced) {
+  // 🏁 RACER 3: Browser Dashboard or node9 tail (interactive terminal)
+  // Both channels resolve via POST /decision/{id} — same waitForDaemonDecision poll.
+  // When cloudEnforced, daemonEntryId == viewerId (same card, no duplicate).
+  // Local UI always participates in the race — cloud remoteApprovalOnly is not enforced.
+  if (daemonEntryId && (approvers.browser || approvers.terminal)) {
     racePromises.push(
       (async () => {
-        try {
-          if (!approvers.native && !cloudEnforced) {
-            console.error(
-              chalk.yellow('\n🛡️  Node9: Action suspended — waiting for browser approval.')
-            );
-            console.error(chalk.cyan(`   URL → http://${DAEMON_HOST}:${DAEMON_PORT}/\n`));
-          }
+        const { decision: daemonDecision, source: decisionSource } = await waitForDaemonDecision(
+          daemonEntryId!,
+          signal
+        );
+        if (daemonDecision === 'abandoned') throw new Error('Abandoned');
 
-          const daemonDecision = await askDaemon(
-            toolName,
-            args,
-            meta,
-            signal,
-            riskMetadata,
-            options?.activityId
-          );
-          if (daemonDecision === 'abandoned') throw new Error('Abandoned');
-
-          const isApproved = daemonDecision === 'allow';
-          return {
-            approved: isApproved,
-            reason: isApproved
-              ? undefined
-              : 'The human user rejected this action via the Node9 Browser Dashboard.',
-            checkedBy: isApproved ? 'daemon' : undefined,
-            blockedBy: isApproved ? undefined : 'local-decision',
-            blockedByLabel: 'User Decision (Browser)',
-          };
-        } catch (err) {
-          throw err;
-        }
-      })()
-    );
-  }
-
-  // 🏁 RACER 4: Terminal Prompt
-  if (approvers.terminal && allowTerminalFallback && process.stdout.isTTY) {
-    racePromises.push(
-      (async () => {
-        try {
-          if (explainableLabel.includes('DLP')) {
-            console.log(chalk.bgRed.white.bold(` 🚨 NODE9 DLP ALERT — CREDENTIAL DETECTED `));
-            console.log(
-              chalk.red.bold(`   A sensitive secret was detected in the tool arguments!`)
-            );
-          } else {
-            console.log(chalk.bgRed.white.bold(` 🛑 NODE9 INTERCEPTOR `));
-          }
-          console.log(`${chalk.bold('Action:')} ${chalk.red(toolName)}`);
-          console.log(`${chalk.bold('Flagged By:')} ${chalk.yellow(explainableLabel)}`);
-
-          if (isRemoteLocked) {
-            console.log(chalk.yellow(`⚡ LOCKED BY ADMIN POLICY: Waiting for Slack Approval...\n`));
-            // If locked, we don't ask [Y/n]. We just keep the promise alive until the SaaS wins and aborts it.
-            await new Promise((_, reject) => {
-              signal.addEventListener('abort', () => reject(new Error('Aborted by SaaS')));
-            });
-          }
-
-          const TIMEOUT_MS = 60_000;
-          let timer: NodeJS.Timeout;
-          const result = await new Promise<boolean>((resolve, reject) => {
-            timer = setTimeout(() => reject(new Error('Terminal Timeout')), TIMEOUT_MS);
-            confirm(
-              { message: `Authorize? (auto-deny in ${TIMEOUT_MS / 1000}s)`, default: false },
-              { signal }
-            )
-              .then(resolve)
-              .catch(reject);
-          });
-          clearTimeout(timer!);
-
-          return {
-            approved: result,
-            reason: result
-              ? undefined
-              : "The human user typed 'N' in the terminal to reject this action.",
-            checkedBy: result ? 'terminal' : undefined,
-            blockedBy: result ? undefined : 'local-decision',
-            blockedByLabel: 'User Decision (Terminal)',
-          };
-        } catch (err: unknown) {
-          const error = err as Error;
-          if (
-            error.name === 'AbortError' ||
-            error.message?.includes('Prompt was canceled') ||
-            error.message?.includes('Aborted by SaaS')
-          )
-            throw err;
-          if (error.message === 'Terminal Timeout') {
-            return {
-              approved: false,
-              reason: 'The terminal prompt timed out without a human response.',
-              blockedBy: 'local-decision',
-            };
-          }
-          throw err;
-        }
+        const isApproved = daemonDecision === 'allow';
+        const src: 'terminal' | 'browser' =
+          decisionSource === 'terminal' || decisionSource === 'browser'
+            ? decisionSource
+            : approvers.browser
+              ? 'browser'
+              : 'terminal';
+        const via = src === 'terminal' ? 'Terminal (node9 tail)' : 'Browser Dashboard';
+        return {
+          approved: isApproved,
+          reason: isApproved
+            ? undefined
+            : `The human user rejected this action via the Node9 ${via}.`,
+          checkedBy: isApproved ? 'daemon' : undefined,
+          blockedBy: isApproved ? undefined : 'local-decision',
+          blockedByLabel: `User Decision (${via})`,
+          decisionSource: src,
+        };
       })()
     );
   }
@@ -2157,7 +2063,12 @@ async function _authorizeHeadlessCore(
   // We await this (not fire-and-forget) because the CLI process may exit
   // immediately after this function returns, killing any in-flight fetch.
   if (cloudRequestId && creds && finalResult.checkedBy !== 'cloud') {
-    await resolveNode9SaaS(cloudRequestId, creds, finalResult.approved);
+    await resolveNode9SaaS(
+      cloudRequestId,
+      creds,
+      finalResult.approved,
+      finalResult.decisionSource ?? finalResult.checkedBy ?? 'local'
+    );
   }
 
   if (!isManual) {
@@ -2234,6 +2145,10 @@ export function getConfig(cwd?: string): Config {
       mergedSettings.enableHookLogDebug = s.enableHookLogDebug;
     if (s.approvers) mergedSettings.approvers = { ...mergedSettings.approvers, ...s.approvers };
     if (s.approvalTimeoutMs !== undefined) mergedSettings.approvalTimeoutMs = s.approvalTimeoutMs;
+    // approvalTimeoutSeconds is the user-facing alias; convert to ms.
+    // approvalTimeoutMs takes precedence if both are present.
+    if (s.approvalTimeoutSeconds !== undefined && s.approvalTimeoutMs === undefined)
+      mergedSettings.approvalTimeoutMs = s.approvalTimeoutSeconds * 1000;
     if (s.environment !== undefined) mergedSettings.environment = s.environment;
 
     if (p.sandboxPaths) mergedPolicy.sandboxPaths.push(...p.sandboxPaths);
@@ -2407,7 +2322,7 @@ export function getCredentials() {
 }
 
 export async function authorizeAction(toolName: string, args: unknown): Promise<boolean> {
-  const result = await authorizeHeadless(toolName, args, true);
+  const result = await authorizeHeadless(toolName, args);
   return result.approved;
 }
 
@@ -2538,11 +2453,9 @@ async function pollNode9SaaS(
       const { status, reason } = (await statusRes.json()) as { status: string; reason?: string };
 
       if (status === 'APPROVED') {
-        console.error(chalk.green('✅  Approved via Cloud.\n'));
         return { approved: true, reason };
       }
       if (status === 'DENIED' || status === 'AUTO_BLOCKED' || status === 'TIMED_OUT') {
-        console.error(chalk.red('❌  Denied via Cloud.\n'));
         return { approved: false, reason };
       }
     } catch {
@@ -2559,20 +2472,33 @@ async function pollNode9SaaS(
 async function resolveNode9SaaS(
   requestId: string,
   creds: { apiKey: string; apiUrl: string },
-  approved: boolean
+  approved: boolean,
+  decidedBy?: string
 ): Promise<void> {
   try {
     const resolveUrl = `${creds.apiUrl}/requests/${requestId}`;
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 5000);
-    await fetch(resolveUrl, {
+    const res = await fetch(resolveUrl, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${creds.apiKey}` },
-      body: JSON.stringify({ decision: approved ? 'APPROVED' : 'DENIED' }),
+      body: JSON.stringify({
+        decision: approved ? 'APPROVED' : 'DENIED',
+        ...(decidedBy && { decidedBy }),
+      }),
       signal: ctrl.signal,
     });
     clearTimeout(timer);
-  } catch {
-    /* fire-and-forget — don't block the proxy on a network error */
+    if (!res.ok) {
+      fs.appendFileSync(
+        HOOK_DEBUG_LOG,
+        `[resolve-cloud] PATCH ${resolveUrl} → HTTP ${res.status}\n`
+      );
+    }
+  } catch (err) {
+    fs.appendFileSync(
+      HOOK_DEBUG_LOG,
+      `[resolve-cloud] PATCH failed for ${requestId}: ${(err as Error).message}\n`
+    );
   }
 }

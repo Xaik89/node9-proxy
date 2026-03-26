@@ -63,7 +63,8 @@
     "prepublishOnly": "npm run validate",
     "test": "vitest --run",
     "test:watch": "vitest",
-    "test:ui": "vitest --ui"
+    "test:ui": "vitest --ui",
+    "dev:tail": "node -e \"try{const d=JSON.parse(require('fs').readFileSync(require('os').homedir()+'/.node9/daemon.pid','utf8'));process.kill(d.pid)}catch(e){if(e.code!=='ESRCH'&&e.code!=='ENOENT')process.stderr.write(e.message+'\\n')}\" && npm run build && node dist/cli.js tail"
   },
   "dependencies": {
     "@inquirer/prompts": "^8.3.0",

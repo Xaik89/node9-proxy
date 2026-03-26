@@ -1,22 +1,34 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import http from 'http';
+import { PassThrough } from 'stream';
+import { EventEmitter } from 'events';
 
 // Mock heavy dependencies before importing tail
 vi.mock('fs');
 vi.mock('os', () => ({ default: { homedir: () => '/mock/home', tmpdir: () => '/tmp' } }));
 vi.mock('../daemon', () => ({ DAEMON_PORT: 7391 }));
-vi.mock('chalk', () => ({
-  default: {
-    green: (s: string) => s,
-    red: (s: string) => s,
-    cyan: { bold: (s: string) => ({ toString: () => s }) },
-    dim: (s: string) => s,
-    yellow: (s: string) => s,
-    gray: (s: string) => s,
-    white: { bold: (s: string) => s },
-  },
+vi.mock('chalk', () => {
+  const fn = (s: string) => s;
+  const withBold = (s: string) => Object.assign(fn(s), { toString: () => s });
+  return {
+    default: {
+      green: fn,
+      red: fn,
+      // chalk.cyan('…') and chalk.cyan.bold('…') are both used
+      cyan: Object.assign(fn, { bold: withBold }),
+      dim: fn,
+      yellow: fn,
+      gray: fn,
+      bold: fn,
+      white: Object.assign(fn, { bold: fn }),
+      bgRed: { white: { bold: fn } },
+    },
+  };
+});
+vi.mock('child_process', () => ({ spawn: vi.fn(), execSync: vi.fn() }));
+vi.mock('../core', () => ({
+  getConfig: vi.fn(() => ({ settings: { approvers: { browser: false } } })),
 }));
-vi.mock('child_process', () => ({ spawn: vi.fn() }));
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -197,5 +209,175 @@ describe('startTail --history flag', () => {
     expect(String(getSpy.mock.calls[0][0])).not.toContain('/clear');
     // Error listener is always registered on the request
     expect(mockReq.on).toHaveBeenCalledWith('error', expect.any(Function));
+  });
+});
+
+// ── Interactive approval card – keypress regression ───────────────────────────
+//
+// Regression for: tail card rendered but [A]/[D] keypresses completely
+// unresponsive — caused by using raw `stdin.on('data', ...)` instead of
+// `readline.emitKeypressEvents` + `stdin.on('keypress', ...)`.
+//
+// Strategy:
+//   - Replace process.stdin with an EventEmitter that has isTTY=true and
+//     TTY methods (setRawMode, resume, pause) so canApprove=true.
+//   - Use a PassThrough stream as the fake SSE HTTP response — real readline
+//     parses it, no readline mock needed.
+//   - Spy on mockStdin.on AFTER startTail() initialises (so emitKeypressEvents
+//     internal data listener is not captured) to verify only 'keypress' is
+//     registered when a card arrives, never 'data'.
+//   - Invoke the captured keypress handler directly to test allow/deny logic.
+
+describe('interactive approval card – keypress regression', () => {
+  const originalStdin = process.stdin;
+
+  type MockStdin = EventEmitter & {
+    isTTY: boolean;
+    setRawMode: ReturnType<typeof vi.fn>;
+    resume: ReturnType<typeof vi.fn>;
+    pause: ReturnType<typeof vi.fn>;
+  };
+
+  let mockStdin: MockStdin;
+  let sseStream: PassThrough & { statusCode: number };
+
+  const tick = (): Promise<void> => new Promise((r) => setImmediate(r));
+
+  function sendSse(event: string, data: unknown): void {
+    sseStream.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  }
+
+  /** Spy on http.request and capture the last POSTed body + call the 200 callback. */
+  function captureDecision(): { getBody: () => string } {
+    let requestBody = '';
+    vi.spyOn(http, 'request').mockImplementation(
+      (_opts: unknown, callback?: unknown) =>
+        ({
+          on: vi.fn(),
+          end: vi.fn((body: string) => {
+            requestBody = body;
+            if (typeof callback === 'function')
+              (callback as (r: unknown) => void)({ statusCode: 200, resume: vi.fn() });
+          }),
+        }) as unknown as http.ClientRequest
+    );
+    return { getBody: () => requestBody };
+  }
+
+  beforeEach(() => {
+    vi.resetModules();
+    vi.clearAllMocks();
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true }));
+
+    // Prevent process.exit() from killing the test runner when the SSE stream
+    // closes (tail.ts calls process.exit(1) on disconnect).
+    vi.spyOn(process, 'exit').mockImplementation(() => undefined as never);
+    // Prevent SIGINT listener accumulation across test runs.
+    vi.spyOn(process, 'on').mockReturnValue(process);
+
+    // Fake TTY stdin: EventEmitter + TTY-specific methods.
+    mockStdin = Object.assign(new EventEmitter(), {
+      isTTY: true,
+      setRawMode: vi.fn().mockReturnThis(),
+      resume: vi.fn().mockReturnThis(),
+      pause: vi.fn().mockReturnThis(),
+    }) as MockStdin;
+    Object.defineProperty(process, 'stdin', { value: mockStdin, configurable: true });
+
+    // Fake TTY stdout (suppresses terminal writes in test output).
+    Object.defineProperty(process.stdout, 'isTTY', { value: true, configurable: true });
+    vi.spyOn(process.stdout, 'write').mockReturnValue(true);
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    // PassThrough stream acts as an http.IncomingMessage for readline.
+    sseStream = Object.assign(new PassThrough(), { statusCode: 200 });
+    vi.spyOn(http, 'get').mockImplementation((_url: unknown, callback?: unknown) => {
+      if (typeof callback === 'function')
+        (callback as (r: unknown) => void)(sseStream as unknown as http.IncomingMessage);
+      return { on: vi.fn() } as unknown as http.ClientRequest;
+    });
+  });
+
+  afterEach(() => {
+    Object.defineProperty(process, 'stdin', { value: originalStdin, configurable: true });
+    Object.defineProperty(process.stdout, 'isTTY', { value: undefined, configurable: true });
+    sseStream.destroy();
+    vi.restoreAllMocks();
+  });
+
+  it('registers keypress listener (not data) on stdin when an interactive card arrives', async () => {
+    const { startTail } = await import('../tui/tail.js');
+    void startTail({});
+    await tick(); // let readline attach to sseStream
+
+    // Spy AFTER init so emitKeypressEvents internal `data` listener is not captured.
+    const stdinOnSpy = vi.spyOn(mockStdin, 'on');
+
+    sendSse('csrf', { token: 'tok' });
+    sendSse('add', { id: 'r1', toolName: 'bash', args: { command: 'ls' }, interactive: true });
+    await tick();
+
+    const events = stdinOnSpy.mock.calls.map((c) => c[0]);
+    // Must register a 'keypress' listener for the card — regression guard against
+    // reverting to raw 'data' events (tests 2 & 3 verify the handler fires correctly).
+    expect(events).toContain('keypress');
+    expect(mockStdin.setRawMode).toHaveBeenCalledWith(true);
+  });
+
+  it('[A] keypress sends allow decision to daemon', async () => {
+    const { getBody } = captureDecision();
+    const { startTail } = await import('../tui/tail.js');
+    void startTail({});
+    await tick();
+
+    const stdinOnSpy = vi.spyOn(mockStdin, 'on');
+    sendSse('csrf', { token: 'csrf123' });
+    sendSse('add', { id: 'r2', toolName: 'bash', args: {}, interactive: true });
+    await tick();
+
+    const call = stdinOnSpy.mock.calls.find((c) => c[0] === 'keypress');
+    expect(call).toBeDefined();
+    const handler = call![1] as (str: string, key: { name: string }) => void;
+
+    handler('a', { name: 'a' });
+    await tick();
+
+    expect(JSON.parse(getBody())).toMatchObject({ decision: 'allow' });
+  });
+
+  it('[D] keypress sends deny decision to daemon', async () => {
+    const { getBody } = captureDecision();
+    const { startTail } = await import('../tui/tail.js');
+    void startTail({});
+    await tick();
+
+    const stdinOnSpy = vi.spyOn(mockStdin, 'on');
+    sendSse('csrf', { token: 'csrf456' });
+    sendSse('add', { id: 'r3', toolName: 'bash', args: {}, interactive: true });
+    await tick();
+
+    const handler = stdinOnSpy.mock.calls.find((c) => c[0] === 'keypress')![1] as (
+      str: string,
+      key: { name: string }
+    ) => void;
+
+    handler('d', { name: 'd' });
+    await tick();
+
+    expect(JSON.parse(getBody())).toMatchObject({ decision: 'deny' });
+  });
+
+  it('does not register any keypress listener when interactive:false', async () => {
+    const { startTail } = await import('../tui/tail.js');
+    void startTail({});
+    await tick();
+
+    const stdinOnSpy = vi.spyOn(mockStdin, 'on');
+    sendSse('csrf', { token: 'tok' });
+    sendSse('add', { id: 'r4', toolName: 'bash', args: {}, interactive: false });
+    await tick();
+
+    expect(stdinOnSpy.mock.calls.map((c) => c[0])).not.toContain('keypress');
   });
 });

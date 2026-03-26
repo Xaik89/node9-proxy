@@ -1024,7 +1024,7 @@
           const res = await fetch('/decision/' + id, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-Node9-Token': CSRF_TOKEN },
-            body: JSON.stringify({ decision, persist: !!persist }),
+            body: JSON.stringify({ decision, persist: !!persist, source: 'browser' }),
           });
           if (!res.ok) throw new Error('Request failed (HTTP ' + res.status + ')');
           card?.remove();
@@ -1043,7 +1043,7 @@
           const res = await fetch('/decision/' + id, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-Node9-Token': CSRF_TOKEN },
-            body: JSON.stringify({ decision: 'trust', trustDuration: duration }),
+            body: JSON.stringify({ decision: 'trust', trustDuration: duration, source: 'browser' }),
           });
           if (!res.ok) throw new Error('Request failed (HTTP ' + res.status + ')');
           card?.remove();

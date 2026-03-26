@@ -157,10 +157,16 @@ interface PendingEntry {
   waiter: ((d: Decision, reason?: string) => void) | null;
   earlyDecision: Decision | null;
   earlyReason?: string;
+  decisionSource?: string; // 'browser', 'terminal', or undefined (cloud/auto)
+}
+
+interface SseClient {
+  res: http.ServerResponse;
+  capabilities: string[];
 }
 
 const pending = new Map<string, PendingEntry>();
-const sseClients = new Set<http.ServerResponse>();
+const sseClients = new Set<SseClient>();
 let abandonTimer: ReturnType<typeof setTimeout> | null = null;
 let daemonServer: http.Server | null = null;
 let hadBrowserClient = false; // true once at least one SSE client has connected
@@ -211,11 +217,15 @@ function broadcast(event: string, data: unknown) {
   const msg = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
   sseClients.forEach((client) => {
     try {
-      client.write(msg);
+      client.res.write(msg);
     } catch {
       sseClients.delete(client);
     }
   });
+}
+
+export function hasInteractiveClient(): boolean {
+  return [...sseClients].some((c) => c.capabilities.includes('input'));
 }
 
 function openBrowser(url: string) {
@@ -269,6 +279,10 @@ export function startDaemon(): void {
   const IDLE_TIMEOUT_MS = 12 * 60 * 60 * 1000; // 12 hours
   const watchMode = process.env.NODE9_WATCH_MODE === '1';
   let idleTimer: NodeJS.Timeout | undefined;
+  // Track if we've already opened the browser this session so we don't
+  // open duplicate tabs when node9 tail is also running (tail is an SSE
+  // client, so sseClients.size > 0 even when no browser is open).
+  let browserOpened = false;
   function resetIdleTimer() {
     if (watchMode) return; // Watch mode — never idle-timeout
     if (idleTimer) clearTimeout(idleTimer);
@@ -285,7 +299,8 @@ export function startDaemon(): void {
   resetIdleTimer(); // Start the clock
 
   const server = http.createServer(async (req, res) => {
-    const { pathname } = new URL(req.url || '/', `http://${req.headers.host}`);
+    const reqUrl = new URL(req.url || '/', `http://${req.headers.host}`);
+    const { pathname } = reqUrl;
 
     if (req.method === 'GET' && pathname === '/') {
       res.writeHead(200, { 'Content-Type': 'text/html' });
@@ -293,6 +308,14 @@ export function startDaemon(): void {
     }
 
     if (req.method === 'GET' && pathname === '/events') {
+      const capParam = reqUrl.searchParams.get('capabilities') ?? '';
+      const capabilities = capParam
+        ? capParam
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean)
+        : [];
+
       res.writeHead(200, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
@@ -303,7 +326,8 @@ export function startDaemon(): void {
         abandonTimer = null;
       }
       hadBrowserClient = true;
-      sseClients.add(res);
+      const sseClient: SseClient = { res, capabilities };
+      sseClients.add(sseClient);
       res.write(
         `event: init\ndata: ${JSON.stringify({
           requests: Array.from(pending.values()).map((e) => ({
@@ -317,7 +341,7 @@ export function startDaemon(): void {
             mcpServer: e.mcpServer,
           })),
           orgName: getOrgName(),
-          autoDenyMs: AUTO_DENY_MS,
+          autoDenyMs: getConfig().settings.approvalTimeoutMs ?? AUTO_DENY_MS,
         })}\n\n`
       );
       res.write(`event: decisions\ndata: ${JSON.stringify(readPersistentDecisions())}\n\n`);
@@ -331,12 +355,16 @@ export function startDaemon(): void {
           })),
         })}\n\n`
       );
+      // Emit the CSRF token on every connection so reconnecting clients
+      // (including the terminal racer) can acquire it without a browser tab.
+      // Always re-emit the existing token — never generate a new one.
+      res.write(`event: csrf\ndata: ${JSON.stringify({ token: csrfToken })}\n\n`);
       // Replay recent activity history so late-joining browsers see the feed
       for (const item of activityRing) {
         res.write(`event: ${item.event}\ndata: ${JSON.stringify(item.data)}\n\n`);
       }
       return req.on('close', () => {
-        sseClients.delete(res);
+        sseClients.delete(sseClient);
         if (sseClients.size === 0 && pending.size > 0) {
           // Give 10s if browser was already open (page reload / brief disconnect),
           // 15s on cold-start (browser needs time to open and connect SSE).
@@ -364,6 +392,7 @@ export function startDaemon(): void {
           riskMetadata,
           fromCLI = false,
           activityId,
+          cwd,
         } = JSON.parse(body);
         // When fromCLI is true the CLI already sent an 'activity' event with
         // activityId via the Unix socket. Reuse that ID so the daemon's
@@ -396,7 +425,7 @@ export function startDaemon(): void {
               pending.delete(id);
               broadcast('remove', { id });
             }
-          }, AUTO_DENY_MS),
+          }, getConfig().settings.approvalTimeoutMs ?? AUTO_DENY_MS),
         };
         pending.set(id, entry);
 
@@ -413,8 +442,14 @@ export function startDaemon(): void {
           });
         }
 
-        const browserEnabled = getConfig().settings.approvers?.browser !== false;
-        if (browserEnabled) {
+        const projectCwd = typeof cwd === 'string' && path.isAbsolute(cwd) ? cwd : undefined;
+        const projectConfig = getConfig(projectCwd);
+        const browserEnabled = projectConfig.settings.approvers?.browser !== false;
+        const terminalEnabled = projectConfig.settings.approvers?.terminal !== false;
+        // Broadcast 'add' when the browser dashboard is on OR terminal approver is
+        // enabled. Tail may connect after the event fires and will see pending entries
+        // via the SSE stream's initial state — don't gate on hasInteractiveClient().
+        if (browserEnabled || terminalEnabled) {
           broadcast('add', {
             id,
             toolName,
@@ -423,22 +458,31 @@ export function startDaemon(): void {
             slackDelegated: entry.slackDelegated,
             agent: entry.agent,
             mcpServer: entry.mcpServer,
+            interactive: terminalEnabled,
           });
-          // When auto-started, the CLI already called openBrowserLocal() before
-          // the request was registered, so the browser is already opening.
-          // Skip here to avoid opening a duplicate tab.
-          if (sseClients.size === 0 && !autoStarted)
+          // Only the `node9 check` path (autoStartDaemonAndWait) pre-opens the
+          // browser before registering the request — it signals this via
+          // NODE9_BROWSER_OPENED=1 so we don't open a duplicate tab.
+          // `node9 tail`'s ensureDaemon() sets NODE9_AUTO_STARTED=1 for lifecycle
+          // purposes but does NOT pre-open the browser, so we must open it here.
+          const browserAlreadyOpened = process.env.NODE9_BROWSER_OPENED === '1';
+          if (browserEnabled && !browserOpened && !browserAlreadyOpened) {
+            browserOpened = true;
             openBrowser(`http://127.0.0.1:${DAEMON_PORT}/`);
+          }
         }
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ id }));
 
         // Run the full policy + cloud + native pipeline in the background.
         // Browser and terminal racers are skipped (no TTY, browser card already exists via SSE).
+        // Skip when slackDelegated: the hook process already owns the cloud race for this
+        // request — running a second initNode9SaaS here would create a duplicate pending
+        // cloud request that never gets resolved.
+        if (slackDelegated) return;
         authorizeHeadless(
           toolName,
           args,
-          false,
           {
             agent: typeof agent === 'string' ? agent : undefined,
             mcpServer: typeof mcpServer === 'string' ? mcpServer : undefined,
@@ -452,6 +496,15 @@ export function startDaemon(): void {
             // If no background channels were available (no cloud, no native),
             // leave the entry alive so the browser dashboard can decide.
             if (result.noApprovalMechanism) return;
+
+            // In audit mode the hook auto-approves without blocking the tool.
+            // The daemon entry is for display only — leave it for browser/tail
+            // to resolve interactively (or for the auto-deny timer).
+            if (result.checkedBy === 'audit') return;
+
+            // First write wins — POST /decision (browser or tail) may have already
+            // resolved this entry while authorizeHeadless was running in the background.
+            if (e.earlyDecision !== null) return;
 
             // ── Flight Recorder: update the feed item with the final verdict ──
             broadcast('activity-result', {
@@ -506,19 +559,34 @@ export function startDaemon(): void {
       if (!entry) return res.writeHead(404).end();
       if (entry.earlyDecision) {
         clearTimeout(entry.timer); // cancel the 30s cleanup timer set by POST /decision
+        const source = entry.decisionSource;
         pending.delete(id);
         // POST /decision already broadcast 'remove' — don't send a duplicate
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        const body: { decision: Decision; reason?: string } = { decision: entry.earlyDecision };
+        const body: { decision: Decision; reason?: string; source?: string } = {
+          decision: entry.earlyDecision,
+        };
         if (entry.earlyReason) body.reason = entry.earlyReason;
+        if (source) body.source = source;
         return res.end(JSON.stringify(body));
       }
       entry.waiter = (d, reason?) => {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        const body: { decision: Decision; reason?: string } = { decision: d };
+        const body: { decision: Decision; reason?: string; source?: string } = { decision: d };
         if (reason) body.reason = reason;
+        if (entry.decisionSource) body.source = entry.decisionSource;
         res.end(JSON.stringify(body));
       };
+      // When the CLI aborts the long-poll (e.g. native popup won the race),
+      // clean up the entry and dismiss the tail card immediately.
+      req.on('close', () => {
+        const e = pending.get(id);
+        if (e && e.waiter && e.earlyDecision === null) {
+          clearTimeout(e.timer);
+          pending.delete(id);
+          broadcast('remove', { id });
+        }
+      });
       return;
     }
 
@@ -528,11 +596,21 @@ export function startDaemon(): void {
         const id = pathname.split('/').pop()!;
         const entry = pending.get(id);
         if (!entry) return res.writeHead(404).end();
-        const { decision, persist, trustDuration, reason } = JSON.parse(await readBody(req)) as {
+        // Idempotency: first write wins. If a decision is already recorded
+        // (earlyDecision set, or waiter already resolved and entry deleted),
+        // return 409 with the existing decision rather than overwriting it.
+        if (entry.earlyDecision !== null) {
+          res.writeHead(409, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ conflict: true, decision: entry.earlyDecision }));
+        }
+        const { decision, persist, trustDuration, reason, source } = JSON.parse(
+          await readBody(req)
+        ) as {
           decision: string;
           persist?: boolean;
           trustDuration?: string;
           reason?: string;
+          source?: string;
         };
 
         // Trust session
@@ -567,6 +645,8 @@ export function startDaemon(): void {
         });
         clearTimeout(entry.timer);
 
+        const VALID_SOURCES = new Set(['terminal', 'browser', 'native']);
+        if (source && VALID_SOURCES.has(source)) entry.decisionSource = source;
         if (entry.waiter) {
           // GET /wait/:id is already connected — respond and clean up now
           entry.waiter(resolvedDecision, reason);

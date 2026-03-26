@@ -25,7 +25,7 @@ describe('spawn Windows compatibility (#41)', () => {
   it('cli.ts spawns daemon using process.execPath', () => {
     // All daemon-spawning sites must use process.execPath as the first argument.
     const spawnCalls = src.match(/spawn\(process\.execPath,\s*\[process\.argv\[1\],\s*'daemon'\]/g);
-    // Three call sites: autoStartDaemonAndWait, daemon --openui, daemon --background
-    expect(spawnCalls).toHaveLength(3);
+    // Four call sites: autoStartDaemonAndWait, daemon --openui, daemon --background, node9 watch
+    expect(spawnCalls).toHaveLength(4);
   });
 });
