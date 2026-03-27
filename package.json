@@ -1,6 +1,6 @@
 {
   "name": "@node9/proxy",
-  "version": "1.1.7",
+  "version": "1.2.0",
   "description": "The Sudo Command for AI Agents. Execution Security for Claude Code & MCP.",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",
@@ -62,9 +62,10 @@
     "preuninstall": "node9 uninstall || echo 'node9 uninstall failed — remove hooks manually from ~/.claude/settings.json'",
     "prepublishOnly": "npm run validate",
     "test": "vitest --run",
+    "test:coverage": "vitest --run --coverage",
     "test:watch": "vitest",
     "test:ui": "vitest --ui",
-    "dev:tail": "node -e \"try{const d=JSON.parse(require('fs').readFileSync(require('os').homedir()+'/.node9/daemon.pid','utf8'));process.kill(d.pid)}catch(e){if(e.code!=='ESRCH'&&e.code!=='ENOENT')process.stderr.write(e.message+'\\n')}\" && npm run build && node dist/cli.js tail"
+    "dev:tail": "node -e \"try{const d=JSON.parse(require('fs').readFileSync(require('os').homedir()+'/.node9/daemon.pid','utf8'));const pid=d.pid;if(Number.isInteger(pid)&&pid>0&&pid<4194304)process.kill(pid)}catch(e){if(e.code!=='ESRCH'&&e.code!=='ENOENT')process.stderr.write(e.message+'\\n')}\" && npm run build && node dist/cli.js tail"
   },
   "dependencies": {
     "@inquirer/prompts": "^8.3.0",
@@ -86,13 +87,17 @@
     "@semantic-release/release-notes-generator": "^14.1.0",
     "@types/node": "^25.3.1",
     "@types/picomatch": "^4.0.2",
+    "@vitest/coverage-v8": "4.1.2",
     "prettier": "^3.4.2",
     "semantic-release": "^25.0.3",
     "tsup": "^8.5.1",
     "tsx": "^4.21.0",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.20.0",
-    "vitest": "^4.0.18"
+    "vitest": "4.1.2"
+  },
+  "overrides": {
+    "undici": "^7.24.0"
   },
   "publishConfig": {
     "access": "public"
