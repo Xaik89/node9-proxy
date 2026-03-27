@@ -6,4 +6,12 @@ export default defineConfig({
     env: { NODE9_TESTING: '1' },
     clearMocks: true,
   },
+  coverage: {
+    provider: 'v8',
+    include: ['src/**/*.ts'],
+    exclude: ['src/**/__tests__/**', 'src/**/*.d.ts', 'src/daemon/ui.ts'],
+    reporter: ['text', 'html'],
+    reportsDirectory: './coverage',
+    all: true,
+  },
 });
