@@ -24,10 +24,7 @@ import {
 } from './setup';
 import { startDaemon, stopDaemon, daemonStatus, DAEMON_PORT, DAEMON_HOST } from './daemon/index';
 import { spawn, execSync, spawnSync } from 'child_process';
-import { parseCommandString } from 'execa';
-import { execa } from 'execa';
 import chalk from 'chalk';
-import readline from 'readline';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -45,121 +42,18 @@ import {
   isShieldVerdict,
 } from './shields';
 import { confirm } from '@inquirer/prompts';
-
-const { version } = JSON.parse(
-  fs.readFileSync(path.join(__dirname, '../package.json'), 'utf-8')
-) as { version: string };
-
-/** Parse a duration string like "15m", "1h", "30s" → milliseconds, or null if invalid. */
-function parseDuration(str: string): number | null {
-  const m = str.trim().match(/^(\d+(?:\.\d+)?)\s*(s|m|h|d)?$/i);
-  if (!m) return null;
-  const n = parseFloat(m[1]);
-  switch ((m[2] ?? 'm').toLowerCase()) {
-    case 's':
-      return Math.round(n * 1_000);
-    case 'm':
-      return Math.round(n * 60_000);
-    case 'h':
-      return Math.round(n * 3_600_000);
-    case 'd':
-      return Math.round(n * 86_400_000);
-    default:
-      return null;
-  }
-}
+import { parseDuration } from './utils/duration';
 
 function sanitize(value: string): string {
   // eslint-disable-next-line no-control-regex
   return value.replace(/[\x00-\x1F\x7F]/g, '');
 }
+import { buildNegotiationMessage } from './policy/negotiation';
+import { runProxy } from './proxy';
 
-/**
- * Builds a context-specific negotiation message for the AI agent.
- * Instead of a generic "blocked" message, the AI gets actionable instructions
- * based on WHY it was blocked so it can pivot intelligently.
- */
-function buildNegotiationMessage(
-  blockedByLabel: string,
-  isHumanDecision: boolean,
-  humanReason?: string
-): string {
-  if (isHumanDecision) {
-    return `NODE9: The human user rejected this action.
-REASON: ${humanReason || 'No specific reason provided.'}
-INSTRUCTIONS:
-- Do NOT retry this exact command.
-- Acknowledge the block to the user and ask if there is an alternative approach.
-- If you believe this action is critical, explain your reasoning and ask them to run "node9 pause 15m" to proceed.`;
-  }
-
-  const label = blockedByLabel.toLowerCase();
-
-  if (
-    label.includes('dlp') ||
-    label.includes('secret detected') ||
-    label.includes('credential review')
-  ) {
-    return `NODE9 SECURITY ALERT: A sensitive credential (API key, token, or private key) was found in your tool call arguments.
-CRITICAL INSTRUCTION: Do NOT retry this action.
-REQUIRED ACTIONS:
-1. Remove the hardcoded credential from your command or code.
-2. Use an environment variable or a dedicated secrets manager instead.
-3. Treat the leaked credential as compromised and rotate it immediately.
-Do NOT attempt to bypass this check or pass the credential through another tool.`;
-  }
-
-  if (label.includes('sql safety') && label.includes('delete without where')) {
-    return `NODE9: Blocked — DELETE without WHERE clause would wipe the entire table.
-INSTRUCTION: Add a WHERE clause to scope the deletion (e.g. WHERE id = <value>).
-Do NOT retry without a WHERE clause.`;
-  }
-
-  if (label.includes('sql safety') && label.includes('update without where')) {
-    return `NODE9: Blocked — UPDATE without WHERE clause would update every row.
-INSTRUCTION: Add a WHERE clause to scope the update (e.g. WHERE id = <value>).
-Do NOT retry without a WHERE clause.`;
-  }
-
-  if (label.includes('dangerous word')) {
-    const match = blockedByLabel.match(/dangerous word: "([^"]+)"/i);
-    const word = match?.[1] ?? 'a dangerous keyword';
-    return `NODE9: Blocked — command contains forbidden keyword "${word}".
-INSTRUCTION: Do NOT use "${word}". Use a non-destructive alternative.
-Do NOT attempt to bypass this with shell tricks or aliases — it will be blocked again.`;
-  }
-
-  if (label.includes('path blocked') || label.includes('sandbox')) {
-    return `NODE9: Blocked — operation targets a path outside the allowed sandbox.
-INSTRUCTION: Move your output to an allowed directory such as /tmp/ or the project directory.
-Do NOT retry on the same path.`;
-  }
-
-  if (label.includes('inline execution')) {
-    return `NODE9: Blocked — inline code execution (e.g. bash -c "...") is not allowed.
-INSTRUCTION: Use individual tool calls instead of embedding code in a shell string.`;
-  }
-
-  if (label.includes('strict mode')) {
-    return `NODE9: Blocked — strict mode is active. All tool calls require explicit human approval.
-INSTRUCTION: Inform the user this action is pending approval. Wait for them to approve via the dashboard or run "node9 pause".`;
-  }
-
-  if (label.includes('rule') && label.includes('default block')) {
-    const match = blockedByLabel.match(/rule "([^"]+)"/i);
-    const rule = match?.[1] ?? 'a policy rule';
-    return `NODE9: Blocked — action "${rule}" is forbidden by security policy.
-INSTRUCTION: Do NOT use "${rule}". Find a read-only or non-destructive alternative.
-Do NOT attempt to bypass this rule.`;
-  }
-
-  // Generic fallback
-  return `NODE9: Action blocked by security policy [${blockedByLabel}].
-INSTRUCTIONS:
-- Do NOT retry this exact command or attempt to bypass the rule.
-- Pivot to a non-destructive or read-only alternative.
-- Inform the user which security rule was triggered and ask how to proceed.`;
-}
+const { version } = JSON.parse(
+  fs.readFileSync(path.join(__dirname, '../package.json'), 'utf-8')
+) as { version: string };
 
 function openBrowserLocal() {
   const url = `http://${DAEMON_HOST}:${DAEMON_PORT}/`;
@@ -210,119 +104,6 @@ async function autoStartDaemonAndWait(): Promise<boolean> {
 
 const program = new Command();
 program.name('node9').description('The Sudo Command for AI Agents').version(version);
-
-async function runProxy(targetCommand: string) {
-  const commandParts = parseCommandString(targetCommand);
-  const cmd = commandParts[0];
-  const args = commandParts.slice(1);
-
-  let executable = cmd;
-  try {
-    const { stdout } = await execa('which', [cmd]);
-    if (stdout) executable = stdout.trim();
-  } catch {}
-
-  // stderr only — stdout must stay clean for stdio protocols (JSON-RPC, MCP)
-  console.error(chalk.green(`🚀 Node9 Proxy Active: Monitoring [${targetCommand}]`));
-
-  // Spawn the MCP Server / Shell command
-  const child = spawn(executable, args, {
-    stdio: ['pipe', 'pipe', 'inherit'], // We control STDIN and STDOUT
-    shell: false,
-    env: { ...process.env, FORCE_COLOR: '1' },
-  });
-
-  // ── INTERCEPT INPUT (Agent -> Server) ──
-  // This is where 'tools/call' requests come from
-  const agentIn = readline.createInterface({ input: process.stdin, terminal: false });
-
-  agentIn.on('line', async (line) => {
-    let message;
-
-    // 1. Safely attempt to parse JSON first
-    try {
-      message = JSON.parse(line);
-    } catch {
-      // If it's not JSON (raw shell usage), just forward it immediately
-      child.stdin.write(line + '\n');
-      return;
-    }
-
-    // 2. Check if it's an MCP tool call
-    if (
-      message.method === 'call_tool' ||
-      message.method === 'tools/call' ||
-      message.method === 'use_tool'
-    ) {
-      // PAUSE the stream so we don't process the next request while waiting for the human
-      agentIn.pause();
-
-      try {
-        const name = message.params?.name || message.params?.tool_name || 'unknown';
-        const toolArgs = message.params?.arguments || message.params?.tool_input || {};
-
-        // Use our Race Engine to authorize
-        const result = await authorizeHeadless(sanitize(name), toolArgs, {
-          agent: 'Proxy/MCP',
-        });
-
-        if (!result.approved) {
-          // 1. Talk to the human
-          console.error(chalk.red(`\n🛑 Node9 Sudo: Action Blocked`));
-          console.error(chalk.gray(`   Tool: ${name}`));
-          console.error(chalk.gray(`   Reason: ${result.reason || 'Security Policy'}\n`));
-
-          // 2. Talk to the AI with a context-specific negotiation message
-          const blockedByLabel = result.blockedByLabel ?? result.reason ?? 'Security Policy';
-          const isHuman =
-            blockedByLabel.toLowerCase().includes('user') ||
-            blockedByLabel.toLowerCase().includes('daemon') ||
-            blockedByLabel.toLowerCase().includes('decision');
-          const aiInstruction = buildNegotiationMessage(blockedByLabel, isHuman, result.reason);
-
-          const errorResponse = {
-            jsonrpc: '2.0',
-            id: message.id ?? null,
-            error: {
-              code: -32000,
-              message: aiInstruction,
-              data: {
-                reason: result.reason,
-                blockedBy: result.blockedByLabel,
-              },
-            },
-          };
-          process.stdout.write(JSON.stringify(errorResponse) + '\n');
-          return; // Stop here! (The 'finally' block will handle the resume)
-        }
-      } catch {
-        // FAIL CLOSED SECURITY: If the auth engine crashes, deny the action!
-        const errorResponse = {
-          jsonrpc: '2.0',
-          id: message.id,
-          error: {
-            code: -32000,
-            message: `Node9: Security engine encountered an error. Action blocked for safety.`,
-          },
-        };
-        process.stdout.write(JSON.stringify(errorResponse) + '\n');
-        return;
-      } finally {
-        // 3. GUARANTEE RESUME: Whether approved, denied, or errored, always wake up the stream
-        agentIn.resume();
-      }
-    }
-
-    // If approved or not a tool call, forward it to the real server's STDIN
-    child.stdin.write(line + '\n');
-  });
-
-  // ── FORWARD OUTPUT (Server -> Agent) ──
-  // We just pass the server's responses back to the agent as-is
-  child.stdout.pipe(process.stdout);
-
-  child.on('exit', (code) => process.exit(code || 0));
-}
 
 // 1. LOGIN
 program
