@@ -46,12 +46,8 @@ jobs:
           node -e "require('fs').existsSync('dist/index.js') || (console.error('Missing: dist/index.js'), process.exit(1))"
 
       - name: Test
+        # On ubuntu/Node 22: run with coverage so thresholds (vitest.config.mts) are enforced.
+        # On all other matrix cells: plain test run — avoids doubling execution time.
         # NODE_ENV=test is set automatically by Vitest; NODE9_TESTING=1 guards
         # native popups and daemon auto-start in spawned child processes.
-        run: npm test
-
-      - name: Coverage (with threshold enforcement)
-        # Run only on Linux to avoid duplicating cost across the matrix.
-        # Thresholds are configured in vitest.config.mts — CI fails if any drop below baseline.
-        if: matrix.os == 'ubuntu-latest' && matrix.node == 22
-        run: npm run test:coverage
+        run: ${{ matrix.os == 'ubuntu-latest' && matrix.node == 22 && 'npm run test:coverage' || 'npm test' }}
