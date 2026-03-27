@@ -31,8 +31,9 @@ jobs:
       - name: Audit dependencies
         # Audit production deps only (--omit=dev). devDep CVEs (handlebars via semantic-release,
         # flatted via eslint) are in tools that never ship in the production bundle and are
-        # not exploitable at runtime. --audit-level=high flags anything we can actually ship.
-        run: npm audit --omit=dev --audit-level=high
+        # not exploitable at runtime. --audit-level=moderate: Node9 sits on the critical path
+        # of every agent tool call, so moderate-severity prod vulns (e.g. regex DoS) matter.
+        run: npm audit --omit=dev --audit-level=moderate
 
       - name: Format check
         run: npm run format:check
