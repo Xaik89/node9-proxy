@@ -87,7 +87,8 @@ function cleanupDir(dir: string) {
   try {
     fs.rmSync(dir, { recursive: true, force: true });
   } catch (e: unknown) {
-    if ((e as NodeJS.ErrnoException).code !== 'EBUSY') throw e;
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code !== 'EBUSY' && code !== 'ENOTEMPTY') throw e;
   }
 }
 
@@ -108,6 +109,10 @@ function runGateway(
     },
   });
 
+  // A null status means spawnSync killed the process due to timeout — treat as
+  // a test failure so a hung gateway doesn't silently pass.
+  if (result.error) throw result.error;
+
   return {
     stdout: result.stdout ?? '',
     stderr: result.stderr ?? '',
@@ -125,6 +130,7 @@ describe('mcp-gateway stdout cleanliness', () => {
         [JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} })],
         home
       );
+      expect(r.status).toBe(0);
       expect(r.stderr).toMatch(/MCP Gateway/);
       // stdout must only contain valid JSON lines — no banner text
       for (const line of r.stdout.split('\n').filter(Boolean)) {
@@ -146,7 +152,7 @@ describe('mcp-gateway pass-through', () => {
         [JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} })],
         home
       );
-      expect(r.stdout).toBeTruthy();
+      expect(r.status).toBe(0);
       const responses = r.stdout
         .split('\n')
         .filter(Boolean)
@@ -173,6 +179,7 @@ describe('mcp-gateway pass-through', () => {
         ],
         home
       );
+      expect(r.status).toBe(0);
       const responses = r.stdout
         .split('\n')
         .filter(Boolean)
@@ -188,9 +195,10 @@ describe('mcp-gateway pass-through', () => {
 
 describe('mcp-gateway tool call interception', () => {
   itUnix('allowed tool call (ignored tool) is forwarded and returns upstream result', () => {
-    // 'read_file' is in ignoredTools — passes through without approval prompt
+    // 'read_file' is explicitly in ignoredTools — passes through without approval prompt
     const home = makeTempHome({
       settings: { mode: 'standard', autoStartDaemon: false },
+      policy: { ignoredTools: ['read_file'] },
     });
     try {
       const r = runGateway(
@@ -204,6 +212,7 @@ describe('mcp-gateway tool call interception', () => {
         ],
         home
       );
+      expect(r.status).toBe(0);
       const responses = r.stdout
         .split('\n')
         .filter(Boolean)

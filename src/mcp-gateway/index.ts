@@ -34,6 +34,9 @@ function extractMcpServer(toolName: string): string | undefined {
 }
 
 export async function runMcpGateway(upstreamCommand: string): Promise<void> {
+  // parseCommandString performs shell-style word splitting (handles quotes and
+  // escapes) without spawning a shell — no command injection risk. The result
+  // is passed to spawn() with shell:false, so the OS never sees a shell string.
   const commandParts = parseCommandString(upstreamCommand);
   const cmd = commandParts[0];
   const cmdArgs = commandParts.slice(1);
