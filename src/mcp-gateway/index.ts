@@ -41,8 +41,10 @@ function extractMcpServer(toolName: string): string | undefined {
  * Shell-style tokenizer: splits on whitespace, respects double-quoted strings
  * and backslash escapes. Does NOT spawn a shell — no injection risk.
  * Example: `node "/path with spaces/server.js"` → `['node', '/path with spaces/server.js']`
+ *
+ * Exported for unit testing — callers outside this module should not use it directly.
  */
-function tokenize(cmd: string): string[] {
+export function tokenize(cmd: string): string[] {
   const tokens: string[] = [];
   let current = '';
   let inDouble = false;
