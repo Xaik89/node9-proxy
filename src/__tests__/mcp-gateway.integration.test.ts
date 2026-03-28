@@ -146,11 +146,19 @@ function runGateway(
   // Strip vars that could inject code into the gateway subprocess:
   //   NODE9_*                  — prevent local developer config leaking in
   //   NODE_OPTIONS             — --require /evil.js would run in the subprocess
-  //   LD_PRELOAD               — shared-library injection on Linux
+  //   NODE_PATH                — redirects Node.js module resolution to a malicious path
+  //   LD_PRELOAD               — shared-library injection on Linux (any process)
+  //   LD_LIBRARY_PATH          — shared-library search path on Linux (any process)
   //   DYLD_INSERT_LIBRARIES    — shared-library injection on macOS
   // PATH is kept: all spawns use absolute paths (NODE, CLI) so the ambient
   // PATH cannot inject a different binary.
-  const INJECTOR_VARS = new Set(['NODE_OPTIONS', 'LD_PRELOAD', 'DYLD_INSERT_LIBRARIES']);
+  const INJECTOR_VARS = new Set([
+    'NODE_OPTIONS',
+    'NODE_PATH',
+    'LD_PRELOAD',
+    'LD_LIBRARY_PATH',
+    'DYLD_INSERT_LIBRARIES',
+  ]);
   const cleanEnv = Object.fromEntries(
     Object.entries(process.env).filter(([k]) => !k.startsWith('NODE9_') && !INJECTOR_VARS.has(k))
   );
