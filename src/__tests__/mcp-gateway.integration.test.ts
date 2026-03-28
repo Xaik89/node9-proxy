@@ -26,6 +26,12 @@ const NODE = process.execPath;
 
 // Skip on Windows — stdio piping behaviour differs and spawnSync input handling
 // for gateway processes is not reliable on Windows CI.
+// Log explicitly so CI doesn't silently pass with zero tests executed.
+if (process.platform === 'win32') {
+  console.warn(
+    '[mcp-gateway] All integration tests skipped on Windows — stdio piping not supported'
+  );
+}
 const itUnix = it.skipIf(process.platform === 'win32');
 
 // Temp dir for the mock upstream script — cleaned up in afterAll
@@ -137,12 +143,16 @@ function runGateway(
   timeoutMs = 5000,
   upstreamScript = mockScriptPath
 ): { stdout: string; stderr: string; status: number | null } {
-  // Strip NODE9_* vars (prevent local config leaking) and NODE_OPTIONS (a poisoned
-  // NODE_OPTIONS=--require /evil.js in the test environment would inject code into
-  // the gateway subprocess). PATH is kept: all spawns use absolute paths so the
-  // ambient PATH cannot inject a different binary.
+  // Strip vars that could inject code into the gateway subprocess:
+  //   NODE9_*                  — prevent local developer config leaking in
+  //   NODE_OPTIONS             — --require /evil.js would run in the subprocess
+  //   LD_PRELOAD               — shared-library injection on Linux
+  //   DYLD_INSERT_LIBRARIES    — shared-library injection on macOS
+  // PATH is kept: all spawns use absolute paths (NODE, CLI) so the ambient
+  // PATH cannot inject a different binary.
+  const INJECTOR_VARS = new Set(['NODE_OPTIONS', 'LD_PRELOAD', 'DYLD_INSERT_LIBRARIES']);
   const cleanEnv = Object.fromEntries(
-    Object.entries(process.env).filter(([k]) => !k.startsWith('NODE9_') && k !== 'NODE_OPTIONS')
+    Object.entries(process.env).filter(([k]) => !k.startsWith('NODE9_') && !INJECTOR_VARS.has(k))
   );
   // NODE9_TESTING=1: suppresses native/browser/terminal UI approvers so tests
   // don't open dialogs. Policy evaluation, DLP, smart rules, and shields all run
