@@ -1,11 +1,7 @@
 // src/__tests__/suggestion-tracker.spec.ts
 // Unit tests for SuggestionTracker, extractPath, and commonPathPrefix.
 import { describe, it, expect } from 'vitest';
-import {
-  SuggestionTracker,
-  extractPath,
-  commonPathPrefix,
-} from '../daemon/suggestion-tracker.js';
+import { SuggestionTracker, extractPath, commonPathPrefix } from '../daemon/suggestion-tracker.js';
 
 // ── extractPath ────────────────────────────────────────────────────────────────
 

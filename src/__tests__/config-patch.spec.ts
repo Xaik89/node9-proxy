@@ -75,7 +75,9 @@ describe('patchConfig — smartRule', () => {
     patchConfig(configPath, { type: 'smartRule', rule });
     patchConfig(configPath, { type: 'smartRule', rule });
     const data = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-    expect(data.policy.smartRules.filter((r: { name: string }) => r.name === rule.name)).toHaveLength(1);
+    expect(
+      data.policy.smartRules.filter((r: { name: string }) => r.name === rule.name)
+    ).toHaveLength(1);
   });
 
   it('preserves existing config keys outside of policy', () => {

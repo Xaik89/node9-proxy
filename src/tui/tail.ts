@@ -373,10 +373,13 @@ export async function startTail(options: TailOptions = {}): Promise<void> {
       // We are at SAVE_CURSOR position; reprint card with decision line appended,
       // then leave cursor below it so the activity feed continues naturally.
       process.stdout.write(RESTORE_CURSOR + ERASE_DOWN);
-      const stampedLines = buildCardLines(req, Math.max(
-        req.allowCount !== undefined ? req.allowCount - 1 : 0,
-        localAllowCounts.get(req.toolName) ?? 0
-      ));
+      const stampedLines = buildCardLines(
+        req,
+        Math.max(
+          req.allowCount !== undefined ? req.allowCount - 1 : 0,
+          localAllowCounts.get(req.toolName) ?? 0
+        )
+      );
       const decisionStamp =
         action === 'always-allow'
           ? chalk.yellow('★ ALWAYS ALLOW')
@@ -443,7 +446,8 @@ export async function startTail(options: TailOptions = {}): Promise<void> {
       );
       const stampedLines = buildCardLines(req, priorCount);
       if (externalDecision) {
-        const source = externalDecision === 'allow' ? chalk.green('✓ ALLOWED') : chalk.red('✗ DENIED');
+        const source =
+          externalDecision === 'allow' ? chalk.green('✓ ALLOWED') : chalk.red('✗ DENIED');
         stampedLines.push(`  ${BOLD}→${RESET} ${source} ${GRAY}(external)${RESET}`, ``);
       }
       for (const line of stampedLines) process.stdout.write(line + '\n');
@@ -495,7 +499,9 @@ export async function startTail(options: TailOptions = {}): Promise<void> {
 
   console.log(chalk.cyan.bold(`\n🛰️  Node9 tail  `) + chalk.dim(`→ ${dashboardUrl}`));
   if (canApprove) {
-    console.log(chalk.dim('Interactive approvals: [↵/y] Allow  [n] Deny  [a] Always Allow  [t] Trust 30m'));
+    console.log(
+      chalk.dim('Interactive approvals: [↵/y] Allow  [n] Deny  [a] Always Allow  [t] Trust 30m')
+    );
   }
   if (options.history) {
     console.log(chalk.dim('Showing history + live events. Press Ctrl+C to exit.\n'));

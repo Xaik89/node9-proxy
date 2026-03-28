@@ -123,7 +123,10 @@ export class SuggestionTracker {
       ? {
           type: 'smartRule',
           rule: {
-            name: `allow-${toolName}-${prefix.replace(/[^a-z0-9]/gi, '-').replace(/-+/g, '-').replace(/^-|-$/g, '')}`,
+            name: `allow-${toolName}-${prefix
+              .replace(/[^a-z0-9]/gi, '-')
+              .replace(/-+/g, '-')
+              .replace(/^-|-$/g, '')}`,
             tool: toolName,
             conditions: [{ field: 'path', op: 'matchesGlob', value: `${prefix}**` }],
             verdict: 'allow',

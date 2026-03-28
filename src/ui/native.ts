@@ -215,7 +215,14 @@ export async function askNativePopup(
   const intentLabel = intent === 'EDIT' ? 'Code Edit' : 'Action Approval';
   const title = locked ? `⚡ Node9 — Locked` : `🛡️ Node9 — ${intentLabel}`;
 
-  const message = buildPlainMessage(toolName, formattedArgs, agent, explainableLabel, locked, allowCount);
+  const message = buildPlainMessage(
+    toolName,
+    formattedArgs,
+    agent,
+    explainableLabel,
+    locked,
+    allowCount
+  );
 
   return new Promise((resolve) => {
     // 2. FIXED: Use ChildProcess type instead of any

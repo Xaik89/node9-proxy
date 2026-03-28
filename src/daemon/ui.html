@@ -786,7 +786,7 @@
         font-family: 'Fira Code', monospace;
         font-size: 10px;
         color: #79c0ff;
-        background: rgba(0,0,0,0.25);
+        background: rgba(0, 0, 0, 0.25);
         border-radius: 4px;
         padding: 4px 8px;
         margin-bottom: 8px;
@@ -1007,7 +1007,7 @@
             <div id="decisionsList"><span class="decisions-empty">None yet.</span></div>
           </div>
 
-          <div class="panel" id="suggestionsPanel" style="display:none">
+          <div class="panel" id="suggestionsPanel" style="display: none">
             <div class="panel-title">💡 Smart Rule Suggestions</div>
             <div id="suggestionsList"></div>
           </div>
@@ -1570,7 +1570,9 @@
           headers: { 'Content-Type': 'application/json', 'X-Node9-Token': CSRF_TOKEN },
           body: JSON.stringify({}),
         })
-          .then((r) => { if (r.ok) removeSuggestionCard(id); })
+          .then((r) => {
+            if (r.ok) removeSuggestionCard(id);
+          })
           .catch(() => {});
       }
 
@@ -1579,7 +1581,9 @@
           method: 'POST',
           headers: { 'X-Node9-Token': CSRF_TOKEN },
         })
-          .then((r) => { if (r.ok) removeSuggestionCard(id); })
+          .then((r) => {
+            if (r.ok) removeSuggestionCard(id);
+          })
           .catch(() => {});
       }
 

@@ -561,7 +561,11 @@ export function startDaemon(): void {
           source?: string;
         };
         const resolvedResolveDecision: Decision = decision === 'allow' ? 'allow' : 'deny';
-        appendAuditLog({ toolName: entry.toolName, args: entry.args, decision: resolvedResolveDecision });
+        appendAuditLog({
+          toolName: entry.toolName,
+          args: entry.args,
+          decision: resolvedResolveDecision,
+        });
         clearTimeout(entry.timer);
 
         // ── Event Bridge: track human decisions for Smart Rule Suggestions ────
@@ -657,7 +661,11 @@ export function startDaemon(): void {
       return res.end(JSON.stringify([...suggestions.values()]));
     }
 
-    if (req.method === 'POST' && pathname.startsWith('/suggestions/') && pathname.endsWith('/apply')) {
+    if (
+      req.method === 'POST' &&
+      pathname.startsWith('/suggestions/') &&
+      pathname.endsWith('/apply')
+    ) {
       if (!validToken(req)) return res.writeHead(403).end();
       try {
         const id = pathname.split('/')[2];
@@ -669,10 +677,9 @@ export function startDaemon(): void {
         const configPath = data.configPath ?? GLOBAL_CONFIG_PATH;
 
         // Allow the UI to override the rule before applying
-        const patch: ConfigPatch =
-          data.rule
-            ? ({ type: 'smartRule', rule: data.rule } as ConfigPatch)
-            : (suggestion.suggestedRule as ConfigPatch);
+        const patch: ConfigPatch = data.rule
+          ? ({ type: 'smartRule', rule: data.rule } as ConfigPatch)
+          : (suggestion.suggestedRule as ConfigPatch);
 
         patchConfig(configPath, patch);
         _resetConfigCache();
@@ -689,7 +696,11 @@ export function startDaemon(): void {
       }
     }
 
-    if (req.method === 'POST' && pathname.startsWith('/suggestions/') && pathname.endsWith('/dismiss')) {
+    if (
+      req.method === 'POST' &&
+      pathname.startsWith('/suggestions/') &&
+      pathname.endsWith('/dismiss')
+    ) {
       if (!validToken(req)) return res.writeHead(403).end();
       try {
         const id = pathname.split('/')[2];

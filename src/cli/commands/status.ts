@@ -178,8 +178,7 @@ export function registerStatusCommand(program: Command): void {
       );
       const cursorConfig = readJson<CursorMcpConfig>(path.join(homeDir, '.cursor', 'mcp.json'));
 
-      const agentFound =
-        claudeSettings || claudeConfig || geminiSettings || cursorConfig;
+      const agentFound = claudeSettings || claudeConfig || geminiSettings || cursorConfig;
 
       if (agentFound) {
         console.log('');
