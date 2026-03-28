@@ -24,21 +24,16 @@ import path from 'path';
 const CLI = path.resolve(__dirname, '../../dist/cli.js');
 const NODE = process.execPath;
 
-// Skip on Windows — stdio piping behaviour differs and spawnSync input handling
-// for gateway processes is not reliable on Windows CI.
-// Log explicitly so CI doesn't silently pass with zero tests executed.
-// Skip the entire suite if the build hasn't been run yet — produces a clear skip
-// message rather than a confusing suite-level failure.
+// Two conditions skip the entire suite:
+//   1. dist/cli.js not built yet — warn and skip rather than a confusing suite-level failure.
+//   2. Windows — stdio piping behaviour and spawnSync input handling differ; not supported.
+// Log both explicitly so CI doesn't silently report zero tests executed.
 const cliExists = fs.existsSync(CLI);
 if (!cliExists) {
   console.warn(
     `[mcp-gateway] All integration tests skipped — dist/cli.js not found. Run "npm run build" first.\nExpected: ${CLI}`
   );
 }
-
-// Skip on Windows — stdio piping behaviour differs and spawnSync input handling
-// for gateway processes is not reliable on Windows CI.
-// Log explicitly so CI doesn't silently pass with zero tests executed.
 if (process.platform === 'win32') {
   console.warn(
     '[mcp-gateway] All integration tests skipped on Windows — stdio piping not supported'
@@ -93,6 +88,9 @@ rl.on('line', (line) => {
 });
 
 afterAll(() => {
+  // mockScriptDir is only set when cliExists — guard to avoid a noisy
+  // "path must be a string" error in afterAll when the suite is skipped.
+  if (!mockScriptDir) return;
   try {
     fs.rmSync(mockScriptDir, { recursive: true, force: true });
   } catch (e) {
