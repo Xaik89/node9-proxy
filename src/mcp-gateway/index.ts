@@ -96,10 +96,36 @@ export async function runMcpGateway(upstreamCommand: string): Promise<void> {
   // stderr only — stdout must stay clean for the JSON-RPC stdio protocol
   console.error(chalk.green(`🚀 Node9 MCP Gateway: Monitoring [${upstreamCommand}]`));
 
+  // Strip env vars that can inject code into the upstream subprocess.
+  // This matters most when the upstream is a Python, Ruby, or Node.js server —
+  // an attacker who controls these vars could load arbitrary modules/libraries.
+  //   NODE_OPTIONS / NODE_PATH     — Node.js require-hook and module-path injection
+  //   LD_PRELOAD / LD_LIBRARY_PATH — shared-library injection on Linux
+  //   DYLD_INSERT_LIBRARIES        — shared-library injection on macOS
+  //   PYTHONPATH / PYTHONSTARTUP   — Python module-path and startup-script injection
+  //   PERL5LIB / PERL5OPT          — Perl module-path and option injection
+  //   RUBYLIB / RUBYOPT            — Ruby load-path and option injection
+  const UPSTREAM_INJECTOR_VARS = new Set([
+    'NODE_OPTIONS',
+    'NODE_PATH',
+    'LD_PRELOAD',
+    'LD_LIBRARY_PATH',
+    'DYLD_INSERT_LIBRARIES',
+    'PYTHONPATH',
+    'PYTHONSTARTUP',
+    'PERL5LIB',
+    'PERL5OPT',
+    'RUBYLIB',
+    'RUBYOPT',
+  ]);
+  const safeEnv = Object.fromEntries(
+    Object.entries(process.env).filter(([k]) => !UPSTREAM_INJECTOR_VARS.has(k))
+  );
+
   const child = spawn(executable, cmdArgs, {
     stdio: ['pipe', 'pipe', 'inherit'], // control stdin/stdout; inherit stderr
     shell: false,
-    env: { ...process.env, FORCE_COLOR: '1' },
+    env: { ...safeEnv, FORCE_COLOR: '1' },
   });
 
   // Track whether an authorization is in flight. If the upstream exits (or

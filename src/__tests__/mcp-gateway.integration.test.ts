@@ -145,11 +145,12 @@ function runGateway(
 ): { stdout: string; stderr: string; status: number | null } {
   // Strip vars that could inject code into the gateway subprocess:
   //   NODE9_*                  — prevent local developer config leaking in
-  //   NODE_OPTIONS             — --require /evil.js would run in the subprocess
-  //   NODE_PATH                — redirects Node.js module resolution to a malicious path
-  //   LD_PRELOAD               — shared-library injection on Linux (any process)
-  //   LD_LIBRARY_PATH          — shared-library search path on Linux (any process)
+  //   NODE_OPTIONS / NODE_PATH — Node.js require-hook and module-path injection
+  //   LD_PRELOAD / LD_LIBRARY_PATH — shared-library injection on Linux
   //   DYLD_INSERT_LIBRARIES    — shared-library injection on macOS
+  //   PYTHONPATH / PYTHONSTARTUP — Python module-path and startup-script injection
+  //   PERL5LIB / PERL5OPT      — Perl module-path and option injection
+  //   RUBYLIB / RUBYOPT        — Ruby load-path and option injection
   // PATH is kept: all spawns use absolute paths (NODE, CLI) so the ambient
   // PATH cannot inject a different binary.
   const INJECTOR_VARS = new Set([
@@ -158,6 +159,12 @@ function runGateway(
     'LD_PRELOAD',
     'LD_LIBRARY_PATH',
     'DYLD_INSERT_LIBRARIES',
+    'PYTHONPATH',
+    'PYTHONSTARTUP',
+    'PERL5LIB',
+    'PERL5OPT',
+    'RUBYLIB',
+    'RUBYOPT',
   ]);
   const cleanEnv = Object.fromEntries(
     Object.entries(process.env).filter(([k]) => !k.startsWith('NODE9_') && !INJECTOR_VARS.has(k))
@@ -243,6 +250,7 @@ describe('mcp-gateway pass-through', () => {
       const responses = parseResponses(r.stdout);
       const listResponse = responses.find((resp) => resp.result && 'tools' in resp.result);
       expect(listResponse).toBeDefined();
+      expect(listResponse!.result!.tools).toBeDefined();
       expect(Array.isArray(listResponse!.result!.tools)).toBe(true);
     } finally {
       cleanupDir(home);
@@ -540,6 +548,85 @@ rl.on('line', (line) => {
       const responses = parseResponses(r.stdout);
       const listResponse = responses.find((resp) => resp.result && 'tools' in resp.result);
       expect(listResponse).toBeDefined();
+    } finally {
+      cleanupDir(home);
+    }
+  });
+
+  itUnix('injection env vars are stripped from the upstream subprocess environment', () => {
+    // The gateway must not pass NODE_OPTIONS, PYTHONPATH, PERL5LIB, RUBYLIB, etc.
+    // to the upstream child — an attacker who controls these can inject code into
+    // any Node.js, Python, Perl, or Ruby MCP server.
+    // Verify by running an upstream that echoes its own env into the response.
+    const envEchoScript = path.join(mockScriptDir, 'env-echo.js');
+    fs.writeFileSync(
+      envEchoScript,
+      `const rl = require('readline').createInterface({ input: process.stdin, terminal: false });
+rl.on('line', (line) => {
+  try {
+    const msg = JSON.parse(line);
+    if (msg.id !== undefined && msg.id !== null) {
+      const envKeys = Object.keys(process.env);
+      process.stdout.write(JSON.stringify({
+        jsonrpc: '2.0', id: msg.id,
+        result: { envKeys }
+      }) + '\\n');
+    }
+  } catch {}
+});
+`
+    );
+    const home = makeTempHome({ settings: { mode: 'audit' } });
+    try {
+      // Inject sentinel values for each injection var into the gateway's env.
+      // The gateway should strip them before passing env to the upstream.
+      // Inject language-specific vars as sentinels — these don't affect the gateway
+      // (a Node.js process) but must be stripped before passing env to the upstream.
+      // NODE_OPTIONS / LD_PRELOAD are intentionally excluded here: setting them to
+      // bad values would crash the gateway subprocess itself, not just the upstream.
+      // The production strip list covers all vars; this test validates the mechanism
+      // for the interpreter-specific ones that are safe to inject into the test env.
+      const result = spawnSync(
+        NODE,
+        [CLI, 'mcp-gateway', '--upstream', `"${NODE}" "${envEchoScript}"`],
+        {
+          input: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }) + '\n',
+          encoding: 'utf-8',
+          timeout: 8000,
+          env: {
+            ...process.env,
+            HOME: home,
+            USERPROFILE: home,
+            NODE9_TESTING: '1',
+            // Sentinels — gateway must strip these before spawning upstream
+            PYTHONPATH: '/evil/py',
+            PYTHONSTARTUP: '/evil/startup.py',
+            PERL5LIB: '/evil/perl',
+            PERL5OPT: '-M/evil',
+            RUBYLIB: '/evil/ruby',
+            RUBYOPT: '-r/evil',
+          },
+        }
+      );
+      expect(result.error).toBeUndefined();
+      expect(result.status).toBe(0);
+      const responses = parseResponses(result.stdout);
+      const envResponse = responses.find((r) => r.id === 1);
+      expect(envResponse?.result).toBeDefined();
+      const envKeys = envResponse!.result!['envKeys'] as string[];
+      expect(Array.isArray(envKeys)).toBe(true);
+      // None of the injected sentinel vars should appear in the upstream's env
+      const stripped = [
+        'PYTHONPATH',
+        'PYTHONSTARTUP',
+        'PERL5LIB',
+        'PERL5OPT',
+        'RUBYLIB',
+        'RUBYOPT',
+      ];
+      for (const v of stripped) {
+        expect(envKeys, `${v} should be stripped from upstream env`).not.toContain(v);
+      }
     } finally {
       cleanupDir(home);
     }
