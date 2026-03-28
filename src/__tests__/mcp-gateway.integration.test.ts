@@ -137,17 +137,21 @@ function runGateway(
   timeoutMs = 5000,
   upstreamScript = mockScriptPath
 ): { stdout: string; stderr: string; status: number | null } {
-  // Strip all NODE9_* env vars so local developer config (NODE9_MODE, NODE9_API_KEY,
-  // NODE9_PAUSED, etc.) cannot leak into the hermetically-isolated test home.
-  // PATH is kept as-is: all spawns use absolute paths (NODE = process.execPath,
-  // CLI = resolved dist/cli.js), so the ambient PATH cannot inject a different binary.
+  // Strip NODE9_* vars (prevent local config leaking) and NODE_OPTIONS (a poisoned
+  // NODE_OPTIONS=--require /evil.js in the test environment would inject code into
+  // the gateway subprocess). PATH is kept: all spawns use absolute paths so the
+  // ambient PATH cannot inject a different binary.
   const cleanEnv = Object.fromEntries(
-    Object.entries(process.env).filter(([k]) => !k.startsWith('NODE9_'))
+    Object.entries(process.env).filter(([k]) => !k.startsWith('NODE9_') && k !== 'NODE_OPTIONS')
   );
   // NODE9_TESTING=1: suppresses native/browser/terminal UI approvers so tests
   // don't open dialogs. Policy evaluation, DLP, smart rules, and shields all run
   // unchanged — see src/auth/orchestrator.ts isTestEnv block for the exact effect.
   // Quote both tokens so paths with spaces (e.g. macOS home dirs) don't confuse the tokenizer.
+  // Known limitation: spawnSync buffers stdin before the process starts. If the upstream's
+  // response exceeds the OS pipe buffer (~64 KB) before stdin is consumed, a deadlock is
+  // theoretically possible. The mock upstream responses are small so this is not a concern
+  // in practice, but real upstream servers with large outputs should use spawn() instead.
   const result = spawnSync(
     NODE,
     [CLI, 'mcp-gateway', '--upstream', `"${NODE}" "${upstreamScript}"`],

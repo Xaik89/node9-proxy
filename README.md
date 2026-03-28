@@ -263,6 +263,8 @@ claude mcp add --scope user filesystem -- node9 mcp-gateway --upstream \
 ```
 
 > **Note:** `--upstream` takes a single command string. The gateway's tokenizer splits it on whitespace and handles double-quoted paths (e.g. `"npx \"/path with spaces/server.js\""`) — it does not run a shell.
+>
+> ⚠️ **Supply-chain warning:** `.mcp.json` files from untrusted repositories can specify any `--upstream` command. Always review `.mcp.json` before using it — treat it with the same caution as a `Makefile` or `package.json` `postinstall` script.
 
 ### What gets protected
 
