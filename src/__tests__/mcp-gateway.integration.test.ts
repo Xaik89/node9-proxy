@@ -147,17 +147,22 @@ function runGateway(
   // NODE9_TESTING=1: suppresses native/browser/terminal UI approvers so tests
   // don't open dialogs. Policy evaluation, DLP, smart rules, and shields all run
   // unchanged — see src/auth/orchestrator.ts isTestEnv block for the exact effect.
-  const result = spawnSync(NODE, [CLI, 'mcp-gateway', '--upstream', `${NODE} ${upstreamScript}`], {
-    input: inputLines.join('\n') + '\n',
-    encoding: 'utf-8',
-    timeout: timeoutMs,
-    env: {
-      ...cleanEnv,
-      HOME: homeDir,
-      USERPROFILE: homeDir,
-      NODE9_TESTING: '1',
-    },
-  });
+  // Quote both tokens so paths with spaces (e.g. macOS home dirs) don't confuse the tokenizer.
+  const result = spawnSync(
+    NODE,
+    [CLI, 'mcp-gateway', '--upstream', `"${NODE}" "${upstreamScript}"`],
+    {
+      input: inputLines.join('\n') + '\n',
+      encoding: 'utf-8',
+      timeout: timeoutMs,
+      env: {
+        ...cleanEnv,
+        HOME: homeDir,
+        USERPROFILE: homeDir,
+        NODE9_TESTING: '1',
+      },
+    }
+  );
 
   // A spawnSync error (e.g. ETIMEDOUT) means the process was killed — fail fast.
   if (result.error) throw result.error;
@@ -455,12 +460,16 @@ rl.on('line', (line) => {
     try {
       // Wrap the path in quotes so parseCommandString treats it as one token
       const quotedPath = `"${spaceyScript}"`;
-      const result = spawnSync(NODE, [CLI, 'mcp-gateway', '--upstream', `${NODE} ${quotedPath}`], {
-        input: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }) + '\n',
-        encoding: 'utf-8',
-        timeout: 8000,
-        env: { ...process.env, HOME: home, USERPROFILE: home, NODE9_TESTING: '1' },
-      });
+      const result = spawnSync(
+        NODE,
+        [CLI, 'mcp-gateway', '--upstream', `"${NODE}" ${quotedPath}`],
+        {
+          input: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }) + '\n',
+          encoding: 'utf-8',
+          timeout: 8000,
+          env: { ...process.env, HOME: home, USERPROFILE: home, NODE9_TESTING: '1' },
+        }
+      );
       expect(result.error).toBeUndefined();
       expect(result.status).toBe(0);
       const responses = parseResponses(result.stdout);
