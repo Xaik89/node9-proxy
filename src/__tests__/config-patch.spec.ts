@@ -94,7 +94,7 @@ describe('patchConfig — error handling', () => {
     expect(() => patchConfig(configPath, { type: 'ignoredTool', toolName: 'Bash' })).toThrow();
   });
 
-  it('writes file with mode 0o600', () => {
+  it.skipIf(process.platform === 'win32')('writes file with mode 0o600', () => {
     patchConfig(configPath, { type: 'ignoredTool', toolName: 'Bash' });
     const stat = fs.statSync(configPath);
     // Check owner read/write only (0o600). On Linux, mask to lower 9 bits.

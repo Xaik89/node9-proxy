@@ -446,40 +446,52 @@ describe('teardownGemini', () => {
 // ── detectAgents ─────────────────────────────────────────────────────────────
 
 describe('detectAgents', () => {
+  // Normalize to forward slashes so comparisons work on Windows too
+  const home = '/mock/home';
+  const p = (name: string) => path.join(home, name).replace(/\\/g, '/');
+
   it('returns all false when no agent directories exist', () => {
     vi.mocked(fs.existsSync).mockReturnValue(false);
-    expect(detectAgents('/mock/home')).toEqual({ claude: false, gemini: false, cursor: false });
+    expect(detectAgents(home)).toEqual({ claude: false, gemini: false, cursor: false });
   });
 
   it('detects Claude via ~/.claude directory', () => {
-    vi.mocked(fs.existsSync).mockImplementation((p) => String(p) === '/mock/home/.claude');
-    const result = detectAgents('/mock/home');
+    vi.mocked(fs.existsSync).mockImplementation(
+      (q) => String(q).replace(/\\/g, '/') === p('.claude')
+    );
+    const result = detectAgents(home);
     expect(result.claude).toBe(true);
     expect(result.gemini).toBe(false);
     expect(result.cursor).toBe(false);
   });
 
   it('detects Claude via ~/.claude.json (no directory)', () => {
-    vi.mocked(fs.existsSync).mockImplementation((p) => String(p) === '/mock/home/.claude.json');
-    expect(detectAgents('/mock/home').claude).toBe(true);
+    vi.mocked(fs.existsSync).mockImplementation(
+      (q) => String(q).replace(/\\/g, '/') === p('.claude.json')
+    );
+    expect(detectAgents(home).claude).toBe(true);
   });
 
   it('detects Gemini via ~/.gemini directory', () => {
-    vi.mocked(fs.existsSync).mockImplementation((p) => String(p) === '/mock/home/.gemini');
-    expect(detectAgents('/mock/home').gemini).toBe(true);
+    vi.mocked(fs.existsSync).mockImplementation(
+      (q) => String(q).replace(/\\/g, '/') === p('.gemini')
+    );
+    expect(detectAgents(home).gemini).toBe(true);
   });
 
   it('detects Cursor via ~/.cursor directory', () => {
-    vi.mocked(fs.existsSync).mockImplementation((p) => String(p) === '/mock/home/.cursor');
-    expect(detectAgents('/mock/home').cursor).toBe(true);
+    vi.mocked(fs.existsSync).mockImplementation(
+      (q) => String(q).replace(/\\/g, '/') === p('.cursor')
+    );
+    expect(detectAgents(home).cursor).toBe(true);
   });
 
   it('detects all three agents simultaneously', () => {
-    vi.mocked(fs.existsSync).mockImplementation((p) => {
-      const s = String(p);
-      return s === '/mock/home/.claude' || s === '/mock/home/.gemini' || s === '/mock/home/.cursor';
+    vi.mocked(fs.existsSync).mockImplementation((q) => {
+      const s = String(q).replace(/\\/g, '/');
+      return s === p('.claude') || s === p('.gemini') || s === p('.cursor');
     });
-    expect(detectAgents('/mock/home')).toEqual({ claude: true, gemini: true, cursor: true });
+    expect(detectAgents(home)).toEqual({ claude: true, gemini: true, cursor: true });
   });
 });
 
