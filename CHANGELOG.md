@@ -10,11 +10,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **Insight Line — "Always Allow" nudge:** After approving the same tool 3+ times, every approval channel (terminal, browser dashboard, native popup) now shows a 💡 hint: _"Approved N× before — 'Always Allow' creates a permanent rule."_ The counter is tracked daemon-side per tool (`insightCounts` Map) and is never reset by the suggestion threshold — only on deny. This ensures the nudge appears consistently across all channels and sessions.
+
+- **Smart Rule Suggestions:** After 3 consecutive approvals of the same tool, the daemon generates a suggested smart rule (e.g. `allowGlob` for file reads, `allowCommand` for shell commands). The suggestion appears in the browser dashboard with a one-click "Apply Rule" button that patches your config without a restart. Suggestions are cleared on deny or config change.
+
+- **Terminal card stamping:** Approved or denied terminal cards now stay visible in `node9 tail` history with the decision stamped on them (`✓ ALLOWED (terminal)` / `✗ DENIED (terminal)`). Previously the card was erased from the terminal buffer on resolution, leaving no trace of what was decided.
+
+- **`node9 status` — Agent Wiring Report:** `node9 status` now includes an **Agent Wiring** section showing, per detected agent (Claude Code, Gemini CLI, Cursor): which hooks are wired (`PreToolUse`, `PostToolUse`, `BeforeTool`, `AfterTool`) and which MCP servers are currently proxied through node9. Example output:
+
+  ```
+  Agent Wiring:
+
+  Claude Code
+    ✓ PreToolUse  (node9 check)
+    ✓ PostToolUse (node9 log)
+    MCP proxied: none
+
+  Gemini CLI
+    ✓ BeforeTool  (node9 check)
+    ✓ AfterTool   (node9 log)
+    MCP proxied:
+      • postgres → npx -y @modelcontextprotocol/server-postgres postgresql://...
+  ```
+
 - **Trusted-Host Allowlist (`node9 trust add/remove/list`):** Persistent per-user allowlist of known-safe network destinations. Pipe-chain exfiltration decisions are downgraded for trusted hosts only: `critical` (hard block) → `review` (approval prompt), `high` (review) → `allow`. If any sink in the pipeline is untrusted, the original decision stands. Hosts are stored in `~/.node9/trusted-hosts.json` (`0o600`) with atomic write (tmp + rename). Only the CLI can add entries — no MCP tool or API can modify the list. Supports exact FQDNs (`api.mycompany.com`) and wildcard subdomains (`*.mycompany.com`); wildcards require at least one subdomain label and do not match the bare domain.
 - **`node9 trust add <host>`:** Adds a host to the trusted list. Normalizes input (strips protocol, path, port, `user@`) before storing so `https://api.company.com/v1/ingest` and `api.company.com` are treated as the same entry. No-op if already present.
 - **`node9 trust remove <host>`:** Removes a host from the trusted list. Exits non-zero if not found.
 - **`node9 trust list`:** Displays all trusted hosts with the date they were added.
 - **TTL cache for trusted-host lookups:** `isTrustedHost()` is on the hot path (called for every pipe-chain tool call). Results are cached in-process for 5 seconds to avoid a synchronous disk read on every policy evaluation. Cache is invalidated on every write.
+
+### Fixed
+
+- **Browser opened twice on `node9 tail` launch:** The daemon no longer reopens the browser tab on the first `/check` request when `node9 tail` has already opened one. `tail` posts `POST /browser-opened` after launching the browser so the daemon can skip the duplicate open.
 
 ---
 

@@ -90,6 +90,8 @@ Showing live events. Press Ctrl+C to exit.
 
 `node9 tail` auto-starts the daemon if it isn't running — no setup step needed.
 
+After approving the same tool 3+ times, every channel (terminal, browser, native popup) shows a 💡 insight: _"Approved N× before — 'Always Allow' creates a permanent rule."_ Approved and denied cards stay stamped in the terminal history so you always know what was decided and when.
+
 ### 🧠 AI Negotiation Loop
 
 Node9 doesn't just "cut the wire." When a command is blocked, it injects a **Structured Negotiation Prompt** back into the AI's context window. This teaches the AI why it was stopped and instructs it to pivot to a safer alternative.
@@ -139,6 +141,9 @@ node9 shield enable aws
 
 # 3. Verify everything is wired correctly
 node9 doctor
+
+# 4. See what's wired and which MCP servers are proxied
+node9 status
 ```
 
 ---
