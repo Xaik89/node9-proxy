@@ -18,7 +18,6 @@ import readline from 'readline';
 import chalk from 'chalk';
 import { spawn } from 'child_process';
 import { execa } from 'execa';
-import { parseCommandString } from 'execa';
 import { authorizeHeadless } from '../auth/orchestrator';
 import { buildNegotiationMessage } from '../policy/negotiation';
 
@@ -38,11 +37,51 @@ function extractMcpServer(toolName: string): string | undefined {
   return match?.[1];
 }
 
+/**
+ * Shell-style tokenizer: splits on whitespace, respects double-quoted strings
+ * and backslash escapes. Does NOT spawn a shell — no injection risk.
+ * Example: `node "/path with spaces/server.js"` → `['node', '/path with spaces/server.js']`
+ */
+function tokenize(cmd: string): string[] {
+  const tokens: string[] = [];
+  let current = '';
+  let inDouble = false;
+  let i = 0;
+  while (i < cmd.length) {
+    const ch = cmd[i];
+    if (inDouble) {
+      if (ch === '"') {
+        inDouble = false;
+      } else if (ch === '\\' && i + 1 < cmd.length) {
+        current += cmd[++i];
+      } else {
+        current += ch;
+      }
+    } else {
+      if (ch === '"') {
+        inDouble = true;
+      } else if (ch === ' ' || ch === '\t') {
+        if (current) {
+          tokens.push(current);
+          current = '';
+        }
+      } else if (ch === '\\' && i + 1 < cmd.length) {
+        current += cmd[++i];
+      } else {
+        current += ch;
+      }
+    }
+    i++;
+  }
+  if (current) tokens.push(current);
+  return tokens;
+}
+
 export async function runMcpGateway(upstreamCommand: string): Promise<void> {
-  // parseCommandString performs shell-style word splitting (handles quotes and
-  // escapes) without spawning a shell — no command injection risk. The result
-  // is passed to spawn() with shell:false, so the OS never sees a shell string.
-  const commandParts = parseCommandString(upstreamCommand);
+  // tokenize() performs shell-style word splitting (handles double-quoted strings
+  // and backslash escapes) without spawning a shell — no injection risk.
+  // The result is passed to spawn() with shell:false.
+  const commandParts = tokenize(upstreamCommand);
   const cmd = commandParts[0];
   const cmdArgs = commandParts.slice(1);
 

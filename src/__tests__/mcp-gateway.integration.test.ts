@@ -60,7 +60,9 @@ rl.on('line', (line) => {
         jsonrpc: '2.0', id: msg.id,
         result: { content: [{ type: 'text', text: 'upstream:' + JSON.stringify(msg.params) }] }
       }) + '\\n');
-    } else {
+    } else if (msg.id !== undefined && msg.id !== null) {
+      // Only respond to requests (have an id). Notifications have no id and
+      // must not get a response — writing one would be invalid JSON-RPC.
       process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: {} }) + '\\n');
     }
   } catch {}
@@ -110,9 +112,13 @@ function runGateway(
     },
   });
 
-  // A null status means spawnSync killed the process due to timeout — treat as
-  // a test failure so a hung gateway doesn't silently pass.
+  // A spawnSync error (e.g. ETIMEDOUT) means the process was killed — fail fast.
   if (result.error) throw result.error;
+  // status===null means the process was killed by a signal without an error object
+  // (platform-dependent). Treat as a failure so hung gateways don't silently pass.
+  if (result.status === null && result.signal) {
+    throw new Error(`Gateway process killed by signal ${result.signal}`);
+  }
 
   return {
     stdout: result.stdout ?? '',
@@ -158,7 +164,7 @@ describe('mcp-gateway pass-through', () => {
         .split('\n')
         .filter(Boolean)
         .map((l) => JSON.parse(l) as { result?: { tools?: unknown[] } });
-      const listResponse = responses.find((r) => r.result && 'tools' in r.result);
+      const listResponse = responses.find((resp) => resp.result && 'tools' in resp.result);
       expect(listResponse).toBeDefined();
       expect(Array.isArray(listResponse!.result!.tools)).toBe(true);
     } finally {
@@ -185,7 +191,7 @@ describe('mcp-gateway pass-through', () => {
         .split('\n')
         .filter(Boolean)
         .map((l) => JSON.parse(l) as { id?: number });
-      expect(responses.some((r) => r.id === 1)).toBe(true);
+      expect(responses.some((resp) => resp.id === 1)).toBe(true);
     } finally {
       cleanupDir(home);
     }
@@ -218,7 +224,7 @@ describe('mcp-gateway tool call interception', () => {
         .split('\n')
         .filter(Boolean)
         .map((l) => JSON.parse(l) as { id?: number; result?: unknown; error?: unknown });
-      const callResponse = responses.find((r) => r.id === 42);
+      const callResponse = responses.find((resp) => resp.id === 42);
       expect(callResponse).toBeDefined();
       // Should have a result (forwarded to upstream), not an error
       expect(callResponse!.result).toBeDefined();
@@ -265,7 +271,7 @@ describe('mcp-gateway tool call interception', () => {
               result?: unknown;
             }
         );
-      const errorResponse = responses.find((r) => r.id === 7);
+      const errorResponse = responses.find((resp) => resp.id === 7);
       expect(errorResponse).toBeDefined();
       expect(errorResponse!.error).toBeDefined();
       expect(errorResponse!.error!.code).toBe(-32000);
@@ -303,8 +309,38 @@ describe('mcp-gateway tool call interception', () => {
         .split('\n')
         .filter(Boolean)
         .map((l) => JSON.parse(l) as { id?: unknown; error?: unknown });
-      const errorResponse = responses.find((r) => r.id === requestId);
+      const errorResponse = responses.find((resp) => resp.id === requestId);
       expect(errorResponse?.error).toBeDefined();
+    } finally {
+      cleanupDir(home);
+    }
+  });
+
+  itUnix('DLP blocks tool call containing a credential in arguments', () => {
+    // Build the fake key at runtime so the DLP scanner doesn't flag this source file.
+    // The gateway's DLP sees the assembled string and blocks it.
+    const fakeKey = ['sk-ant-', 'api03-', 'A'.repeat(40)].join('');
+    const home = makeTempHome({ settings: { mode: 'standard', autoStartDaemon: false } });
+    try {
+      const r = runGateway(
+        [
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: 99,
+            method: 'tools/call',
+            params: { name: 'write_file', arguments: { path: '/tmp/x.txt', content: fakeKey } },
+          }),
+        ],
+        home
+      );
+      expect(r.status).toBe(0);
+      const responses = r.stdout
+        .split('\n')
+        .filter(Boolean)
+        .map((l) => JSON.parse(l) as { id?: unknown; error?: { code: number } });
+      const errorResponse = responses.find((resp) => resp.id === 99);
+      expect(errorResponse?.error).toBeDefined();
+      expect(errorResponse!.error!.code).toBe(-32000);
     } finally {
       cleanupDir(home);
     }
@@ -330,7 +366,7 @@ describe('mcp-gateway tool call interception', () => {
         .split('\n')
         .filter(Boolean)
         .map((l) => JSON.parse(l) as { id?: unknown; error?: { code: number } });
-      const errorResponse = responses.find((r) => r.error?.code === -32600);
+      const errorResponse = responses.find((resp) => resp.error?.code === -32600);
       expect(errorResponse).toBeDefined();
       expect(errorResponse!.id).toBeNull();
     } finally {
@@ -363,6 +399,47 @@ describe('mcp-gateway resilience', () => {
       expect(r.stdout).toContain('not-valid-json');
     } finally {
       cleanupDir(home);
+    }
+  });
+
+  itUnix('upstream script path with spaces is handled correctly', () => {
+    // parseCommandString must handle quoted paths — space in script path must not
+    // be split into two separate arguments.
+    const spaceyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'node9 gw spaces '));
+    const spaceyScript = path.join(spaceyDir, 'upstream.js');
+    fs.writeFileSync(
+      spaceyScript,
+      `const rl = require('readline').createInterface({ input: process.stdin, terminal: false });
+rl.on('line', (line) => {
+  try {
+    const msg = JSON.parse(line);
+    if (msg.id !== undefined && msg.id !== null) {
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { ok: true } }) + '\\n');
+    }
+  } catch {}
+});
+`
+    );
+    const home = makeTempHome({ settings: { mode: 'audit' } });
+    try {
+      // Wrap the path in quotes so parseCommandString treats it as one token
+      const quotedPath = `"${spaceyScript}"`;
+      const result = spawnSync(NODE, [CLI, 'mcp-gateway', '--upstream', `${NODE} ${quotedPath}`], {
+        input: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }) + '\n',
+        encoding: 'utf-8',
+        timeout: 8000,
+        env: { ...process.env, HOME: home, USERPROFILE: home, NODE9_TESTING: '1' },
+      });
+      expect(result.error).toBeUndefined();
+      expect(result.status).toBe(0);
+      const responses = result.stdout
+        .split('\n')
+        .filter(Boolean)
+        .map((l) => JSON.parse(l) as { id?: unknown });
+      expect(responses.some((resp) => resp.id === 1)).toBe(true);
+    } finally {
+      cleanupDir(home);
+      cleanupDir(spaceyDir);
     }
   });
 
