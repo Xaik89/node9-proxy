@@ -1,0 +1,155 @@
+// src/__tests__/trusted-hosts.spec.ts
+// Unit tests for trusted-host allowlist: normalisation, exact match, wildcard, add/remove.
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import fs from 'fs';
+import os from 'os';
+import {
+  normalizeHost,
+  isTrustedHost,
+  addTrustedHost,
+  removeTrustedHost,
+} from '../auth/trusted-hosts.js';
+
+// ── normalizeHost ──────────────────────────────────────────────────────────────
+
+describe('normalizeHost', () => {
+  it('strips https:// protocol', () => {
+    expect(normalizeHost('https://api.mycompany.com')).toBe('api.mycompany.com');
+  });
+
+  it('strips http:// protocol', () => {
+    expect(normalizeHost('http://api.mycompany.com')).toBe('api.mycompany.com');
+  });
+
+  it('strips path', () => {
+    expect(normalizeHost('https://api.mycompany.com/collect')).toBe('api.mycompany.com');
+  });
+
+  it('strips numeric port', () => {
+    expect(normalizeHost('api.mycompany.com:443')).toBe('api.mycompany.com');
+  });
+
+  it('strips user@ prefix', () => {
+    expect(normalizeHost('user@host.com')).toBe('host.com');
+  });
+
+  it('lowercases', () => {
+    expect(normalizeHost('API.MyCompany.COM')).toBe('api.mycompany.com');
+  });
+
+  it('leaves plain FQDN unchanged', () => {
+    expect(normalizeHost('api.mycompany.com')).toBe('api.mycompany.com');
+  });
+});
+
+// ── isTrustedHost (with mocked fs) ────────────────────────────────────────────
+
+vi.spyOn(os, 'homedir').mockReturnValue('/mock/home');
+
+describe('isTrustedHost', () => {
+  beforeEach(() => {
+    vi.spyOn(fs, 'readFileSync').mockImplementation((p) => {
+      if (String(p).includes('trusted-hosts')) {
+        return JSON.stringify({
+          hosts: [
+            { host: 'api.mycompany.com', addedAt: 1000, addedBy: 'user' },
+            { host: '*.logs.io', addedAt: 1001, addedBy: 'user' },
+          ],
+        });
+      }
+      return '';
+    });
+  });
+
+  it('matches exact host', () => {
+    expect(isTrustedHost('api.mycompany.com')).toBe(true);
+  });
+
+  it('matches after stripping protocol and path', () => {
+    expect(isTrustedHost('https://api.mycompany.com/collect')).toBe(true);
+  });
+
+  it('does NOT match subdomain of exact entry', () => {
+    expect(isTrustedHost('evil.api.mycompany.com')).toBe(false);
+  });
+
+  it('does NOT match unrelated host', () => {
+    expect(isTrustedHost('evil.com')).toBe(false);
+  });
+
+  it('wildcard *.logs.io matches direct subdomain', () => {
+    expect(isTrustedHost('app.logs.io')).toBe(true);
+  });
+
+  it('wildcard *.logs.io matches deeper subdomain', () => {
+    expect(isTrustedHost('us.app.logs.io')).toBe(true);
+  });
+
+  it('wildcard *.logs.io matches bare domain', () => {
+    expect(isTrustedHost('logs.io')).toBe(true);
+  });
+
+  it('returns false when trusted-hosts.json is missing', () => {
+    vi.spyOn(fs, 'readFileSync').mockImplementation(() => {
+      throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    });
+    expect(isTrustedHost('api.mycompany.com')).toBe(false);
+  });
+});
+
+// ── addTrustedHost / removeTrustedHost ────────────────────────────────────────
+
+describe('addTrustedHost / removeTrustedHost', () => {
+  beforeEach(() => {
+    vi.spyOn(os, 'homedir').mockReturnValue('/mock/home');
+    vi.spyOn(fs, 'mkdirSync').mockReturnValue(undefined);
+    vi.spyOn(fs, 'renameSync').mockReturnValue(undefined);
+  });
+
+  it('addTrustedHost writes new entry', () => {
+    vi.spyOn(fs, 'readFileSync').mockReturnValue(JSON.stringify({ hosts: [] }));
+    const writeSpy = vi.spyOn(fs, 'writeFileSync').mockReturnValue(undefined);
+
+    addTrustedHost('api.newhost.com');
+
+    expect(writeSpy).toHaveBeenCalledOnce();
+    const written = JSON.parse(writeSpy.mock.calls[0][1] as string);
+    expect(written.hosts).toHaveLength(1);
+    expect(written.hosts[0].host).toBe('api.newhost.com');
+    expect(written.hosts[0].addedBy).toBe('user');
+  });
+
+  it('addTrustedHost is idempotent', () => {
+    vi.spyOn(fs, 'readFileSync').mockReturnValue(
+      JSON.stringify({ hosts: [{ host: 'api.newhost.com', addedAt: 1000, addedBy: 'user' }] })
+    );
+    const writeSpy = vi.spyOn(fs, 'writeFileSync').mockReturnValue(undefined);
+
+    addTrustedHost('api.newhost.com');
+
+    expect(writeSpy).not.toHaveBeenCalled();
+  });
+
+  it('removeTrustedHost removes existing entry and returns true', () => {
+    vi.spyOn(fs, 'readFileSync').mockReturnValue(
+      JSON.stringify({ hosts: [{ host: 'api.newhost.com', addedAt: 1000, addedBy: 'user' }] })
+    );
+    const writeSpy = vi.spyOn(fs, 'writeFileSync').mockReturnValue(undefined);
+
+    const result = removeTrustedHost('api.newhost.com');
+
+    expect(result).toBe(true);
+    const written = JSON.parse(writeSpy.mock.calls[0][1] as string);
+    expect(written.hosts).toHaveLength(0);
+  });
+
+  it('removeTrustedHost returns false when host not found', () => {
+    vi.spyOn(fs, 'readFileSync').mockReturnValue(JSON.stringify({ hosts: [] }));
+    const writeSpy = vi.spyOn(fs, 'writeFileSync').mockReturnValue(undefined);
+
+    const result = removeTrustedHost('nothere.com');
+
+    expect(result).toBe(false);
+    expect(writeSpy).not.toHaveBeenCalled();
+  });
+});

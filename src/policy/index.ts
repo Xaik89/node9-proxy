@@ -12,6 +12,7 @@ import { getCompiledRegex } from '../utils/regex';
 import { checkProvenance } from '../utils/provenance.js';
 import { analyzePipeChain } from './pipe-chain.js';
 import { extractAllSshHosts } from './ssh-parser.js';
+import { isTrustedHost } from '../auth/trusted-hosts.js';
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
@@ -295,23 +296,41 @@ export async function evaluatePolicy(
 
     // ── Pipe-chain exfiltration detection ────────────────────────────────────
     const pipeAnalysis = analyzePipeChain(shellCommand);
-    if (pipeAnalysis.isPipeline) {
+    if (
+      pipeAnalysis.isPipeline &&
+      (pipeAnalysis.risk === 'critical' || pipeAnalysis.risk === 'high')
+    ) {
+      const sinks = pipeAnalysis.sinkTargets;
+      const allTrusted = sinks.length > 0 && sinks.every(isTrustedHost);
+
       if (pipeAnalysis.risk === 'critical') {
+        // Obfuscated exfil: trusted hosts downgrade block → review; untrusted → block
+        if (allTrusted) {
+          return {
+            decision: 'review',
+            blockedByLabel: 'Node9: Pipe-Chain to Trusted Host (obfuscated)',
+            reason: `Obfuscated pipe to trusted host(s): ${sinks.join(', ')} — requires approval`,
+            tier: 3,
+          };
+        }
         return {
           decision: 'block',
           blockedByLabel: 'Node9: Pipe-Chain Exfiltration (critical)',
-          reason: `Sensitive file piped through obfuscator to network sink: ${pipeAnalysis.sourceFiles.join(', ')} → ${pipeAnalysis.sinkTargets.join(', ')}`,
+          reason: `Sensitive file piped through obfuscator to network sink: ${pipeAnalysis.sourceFiles.join(', ')} → ${sinks.join(', ')}`,
           tier: 3,
         };
       }
-      if (pipeAnalysis.risk === 'high') {
-        return {
-          decision: 'review',
-          blockedByLabel: 'Node9: Pipe-Chain Exfiltration (high)',
-          reason: `Sensitive file piped to network sink: ${pipeAnalysis.sourceFiles.join(', ')} → ${pipeAnalysis.sinkTargets.join(', ')}`,
-          tier: 3,
-        };
+
+      // high risk: trusted hosts → allow; untrusted → review
+      if (allTrusted) {
+        return { decision: 'allow' };
       }
+      return {
+        decision: 'review',
+        blockedByLabel: 'Node9: Pipe-Chain Exfiltration (high)',
+        reason: `Sensitive file piped to network sink: ${pipeAnalysis.sourceFiles.join(', ')} → ${sinks.join(', ')}`,
+        tier: 3,
+      };
     }
 
     // ── SSH multi-hop host extraction ─────────────────────────────────────────
