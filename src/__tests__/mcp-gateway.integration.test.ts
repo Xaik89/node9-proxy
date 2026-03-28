@@ -77,7 +77,10 @@ rl.on('line', (line) => {
 afterAll(() => {
   try {
     fs.rmSync(mockScriptDir, { recursive: true, force: true });
-  } catch {}
+  } catch (e) {
+    // Don't silently swallow — leaked temp dirs accumulate in CI.
+    process.stderr.write(`[node9-gw-test] afterAll cleanup failed: ${e}\n`);
+  }
 });
 
 function makeTempHome(config: object): string {
@@ -101,7 +104,7 @@ function cleanupDir(dir: string) {
 type GatewayResponse = {
   id?: unknown;
   jsonrpc?: string;
-  result?: Record<string, unknown>;
+  result?: Record<string, unknown> & { tools?: unknown[]; ok?: boolean };
   error?: { code: number; message: string; data?: unknown };
 };
 
@@ -121,9 +124,14 @@ function runGateway(
 ): { stdout: string; stderr: string; status: number | null } {
   // Strip all NODE9_* env vars so local developer config (NODE9_MODE, NODE9_API_KEY,
   // NODE9_PAUSED, etc.) cannot leak into the hermetically-isolated test home.
+  // PATH is kept as-is: all spawns use absolute paths (NODE = process.execPath,
+  // CLI = resolved dist/cli.js), so the ambient PATH cannot inject a different binary.
   const cleanEnv = Object.fromEntries(
     Object.entries(process.env).filter(([k]) => !k.startsWith('NODE9_'))
   );
+  // NODE9_TESTING=1: suppresses native/browser/terminal UI approvers so tests
+  // don't open dialogs. Policy evaluation, DLP, smart rules, and shields all run
+  // unchanged — see src/auth/orchestrator.ts isTestEnv block for the exact effect.
   const result = spawnSync(NODE, [CLI, 'mcp-gateway', '--upstream', `${NODE} ${upstreamScript}`], {
     input: inputLines.join('\n') + '\n',
     encoding: 'utf-8',
@@ -132,7 +140,7 @@ function runGateway(
       ...cleanEnv,
       HOME: homeDir,
       USERPROFILE: homeDir,
-      NODE9_TESTING: '1', // disables UI approvers only — policy/DLP/smart-rules still run
+      NODE9_TESTING: '1',
     },
   });
 
@@ -233,14 +241,14 @@ describe('mcp-gateway tool call interception', () => {
             jsonrpc: '2.0',
             id: 42,
             method: 'tools/call',
-            params: { name: 'read_file', arguments: { path: '/tmp/test.txt' } },
+            params: { name: 'read_file', arguments: { path: '/nonexistent/node9-test-only' } },
           }),
         ],
         home
       );
-      // The mock upstream echoes back whatever params it receives — forwarding the
-      // path "/tmp/test.txt" is safe here because the upstream is a mock script,
-      // not a real filesystem server. It never actually reads from disk.
+      // The mock upstream echoes back whatever params it receives — it never reads
+      // from disk, so the path argument is irrelevant. /nonexistent/node9-test-only
+      // makes it explicit that this is a synthetic test path with no real target.
       expect(r.status).toBe(0);
       const responses = parseResponses(r.stdout);
       const callResponse = responses.find((resp) => resp.id === 42);
@@ -261,7 +269,10 @@ describe('mcp-gateway tool call interception', () => {
       settings: {
         mode: 'standard',
         autoStartDaemon: false,
-        approvalTimeoutMs: 100, // fast timeout so test doesn't hang
+        // approvalTimeoutMs is 100ms; give the gateway 2000ms total to leave
+        // enough overhead while keeping the test tight. If the auth engine hangs
+        // instead of rejecting, the test will fail with a clear timeout error.
+        approvalTimeoutMs: 100,
         approvers: { native: false, browser: false, terminal: false, cloud: false },
       },
     });
@@ -276,7 +287,7 @@ describe('mcp-gateway tool call interception', () => {
           }),
         ],
         home,
-        5000
+        2000
       );
       expect(r.status).toBe(0);
       const responses = parseResponses(r.stdout);
@@ -311,7 +322,7 @@ describe('mcp-gateway tool call interception', () => {
           }),
         ],
         home,
-        5000
+        2000
       );
       expect(r.status).toBe(0);
       const responses = parseResponses(r.stdout);

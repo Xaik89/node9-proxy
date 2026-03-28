@@ -262,6 +262,8 @@ claude mcp add --scope user filesystem -- node9 mcp-gateway --upstream \
 }
 ```
 
+> **Note:** `--upstream` takes a single command string. The gateway's tokenizer splits it on whitespace and handles double-quoted paths (e.g. `"npx \"/path with spaces/server.js\""`) — it does not run a shell.
+
 ### What gets protected
 
 The same `ignoredTools`, smart rules, shields, and DLP that protect hook-mode tools apply here — but matched against **MCP tool names** (e.g. `write_file`, `execute_query`) instead of Claude's built-in tools.
