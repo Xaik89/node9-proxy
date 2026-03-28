@@ -20,6 +20,7 @@ import { spawn } from 'child_process';
 import { execa } from 'execa';
 import { authorizeHeadless } from '../auth/orchestrator';
 import { buildNegotiationMessage } from '../policy/negotiation';
+import { checkProvenance } from '../utils/provenance.js';
 
 function sanitize(value: string): string {
   // eslint-disable-next-line no-control-regex
@@ -101,6 +102,27 @@ export async function runMcpGateway(upstreamCommand: string): Promise<void> {
     const { stdout } = await execa('which', [cmd]);
     if (stdout) executable = stdout.trim();
   } catch {}
+
+  // Check binary provenance before spawning — a server in /tmp or world-writable
+  // could be a supply-chain attack (malicious binary replacing the real MCP server).
+  const prov = checkProvenance(executable);
+  if (prov.trustLevel === 'suspect') {
+    console.error(
+      chalk.red(
+        `⚠️  Node9: Upstream MCP server binary is suspect — ${prov.reason} (${prov.resolvedPath})`
+      )
+    );
+    console.error(chalk.red('   Refusing to spawn. Use a system-installed or managed binary.'));
+    process.exit(1);
+  }
+  if (prov.trustLevel === 'unknown') {
+    console.error(
+      chalk.yellow(
+        `⚠️  Node9: Upstream MCP server binary is in an unrecognized location — ${prov.resolvedPath}`
+      )
+    );
+    console.error(chalk.yellow('   Proceeding, but verify this binary is trusted.'));
+  }
 
   // stderr only — stdout must stay clean for the JSON-RPC stdio protocol
   console.error(chalk.green(`🚀 Node9 MCP Gateway: Monitoring [${upstreamCommand}]`));
