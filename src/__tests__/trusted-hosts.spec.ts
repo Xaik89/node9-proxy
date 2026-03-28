@@ -8,6 +8,7 @@ import {
   isTrustedHost,
   addTrustedHost,
   removeTrustedHost,
+  _resetTrustedHostsCache,
 } from '../auth/trusted-hosts.js';
 
 // ── normalizeHost ──────────────────────────────────────────────────────────────
@@ -48,6 +49,7 @@ vi.spyOn(os, 'homedir').mockReturnValue('/mock/home');
 
 describe('isTrustedHost', () => {
   beforeEach(() => {
+    _resetTrustedHostsCache();
     vi.spyOn(fs, 'readFileSync').mockImplementation((p) => {
       if (String(p).includes('trusted-hosts')) {
         return JSON.stringify({
@@ -85,11 +87,13 @@ describe('isTrustedHost', () => {
     expect(isTrustedHost('us.app.logs.io')).toBe(true);
   });
 
-  it('wildcard *.logs.io matches bare domain', () => {
-    expect(isTrustedHost('logs.io')).toBe(true);
+  it('wildcard *.logs.io does NOT match bare domain logs.io', () => {
+    // *.logs.io requires at least one subdomain label — the bare domain is not covered.
+    expect(isTrustedHost('logs.io')).toBe(false);
   });
 
   it('returns false when trusted-hosts.json is missing', () => {
+    _resetTrustedHostsCache();
     vi.spyOn(fs, 'readFileSync').mockImplementation(() => {
       throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
     });
@@ -101,6 +105,7 @@ describe('isTrustedHost', () => {
 
 describe('addTrustedHost / removeTrustedHost', () => {
   beforeEach(() => {
+    _resetTrustedHostsCache();
     vi.spyOn(os, 'homedir').mockReturnValue('/mock/home');
     vi.spyOn(fs, 'mkdirSync').mockReturnValue(undefined);
     vi.spyOn(fs, 'renameSync').mockReturnValue(undefined);
@@ -117,6 +122,17 @@ describe('addTrustedHost / removeTrustedHost', () => {
     expect(written.hosts).toHaveLength(1);
     expect(written.hosts[0].host).toBe('api.newhost.com');
     expect(written.hosts[0].addedBy).toBe('user');
+  });
+
+  it('addTrustedHost normalizes URL before storing', () => {
+    vi.spyOn(fs, 'readFileSync').mockReturnValue(JSON.stringify({ hosts: [] }));
+    const writeSpy = vi.spyOn(fs, 'writeFileSync').mockReturnValue(undefined);
+
+    addTrustedHost('https://api.newhost.com/v1/ingest');
+
+    expect(writeSpy).toHaveBeenCalledOnce();
+    const written = JSON.parse(writeSpy.mock.calls[0][1] as string);
+    expect(written.hosts[0].host).toBe('api.newhost.com');
   });
 
   it('addTrustedHost is idempotent', () => {

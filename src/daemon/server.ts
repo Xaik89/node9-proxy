@@ -47,7 +47,11 @@ import {
   type SseClient,
   type Decision,
   CREDENTIALS_FILE,
+  suggestionTracker,
+  suggestions,
+  insightCounts,
 } from './state';
+import { patchConfig, GLOBAL_CONFIG_PATH, type ConfigPatch } from '../config/patch.js';
 
 export function startDaemon(): void {
   const csrfToken = randomUUID();
@@ -120,6 +124,7 @@ export function startDaemon(): void {
             timestamp: e.timestamp,
             agent: e.agent,
             mcpServer: e.mcpServer,
+            allowCount: (insightCounts.get(e.toolName) ?? 0) + 1,
           })),
           orgName: getOrgName(),
           autoDenyMs: getConfig().settings.approvalTimeoutMs ?? AUTO_DENY_MS,
@@ -151,6 +156,14 @@ export function startDaemon(): void {
           setAbandonTimer(setTimeout(abandonPending, getHadBrowserClient() ? 10_000 : 15_000));
         }
       });
+    }
+
+    // Tail notifies the daemon that it already opened the browser so the daemon
+    // won't open a duplicate tab on the first /check request.
+    if (req.method === 'POST' && pathname === '/browser-opened') {
+      browserOpened = true;
+      res.writeHead(200).end();
+      return;
     }
 
     if (req.method === 'POST' && pathname === '/check') {
@@ -200,7 +213,7 @@ export function startDaemon(): void {
                 e.earlyReason = 'No response — auto-denied after timeout';
               }
               pending.delete(id);
-              broadcast('remove', { id });
+              broadcast('remove', { id, decision: 'deny' });
             }
           }, getConfig().settings.approvalTimeoutMs ?? AUTO_DENY_MS),
         };
@@ -236,6 +249,9 @@ export function startDaemon(): void {
             agent: entry.agent,
             mcpServer: entry.mcpServer,
             interactive: terminalEnabled,
+            // allowCount = what this count will be if the user allows.
+            // Terminal uses this to show the 💡 insight line on the Nth consecutive approval.
+            allowCount: (insightCounts.get(toolName) ?? 0) + 1,
           });
           // Only the `node9 check` path (autoStartDaemonAndWait) pre-opens the
           // browser before registering the request — it signals this via
@@ -247,7 +263,7 @@ export function startDaemon(): void {
           }
         }
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ id }));
+        res.end(JSON.stringify({ id, allowCount: (insightCounts.get(toolName) ?? 0) + 1 }));
 
         // Run the full policy + cloud + native pipeline in the background.
         // Browser and terminal racers are skipped (no TTY, browser card already exists via SSE).
@@ -298,7 +314,7 @@ export function startDaemon(): void {
             if (e.waiter) {
               e.waiter(decision, result.reason);
               pending.delete(id);
-              broadcast('remove', { id });
+              broadcast('remove', { id, decision });
             } else {
               e.earlyDecision = decision;
               e.earlyReason = result.reason;
@@ -316,7 +332,7 @@ export function startDaemon(): void {
               e.earlyReason = reason;
             }
             pending.delete(id);
-            broadcast('remove', { id });
+            broadcast('remove', { id, decision: 'deny' });
           });
 
         return;
@@ -349,14 +365,19 @@ export function startDaemon(): void {
         res.end(JSON.stringify(body));
       };
       // When the CLI aborts the long-poll (e.g. native popup won the race),
-      // clean up the entry and dismiss the tail card immediately.
+      // clean up the entry and dismiss the tail card.
+      // Delay 200ms so the Event Bridge POST /resolve/ (fired in finish() just
+      // after abort()) arrives first and carries the real decision.
+      // If /resolve/ arrives first it deletes the entry — the timeout is a no-op.
       req.on('close', () => {
-        const e = pending.get(id);
-        if (e && e.waiter && e.earlyDecision === null) {
-          clearTimeout(e.timer);
-          pending.delete(id);
-          broadcast('remove', { id });
-        }
+        setTimeout(() => {
+          const e = pending.get(id);
+          if (e && e.waiter && e.earlyDecision === null) {
+            clearTimeout(e.timer);
+            pending.delete(id);
+            broadcast('remove', { id }); // no decision — preserves tail count
+          }
+        }, 200);
       });
       return;
     }
@@ -395,10 +416,10 @@ export function startDaemon(): void {
           if (entry.waiter) {
             entry.waiter('allow');
             pending.delete(id);
-            broadcast('remove', { id });
+            broadcast('remove', { id, decision: 'allow' });
           } else {
             entry.earlyDecision = 'allow';
-            broadcast('remove', { id });
+            broadcast('remove', { id, decision: 'allow' });
             entry.timer = setTimeout(() => pending.delete(id), 30_000);
           }
           res.writeHead(200);
@@ -414,6 +435,22 @@ export function startDaemon(): void {
         });
         clearTimeout(entry.timer);
 
+        // ── Smart Rule Suggestions ────────────────────────────────────────────
+        // Track human allow decisions. After threshold consecutive allows for
+        // the same tool, broadcast a suggestion card to reduce future friction.
+        // Reset the counter on deny so we never suggest allowing blocked actions.
+        if (resolvedDecision === 'allow' && !persist) {
+          insightCounts.set(entry.toolName, (insightCounts.get(entry.toolName) ?? 0) + 1);
+          const suggestion = suggestionTracker.recordAllow(entry.toolName, entry.args);
+          if (suggestion) {
+            suggestions.set(suggestion.id, suggestion);
+            broadcast('suggestion:new', suggestion);
+          }
+        } else if (resolvedDecision === 'deny') {
+          insightCounts.delete(entry.toolName);
+          suggestionTracker.resetTool(entry.toolName);
+        }
+
         // source is validated against an allowlist AFTER appendAuditLog so the
         // raw user-supplied value never reaches any log string — no log injection.
         const VALID_SOURCES = new Set(['terminal', 'browser', 'native']);
@@ -421,11 +458,11 @@ export function startDaemon(): void {
         if (entry.waiter) {
           entry.waiter(resolvedDecision, reason);
           pending.delete(id!);
-          broadcast('remove', { id });
+          broadcast('remove', { id, decision: resolvedDecision });
         } else {
           entry.earlyDecision = resolvedDecision;
           entry.earlyReason = reason;
-          broadcast('remove', { id });
+          broadcast('remove', { id, decision: resolvedDecision });
           entry.timer = setTimeout(() => pending.delete(id!), 30_000);
         }
         res.writeHead(200);
@@ -519,13 +556,43 @@ export function startDaemon(): void {
         const id = pathname.split('/').pop()!;
         const entry = pending.get(id);
         if (!entry) return res.writeHead(404).end();
-        const { decision } = JSON.parse(await readBody(req));
-        appendAuditLog({ toolName: entry.toolName, args: entry.args, decision });
+        const { decision, source } = JSON.parse(await readBody(req)) as {
+          decision: string;
+          source?: string;
+        };
+        const resolvedResolveDecision: Decision = decision === 'allow' ? 'allow' : 'deny';
+        appendAuditLog({ toolName: entry.toolName, args: entry.args, decision: resolvedResolveDecision });
         clearTimeout(entry.timer);
-        if (entry.waiter) entry.waiter(decision);
-        else entry.earlyDecision = decision;
+
+        // ── Event Bridge: track human decisions for Smart Rule Suggestions ────
+        // insightCounts tracks all human approvals (including cloud/Slack) so the
+        // 💡 insight line appears consistently across all approval channels.
+        // suggestionTracker is gated on !slackDelegated — Slack auto-approvals should
+        // not generate smart rule suggestions (different UX intent).
+        if (resolvedResolveDecision === 'allow') {
+          insightCounts.set(entry.toolName, (insightCounts.get(entry.toolName) ?? 0) + 1);
+        } else {
+          insightCounts.delete(entry.toolName);
+        }
+        if (!entry.slackDelegated) {
+          if (resolvedResolveDecision === 'allow') {
+            const suggestion = suggestionTracker.recordAllow(entry.toolName, entry.args);
+            if (suggestion) {
+              suggestions.set(suggestion.id, suggestion);
+              broadcast('suggestion:new', suggestion);
+            }
+          } else {
+            suggestionTracker.resetTool(entry.toolName);
+          }
+        }
+
+        const VALID_RESOLVE_SOURCES = new Set(['terminal', 'browser', 'native']);
+        if (source && VALID_RESOLVE_SOURCES.has(source)) entry.decisionSource = source;
+
+        if (entry.waiter) entry.waiter(resolvedResolveDecision);
+        else entry.earlyDecision = resolvedResolveDecision;
         pending.delete(id);
-        broadcast('remove', { id });
+        broadcast('remove', { id, decision: resolvedResolveDecision });
         res.writeHead(200);
         return res.end(JSON.stringify({ ok: true }));
       } catch {
@@ -577,6 +644,62 @@ export function startDaemon(): void {
         }));
         broadcast('shields-status', { shields: shieldsPayload });
         res.writeHead(200);
+        return res.end(JSON.stringify({ ok: true }));
+      } catch {
+        res.writeHead(400).end();
+      }
+    }
+
+    // ── Suggestions routes ────────────────────────────────────────────────────
+
+    if (req.method === 'GET' && pathname === '/suggestions') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify([...suggestions.values()]));
+    }
+
+    if (req.method === 'POST' && pathname.startsWith('/suggestions/') && pathname.endsWith('/apply')) {
+      if (!validToken(req)) return res.writeHead(403).end();
+      try {
+        const id = pathname.split('/')[2];
+        const suggestion = suggestions.get(id);
+        if (!suggestion) return res.writeHead(404).end();
+
+        const body = await readBody(req);
+        const data = body ? (JSON.parse(body) as { configPath?: string; rule?: object }) : {};
+        const configPath = data.configPath ?? GLOBAL_CONFIG_PATH;
+
+        // Allow the UI to override the rule before applying
+        const patch: ConfigPatch =
+          data.rule
+            ? ({ type: 'smartRule', rule: data.rule } as ConfigPatch)
+            : (suggestion.suggestedRule as ConfigPatch);
+
+        patchConfig(configPath, patch);
+        _resetConfigCache();
+
+        suggestion.status = 'applied';
+        broadcast('suggestion:resolved', { id, status: 'applied' });
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ ok: true }));
+      } catch (err) {
+        console.error(chalk.red('[node9 daemon] POST /suggestions/:id/apply failed:'), err);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: String(err) }));
+      }
+    }
+
+    if (req.method === 'POST' && pathname.startsWith('/suggestions/') && pathname.endsWith('/dismiss')) {
+      if (!validToken(req)) return res.writeHead(403).end();
+      try {
+        const id = pathname.split('/')[2];
+        const suggestion = suggestions.get(id);
+        if (!suggestion) return res.writeHead(404).end();
+
+        suggestion.status = 'dismissed';
+        broadcast('suggestion:resolved', { id, status: 'dismissed' });
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ ok: true }));
       } catch {
         res.writeHead(400).end();

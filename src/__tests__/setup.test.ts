@@ -10,6 +10,7 @@ import {
   teardownClaude,
   teardownGemini,
   teardownCursor,
+  detectAgents,
 } from '../setup.js';
 
 vi.mock('@inquirer/prompts', () => ({ confirm: vi.fn() }));
@@ -439,6 +440,46 @@ describe('teardownGemini', () => {
     const written = writtenTo(settingsPath);
     expect(written.hooks.BeforeTool).toHaveLength(1);
     expect(written.hooks.BeforeTool[0].hooks[0].command).toBe('/other/tool run');
+  });
+});
+
+// ── detectAgents ─────────────────────────────────────────────────────────────
+
+describe('detectAgents', () => {
+  it('returns all false when no agent directories exist', () => {
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    expect(detectAgents('/mock/home')).toEqual({ claude: false, gemini: false, cursor: false });
+  });
+
+  it('detects Claude via ~/.claude directory', () => {
+    vi.mocked(fs.existsSync).mockImplementation((p) => String(p) === '/mock/home/.claude');
+    const result = detectAgents('/mock/home');
+    expect(result.claude).toBe(true);
+    expect(result.gemini).toBe(false);
+    expect(result.cursor).toBe(false);
+  });
+
+  it('detects Claude via ~/.claude.json (no directory)', () => {
+    vi.mocked(fs.existsSync).mockImplementation((p) => String(p) === '/mock/home/.claude.json');
+    expect(detectAgents('/mock/home').claude).toBe(true);
+  });
+
+  it('detects Gemini via ~/.gemini directory', () => {
+    vi.mocked(fs.existsSync).mockImplementation((p) => String(p) === '/mock/home/.gemini');
+    expect(detectAgents('/mock/home').gemini).toBe(true);
+  });
+
+  it('detects Cursor via ~/.cursor directory', () => {
+    vi.mocked(fs.existsSync).mockImplementation((p) => String(p) === '/mock/home/.cursor');
+    expect(detectAgents('/mock/home').cursor).toBe(true);
+  });
+
+  it('detects all three agents simultaneously', () => {
+    vi.mocked(fs.existsSync).mockImplementation((p) => {
+      const s = String(p);
+      return s === '/mock/home/.claude' || s === '/mock/home/.gemini' || s === '/mock/home/.cursor';
+    });
+    expect(detectAgents('/mock/home')).toEqual({ claude: true, gemini: true, cursor: true });
   });
 });
 

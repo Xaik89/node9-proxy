@@ -30,19 +30,38 @@ export function readTrustedHosts(): TrustedHostEntry[] {
   }
 }
 
+// Module-level TTL cache — avoids a sync disk read on every policy evaluation.
+// Invalidated by _resetTrustedHostsCache() (used in tests) and after each write.
+let _cache: { hosts: TrustedHostEntry[]; expiry: number } | null = null;
+const CACHE_TTL_MS = 5_000;
+
+export function _resetTrustedHostsCache(): void {
+  _cache = null;
+}
+
+function getCachedHosts(): TrustedHostEntry[] {
+  const now = Date.now();
+  if (_cache && now < _cache.expiry) return _cache.hosts;
+  const hosts = readTrustedHosts();
+  _cache = { hosts, expiry: now + CACHE_TTL_MS };
+  return hosts;
+}
+
 function writeTrustedHosts(hosts: TrustedHostEntry[]): void {
+  _cache = null; // invalidate cache on every write
   const filePath = getTrustedHostsPath();
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   const tmp = filePath + '.node9-tmp';
-  fs.writeFileSync(tmp, JSON.stringify({ hosts }, null, 2));
+  fs.writeFileSync(tmp, JSON.stringify({ hosts }, null, 2), { mode: 0o600 });
   fs.renameSync(tmp, filePath);
 }
 
-/** Add a host to the trusted list. No-op if already present. */
+/** Add a host to the trusted list. Normalizes input before storing. No-op if already present. */
 export function addTrustedHost(host: string): void {
+  const normalized = normalizeHost(host);
   const hosts = readTrustedHosts();
-  if (hosts.some((h) => h.host === host)) return;
-  hosts.push({ host, addedAt: Date.now(), addedBy: 'user' });
+  if (hosts.some((h) => h.host === normalized)) return;
+  hosts.push({ host: normalized, addedAt: Date.now(), addedBy: 'user' });
   writeTrustedHosts(hosts);
 }
 
@@ -75,16 +94,18 @@ export function normalizeHost(raw: string): string {
  * Returns true if `host` is trusted.
  * - Exact match: "api.mycompany.com" matches entry "api.mycompany.com"
  * - Wildcard: entry "*.mycompany.com" matches "api.mycompany.com" and "sub.api.mycompany.com"
+ *   but does NOT match bare "mycompany.com" — a wildcard requires at least one subdomain label.
  * - Protocol/path/port are stripped before comparison.
  * - "api.mycompany.com" does NOT match a bare "mycompany.com" entry.
  */
 export function isTrustedHost(host: string): boolean {
   const normalized = normalizeHost(host);
-  return readTrustedHosts().some((entry) => {
+  return getCachedHosts().some((entry) => {
     const entryHost = entry.host.toLowerCase();
     if (entryHost.startsWith('*.')) {
       const domain = entryHost.slice(2);
-      return normalized === domain || normalized.endsWith('.' + domain);
+      // Must be a proper subdomain: "foo.domain" matches, bare "domain" does not.
+      return normalized.endsWith('.' + domain);
     }
     return normalized === entryHost;
   });

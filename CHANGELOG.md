@@ -6,6 +6,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [Unreleased] → v1.4.0
+
+### Added
+
+- **Trusted-Host Allowlist (`node9 trust add/remove/list`):** Persistent per-user allowlist of known-safe network destinations. Pipe-chain exfiltration decisions are downgraded for trusted hosts only: `critical` (hard block) → `review` (approval prompt), `high` (review) → `allow`. If any sink in the pipeline is untrusted, the original decision stands. Hosts are stored in `~/.node9/trusted-hosts.json` (`0o600`) with atomic write (tmp + rename). Only the CLI can add entries — no MCP tool or API can modify the list. Supports exact FQDNs (`api.mycompany.com`) and wildcard subdomains (`*.mycompany.com`); wildcards require at least one subdomain label and do not match the bare domain.
+- **`node9 trust add <host>`:** Adds a host to the trusted list. Normalizes input (strips protocol, path, port, `user@`) before storing so `https://api.company.com/v1/ingest` and `api.company.com` are treated as the same entry. No-op if already present.
+- **`node9 trust remove <host>`:** Removes a host from the trusted list. Exits non-zero if not found.
+- **`node9 trust list`:** Displays all trusted hosts with the date they were added.
+- **TTL cache for trusted-host lookups:** `isTrustedHost()` is on the hot path (called for every pipe-chain tool call). Results are cached in-process for 5 seconds to avoid a synchronous disk read on every policy evaluation. Cache is invalidated on every write.
+
+---
+
+## [Unreleased] → v1.3.0
+
+### Added
+
+- **Pipe-Chain Exfiltration Detection:** The policy engine now detects shell pipelines that exfiltrate sensitive files to the network. Two risk levels: `critical` (file piped through an obfuscator such as `base64`, `xxd`, `gzip`, `openssl` before a network sink) → hard block; `high` (file piped directly to a network sink like `curl`, `wget`, `nc`, `socat`) → review. Sink targets (URLs, hostnames, IPs) are extracted from the pipeline and surfaced in the block reason and audit log.
+- **Binary Provenance Check:** Absolute-path binaries (e.g. `/tmp/curl`) are classified by filesystem location before execution. Binaries in temp directories, world-writable paths, or unknown locations are flagged as `suspect` (block in strict mode, review in standard) or `unknown` (review in strict mode). System binaries (`/usr/bin`, `/bin`, `/usr/local/bin`) and managed tool binaries (nvm, volta, homebrew, pyenv, cargo) are trusted. Bare command names (`npm`, `curl`) are not checked to avoid false positives from PATH-managed tools.
+- **`_classifyPath()` exported pure helper:** Extracted from `checkProvenance()` for unit testability without filesystem mocking. Takes a resolved path and optional cwd, returns `{ trustLevel, reason }`.
+- **SSH multi-hop host extraction:** `extractAllSshHosts()` parses `ssh`/`scp`/`rsync` command arguments including `-J` jump hosts, `ProxyJump` config, and `user@host` patterns. Extracted hostnames are added to the token stream for dangerous-word scanning.
+
+### Fixed
+
+- **POSIX path semantics on Windows:** All prefix checks in provenance now use `'/'` as separator instead of `path.sep` (which is `'\\'` on Windows). `path.posix.isAbsolute` replaces `path.isAbsolute` for checking POSIX-style paths. This fixes all provenance classification tests on `windows-latest` CI.
+
+---
+
 ## [Unreleased] → v1.2.0
 
 ### Added

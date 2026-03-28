@@ -10,6 +10,9 @@ import { spawn } from 'child_process';
 import { randomUUID } from 'crypto';
 import { RiskMetadata } from '../context-sniper';
 import { DAEMON_PORT, DAEMON_HOST } from '../auth/daemon';
+import { SuggestionTracker, type Suggestion } from './suggestion-tracker.js';
+
+export type { Suggestion };
 
 export { DAEMON_PORT, DAEMON_HOST };
 
@@ -57,6 +60,12 @@ export interface SseClient {
 // ── Shared mutable state ──────────────────────────────────────────────────────
 export const pending = new Map<string, PendingEntry>();
 export const sseClients = new Set<SseClient>();
+export const suggestionTracker = new SuggestionTracker(3);
+export const suggestions = new Map<string, Suggestion>();
+/** Cumulative per-tool allow count for the 💡 insight line.
+ *  Unlike suggestionTracker, this never resets after the suggestion threshold —
+ *  only on deny. Used by all approval channels (terminal, browser, native popup). */
+export const insightCounts = new Map<string, number>();
 let _abandonTimer: ReturnType<typeof setTimeout> | null = null;
 export function getAbandonTimer() {
   return _abandonTimer;
