@@ -59,9 +59,10 @@ describe('checkProvenance — world-writable check', () => {
     vi.restoreAllMocks();
   });
 
-  it('classifies a world-writable binary as suspect', () => {
+  // World-writable is a POSIX concept; /bin/sh doesn't exist on Windows.
+  it.skipIf(process.platform === 'win32')('classifies a world-writable binary as suspect', () => {
     vi.spyOn(fs, 'statSync').mockReturnValue({ mode: 0o777 } as fs.Stats);
-    // /bin/sh always exists; realpathSync works on real fs without mocking
+    // /bin/sh always exists on POSIX; realpathSync works on real fs without mocking
     const result = checkProvenance('/bin/sh');
     expect(result.trustLevel).toBe('suspect');
     expect(result.reason).toMatch(/world-writable/i);
