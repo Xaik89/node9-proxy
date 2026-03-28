@@ -68,7 +68,11 @@ rl.on('line', (line) => {
       // must not get a response — writing one would be invalid JSON-RPC.
       process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: {} }) + '\\n');
     }
-  } catch {}
+  } catch (err) {
+    // Write to stderr so test failures surface the actual parse error rather
+    // than hanging on a missing response. Never write to stdout (breaks protocol).
+    process.stderr.write('[mock-upstream] line parse error: ' + err + '\\n');
+  }
 });
 `
   );
@@ -95,6 +99,7 @@ function cleanupDir(dir: string) {
   try {
     fs.rmSync(dir, { recursive: true, force: true });
   } catch (e: unknown) {
+    if (!(e instanceof Error)) throw e;
     const code = (e as NodeJS.ErrnoException).code;
     if (code !== 'EBUSY' && code !== 'ENOTEMPTY') throw e;
   }
@@ -104,7 +109,9 @@ function cleanupDir(dir: string) {
 type GatewayResponse = {
   id?: unknown;
   jsonrpc?: string;
-  result?: Record<string, unknown> & { tools?: unknown[]; ok?: boolean };
+  // Index signature first, then named properties — avoids the redundant
+  // `Record<string, unknown> & {...}` intersection pattern.
+  result?: { [key: string]: unknown; tools?: unknown[]; ok?: boolean };
   error?: { code: number; message: string; data?: unknown };
 };
 
@@ -113,7 +120,15 @@ function parseResponses(stdout: string): GatewayResponse[] {
   return stdout
     .split('\n')
     .filter(Boolean)
-    .map((l) => JSON.parse(l) as GatewayResponse);
+    .map((l) => {
+      try {
+        return JSON.parse(l) as GatewayResponse;
+      } catch (e) {
+        throw new Error(
+          `parseResponses: non-JSON line on gateway stdout: ${JSON.stringify(l)}\n  cause: ${e}`
+        );
+      }
+    });
 }
 
 function runGateway(
@@ -149,8 +164,13 @@ function runGateway(
   // status===null means the process was killed by a signal or timed out.
   // On some platforms signal may also be null in this case — treat both as failure
   // so a hung/killed gateway doesn't silently appear to pass.
+  // Include partial output to make timeout failures diagnosable.
   if (result.status === null) {
-    throw new Error(`Gateway process did not exit cleanly (signal: ${result.signal ?? 'none'})`);
+    throw new Error(
+      `Gateway process did not exit cleanly (signal: ${result.signal ?? 'none'})\n` +
+        `  stdout: ${result.stdout ? JSON.stringify(result.stdout.slice(0, 500)) : '(empty)'}\n` +
+        `  stderr: ${result.stderr ? result.stderr.slice(0, 500) : '(empty)'}`
+    );
   }
 
   return {
