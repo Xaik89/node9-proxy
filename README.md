@@ -15,6 +15,19 @@ While others try to _guess_ if a prompt is malicious (Semantic Security), Node9 
 
 ---
 
+## Contents
+
+|                                                   |                                                    |
+| ------------------------------------------------- | -------------------------------------------------- |
+| [💎 The Aha Moment](#-the-aha-moment)             | [🌐 MCP Gateway](#-mcp-gateway)                    |
+| [⚡ Key Features](#-key-features)                 | [🔗 Config Precedence](#-configuration-precedence) |
+| [🎮 Try it Live](#-try-it-live)                   | [⚙️ Custom Rules](#️-custom-rules-advanced)         |
+| [🚀 Quick Start](#-quick-start)                   | [🖥️ CLI Reference](#️-cli-reference)                |
+| [🛡️ How Protection Works](#️-how-protection-works) | [🔧 Troubleshooting](#-troubleshooting)            |
+| [🛠 Protection Modes](#-protection-modes)         | [🗺️ Roadmap](#️-roadmap)                            |
+
+---
+
 ## 💎 The "Aha!" Moment
 
 **AIs are literal.** When you ask an agent to "Fix my disk space," it might decide to run `docker system prune -af`.
