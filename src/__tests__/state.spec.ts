@@ -168,4 +168,15 @@ describe('insightCounts nudge-threshold boundary', () => {
     simulateAllow('Write');
     expect(allowCountSentToUI('Write') >= 3).toBe(false);
   });
+
+  it('nudge does not re-fire after Apply Rule resets the counter', () => {
+    // server.ts calls insightCounts.delete(suggestion.toolName) on Apply Rule,
+    // same operation as a deny. Verify the counter restarts from zero so the user
+    // isn't immediately re-nudged after they've already acted on the suggestion.
+    simulateAllow('Edit');
+    simulateAllow('Edit');
+    insightCounts.delete('Edit'); // mirrors server.ts Apply Rule handler
+    simulateAllow('Edit');
+    expect(allowCountSentToUI('Edit') >= 3).toBe(false); // still at 2, no nudge yet
+  });
 });

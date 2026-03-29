@@ -159,8 +159,26 @@ export function atomicWriteSync(
   const dir = path.dirname(filePath);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   const tmpPath = `${filePath}.${randomUUID()}.tmp`;
-  fs.writeFileSync(tmpPath, data, options);
-  fs.renameSync(tmpPath, filePath);
+  try {
+    fs.writeFileSync(tmpPath, data, options);
+  } catch (err) {
+    try {
+      fs.unlinkSync(tmpPath);
+    } catch {
+      /* best-effort: file may not have been created */
+    }
+    throw err;
+  }
+  try {
+    fs.renameSync(tmpPath, filePath);
+  } catch (err) {
+    try {
+      fs.unlinkSync(tmpPath);
+    } catch {
+      /* best-effort cleanup */
+    }
+    throw err;
+  }
 }
 
 const SECRET_KEY_RE = /password|secret|token|key|apikey|credential|auth/i;
