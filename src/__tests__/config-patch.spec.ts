@@ -25,6 +25,15 @@ describe('patchConfig — ignoredTool', () => {
     expect(data.policy.ignoredTools).toContain('Bash');
   });
 
+  it('creates parent directories if they do not exist', () => {
+    // patchConfig should call mkdirSync({ recursive: true }) before writing.
+    // This covers the production path where ~/.node9/ doesn't exist on first run.
+    const nestedPath = path.join(tmpDir, 'nested', 'deep', 'config.json');
+    patchConfig(nestedPath, { type: 'ignoredTool', toolName: 'Bash' });
+    const data = JSON.parse(fs.readFileSync(nestedPath, 'utf8'));
+    expect(data.policy.ignoredTools).toContain('Bash');
+  });
+
   it('appends to existing ignoredTools', () => {
     fs.writeFileSync(configPath, JSON.stringify({ policy: { ignoredTools: ['Read'] } }));
     patchConfig(configPath, { type: 'ignoredTool', toolName: 'Write' });

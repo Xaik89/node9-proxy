@@ -126,6 +126,12 @@ describe('isTrustedHost', () => {
     expect(isTrustedHost('evil.logs.io.attacker.com')).toBe(false);
   });
 
+  it('wildcard does NOT match a host that ends with the domain but has no leading dot', () => {
+    // "evillogs.io" ends with "logs.io" but NOT ".logs.io" — must not match *.logs.io.
+    // This guards against an endsWith(domain) check that omits the leading dot.
+    expect(isTrustedHost('evillogs.io')).toBe(false);
+  });
+
   it('wildcard match is case-insensitive', () => {
     expect(isTrustedHost('APP.LOGS.IO')).toBe(true);
   });
@@ -263,6 +269,16 @@ describe('addTrustedHost / removeTrustedHost', () => {
   it('addTrustedHost rejects single-label wildcard regardless of capitalisation', () => {
     // normalizeHost lowercases before the check, so *.COM is treated as *.com
     expect(() => addTrustedHost('*.COM')).toThrow(/too broad/);
+  });
+
+  it('addTrustedHost accepts *.co.uk (known PSL limitation — base has a dot)', () => {
+    // Our single-label check (base must contain a dot) accepts *.co.uk because
+    // "co.uk" contains a dot. True second-level TLD rejection would require a
+    // Public Suffix List — out of scope. Users are responsible for not adding
+    // country-code TLD wildcards. Documented as a known limitation.
+    vi.spyOn(fs, 'readFileSync').mockReturnValue(JSON.stringify({ hosts: [] }));
+    vi.spyOn(fs, 'writeFileSync').mockReturnValue(undefined);
+    expect(() => addTrustedHost('*.co.uk')).not.toThrow();
   });
 
   it('addTrustedHost accepts a valid two-label wildcard *.mycompany.com', () => {
