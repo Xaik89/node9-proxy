@@ -97,6 +97,12 @@ describe('isTrustedHost', () => {
     expect(isTrustedHost('logs.io')).toBe(false);
   });
 
+  it('wildcard *.logs.io matches arbitrarily deep subdomains', () => {
+    // endsWith('.' + domain) matches at any depth, not just one level.
+    // This is intentional: *.mycompany.com should cover all subdomains.
+    expect(isTrustedHost('a.b.c.logs.io')).toBe(true);
+  });
+
   it('wildcard *.mycompany.com does NOT match bare mycompany.com', () => {
     // Reviewer-requested explicit test: the most exploitable edge case —
     // attacker controls mycompany.com and uses it as a sink.

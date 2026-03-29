@@ -227,7 +227,7 @@ Node9 blocks any pipe-chain that sends sensitive files to the network. If the de
 
 ```bash
 node9 trust add api.mycompany.com      # exact FQDN
-node9 trust add *.logs.mycompany.com   # wildcard — any subdomain
+node9 trust add *.logs.mycompany.com   # wildcard — matches any subdomain at any depth (api.logs.mycompany.com, us.api.logs.mycompany.com, …) but NOT bare logs.mycompany.com
 node9 trust list                        # see the full list
 node9 trust remove api.mycompany.com   # remove a host
 ```

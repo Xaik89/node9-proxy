@@ -35,6 +35,12 @@ export function readTrustedHosts(): TrustedHostEntry[] {
 // If another process (e.g. `node9 trust remove`) writes the file, the mtime changes
 // and the next call re-reads immediately — no need to wait for TTL expiry.
 // Invalidated by _resetTrustedHostsCache() (used in tests) and after each write.
+//
+// Mtime granularity caveat: on Linux ext4 the mtime has 1-second resolution.
+// If a `node9 trust remove` write and the very next daemon `isTrustedHost()` call
+// land within the same clock second, the mtime appears unchanged and the stale
+// cache is served until TTL expiry (≤ 5 s). This is an accepted, bounded risk:
+// the maximum window is max(mtime_granularity, CACHE_TTL_MS) ≈ 5 seconds.
 let _cache: { hosts: TrustedHostEntry[]; expiry: number; mtime: number } | null = null;
 const CACHE_TTL_MS = 5_000;
 
