@@ -54,6 +54,7 @@ import {
   saveInsightCounts,
 } from './state';
 import { patchConfig, GLOBAL_CONFIG_PATH, type ConfigPatch } from '../config/patch.js';
+import { SmartRuleSchema } from '../config-schema.js';
 
 export function startDaemon(): void {
   loadInsightCounts(); // restore persisted nudge counters across restarts
@@ -683,13 +684,22 @@ export function startDaemon(): void {
         if (!suggestion) return res.writeHead(404).end();
 
         const body = await readBody(req);
-        const data = body ? (JSON.parse(body) as { configPath?: string; rule?: object }) : {};
+        const data = body ? (JSON.parse(body) as { configPath?: string; rule?: unknown }) : {};
         const configPath = data.configPath ?? GLOBAL_CONFIG_PATH;
 
-        // Allow the UI to override the rule before applying
-        const patch: ConfigPatch = data.rule
-          ? ({ type: 'smartRule', rule: data.rule } as ConfigPatch)
-          : (suggestion.suggestedRule as ConfigPatch);
+        // Allow the UI to override the rule before applying — validate against schema first
+        // to prevent a malformed rule from corrupting the config file.
+        let patch: ConfigPatch;
+        if (data.rule !== undefined) {
+          const parsed = SmartRuleSchema.safeParse(data.rule);
+          if (!parsed.success) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify({ error: parsed.error.message }));
+          }
+          patch = { type: 'smartRule', rule: parsed.data };
+        } else {
+          patch = suggestion.suggestedRule as ConfigPatch;
+        }
 
         patchConfig(configPath, patch);
         _resetConfigCache();

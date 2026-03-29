@@ -1,16 +1,27 @@
 // src/__tests__/state.spec.ts
 // Unit tests for insightCounts persistence (loadInsightCounts / saveInsightCounts)
 // and nudge-threshold boundary behaviour.
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
 import { insightCounts, loadInsightCounts, saveInsightCounts } from '../daemon/state.js';
 
-// atomicWriteSync calls writeFileSync + renameSync; stub both so tests don't hit disk.
+// atomicWriteSync (inside saveInsightCounts) calls mkdirSync + writeFileSync + renameSync.
+// Stub the FS side-effects at module level so no test ever hits disk.
 vi.spyOn(fs, 'mkdirSync').mockReturnValue(undefined);
 vi.spyOn(fs, 'renameSync').mockReturnValue(undefined);
 
 beforeEach(() => {
   insightCounts.clear();
+});
+
+// Restore per-test spies (existsSync, readFileSync, writeFileSync) so their
+// implementations don't leak between tests. The module-level mkdirSync/renameSync
+// mocks are re-established by the vi.spyOn calls above on next module load.
+afterEach(() => {
+  vi.restoreAllMocks();
+  // Re-stub the module-level mocks that restoreAllMocks just undid
+  vi.spyOn(fs, 'mkdirSync').mockReturnValue(undefined);
+  vi.spyOn(fs, 'renameSync').mockReturnValue(undefined);
 });
 
 // ── loadInsightCounts ─────────────────────────────────────────────────────────

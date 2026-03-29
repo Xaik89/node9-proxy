@@ -37,7 +37,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **`node9 trust add <host>`:** Adds a host to the trusted list. Normalizes input (strips protocol, path, port, `user@`) before storing so `https://api.company.com/v1/ingest` and `api.company.com` are treated as the same entry. No-op if already present.
 - **`node9 trust remove <host>`:** Removes a host from the trusted list. Exits non-zero if not found.
 - **`node9 trust list`:** Displays all trusted hosts with the date they were added.
-- **TTL cache for trusted-host lookups:** `isTrustedHost()` is on the hot path (called for every pipe-chain tool call). Results are cached in-process for 5 seconds to avoid a synchronous disk read on every policy evaluation. Cache is invalidated on every write.
+- **TTL cache for trusted-host lookups:** `isTrustedHost()` is on the hot path (called for every pipe-chain tool call). Results are cached in-process (5-second TTL) to avoid a synchronous disk read on every policy evaluation. Cache is invalidated on every write by the same process. For cross-process invalidation (e.g. `node9 trust remove` run in a CLI while the daemon is running), the cache stores the file mtime and re-reads immediately on the next call if the mtime has changed — removal takes effect on the next policy evaluation, not after the full TTL.
 
 ### Fixed
 
