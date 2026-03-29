@@ -140,6 +140,8 @@ describe('patchConfig — error handling', () => {
     expect(() => patchConfig(configPath, { type: 'ignoredTool', toolName: 'Bash' })).toThrow();
     // Corrupted file must not be truncated or overwritten by the failing call
     expect(fs.readFileSync(configPath, 'utf8')).toBe(badContent);
+    // Parse failure happens before any write — no .node9-tmp orphan should be left
+    expect(fs.existsSync(configPath + '.node9-tmp')).toBe(false);
   });
 
   it('passes mode 0o600 to writeFileSync (spy-based, all platforms)', () => {
@@ -150,7 +152,8 @@ describe('patchConfig — error handling', () => {
     try {
       patchConfig(configPath, { type: 'ignoredTool', toolName: 'Bash' });
       const tmpCall = writeSpy.mock.calls.find(([p]) => String(p).endsWith('.node9-tmp'));
-      if (!tmpCall) throw new Error('Expected writeFileSync to be called with a .node9-tmp path');
+      expect(tmpCall).toBeDefined();
+      if (!tmpCall) return; // TypeScript narrowing — never reached; expect above throws first
       const opts = tmpCall[2];
       // Guard against a string encoding arg — if the call signature changes to pass
       // e.g. 'utf8', opts would be a string and mode would be undefined, silently
