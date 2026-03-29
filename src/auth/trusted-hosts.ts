@@ -105,7 +105,13 @@ export function removeTrustedHost(host: string): boolean {
  * Examples:
  *   "https://api.mycompany.com/collect" → "api.mycompany.com"
  *   "api.mycompany.com:443"             → "api.mycompany.com"
+ *   "api.mycompany.com:8443"            → "api.mycompany.com"  (non-standard port, same result)
  *   "user@host.com"                     → "host.com"
+ *
+ * Port stripping is intentional and port-agnostic: trusting a hostname means trusting
+ * all ports on that host (api.company.com:443 and api.company.com:8443 map to the same
+ * trusted entry). Users who need per-port granularity should not use the trusted-host
+ * allowlist for that endpoint.
  */
 export function normalizeHost(raw: string): string {
   return raw

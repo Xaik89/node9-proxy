@@ -30,6 +30,11 @@ describe('normalizeHost', () => {
     expect(normalizeHost('api.mycompany.com:443')).toBe('api.mycompany.com');
   });
 
+  it('strips non-standard port (port-agnostic trust)', () => {
+    // :8443 normalizes to the same host as :443 — trusting a hostname covers all ports.
+    expect(normalizeHost('api.mycompany.com:8443')).toBe('api.mycompany.com');
+  });
+
   it('strips user@ prefix', () => {
     expect(normalizeHost('user@host.com')).toBe('host.com');
   });
