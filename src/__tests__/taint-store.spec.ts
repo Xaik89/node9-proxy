@@ -139,7 +139,13 @@ describe('TaintStore — propagate TTL inheritance', () => {
     // Propagate: destination should expire ~1 s from now, not 1 h from now.
     store.propagate('/tmp/src.txt', '/tmp/dest.txt');
     const dest = store.check('/tmp/dest.txt');
+    const src = store.check('/tmp/src.txt');
     expect(dest).not.toBeNull();
+
+    // Upper-bound assertion: dest must expire close to when src expires,
+    // not at the default 1-hour TTL. Without TTL inheritance, dest.expiresAt
+    // would be ~3600 s ahead of src.expiresAt — this catches that regression.
+    expect(Math.abs(dest!.expiresAt - src!.expiresAt)).toBeLessThan(50);
 
     // After another 1100 ms the remaining TTL should be exhausted.
     vi.advanceTimersByTime(1100);

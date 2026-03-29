@@ -32,7 +32,13 @@ beforeAll(
         const pathname = url.pathname;
 
         if (req.method === 'POST' && pathname === '/taint') {
-          const body = JSON.parse(await readBody(req)) as { path?: unknown; source?: unknown };
+          let body: { path?: unknown; source?: unknown };
+          try {
+            body = JSON.parse(await readBody(req)) as { path?: unknown; source?: unknown };
+          } catch {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify({ error: 'invalid JSON' }));
+          }
           if (typeof body.path !== 'string' || typeof body.source !== 'string') {
             res.writeHead(400, { 'Content-Type': 'application/json' });
             return res.end(JSON.stringify({ error: 'path and source are required strings' }));
@@ -43,7 +49,13 @@ beforeAll(
         }
 
         if (req.method === 'POST' && pathname === '/taint/check') {
-          const body = JSON.parse(await readBody(req)) as { paths?: unknown };
+          let body: { paths?: unknown };
+          try {
+            body = JSON.parse(await readBody(req)) as { paths?: unknown };
+          } catch {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify({ error: 'invalid JSON' }));
+          }
           if (!Array.isArray(body.paths)) {
             res.writeHead(400, { 'Content-Type': 'application/json' });
             return res.end(JSON.stringify({ error: 'paths must be an array' }));
@@ -95,6 +107,13 @@ async function postTaintCheck(paths: string[]): Promise<{ tainted: boolean; reco
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 describe('Taint daemon endpoints', () => {
+  // Fresh store per group — prevents taint records from bleeding into later groups.
+  // The server handler captures `store` by variable reference, so reassignment
+  // here is picked up immediately by the running server.
+  beforeAll(() => {
+    store = new TaintStore();
+  });
+
   it('POST /taint → marks path as tainted', async () => {
     await postTaint('/tmp/exfil.txt', 'DLP:AnthropicApiKey');
     const result = await postTaintCheck(['/tmp/exfil.txt']);
@@ -139,6 +158,10 @@ describe('Taint daemon endpoints', () => {
 });
 
 describe('Exfiltration scenario: write secret → upload blocked', () => {
+  beforeAll(() => {
+    store = new TaintStore();
+  });
+
   it('step 1: DLP-blocked write taints the file', async () => {
     // Simulates what orchestrator.ts does after a DLP block on write_file
     await postTaint('/tmp/exfil-scenario.txt', 'DLP:AWSAccessKeyID');
