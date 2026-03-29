@@ -133,6 +133,22 @@ describe('patchConfig — error handling', () => {
     expect(fs.readFileSync(configPath, 'utf8')).toBe(badContent);
   });
 
+  it('passes mode 0o600 to writeFileSync (spy-based, all platforms)', () => {
+    // Checks that patchConfig explicitly requests 0o600 regardless of umask.
+    // This is a faster, platform-safe complement to the umask-based test below —
+    // it verifies the intent (the argument) without touching process.umask.
+    const writeSpy = vi.spyOn(fs, 'writeFileSync');
+    try {
+      patchConfig(configPath, { type: 'ignoredTool', toolName: 'Bash' });
+      const tmpCall = writeSpy.mock.calls.find(([p]) => String(p).endsWith('.node9-tmp'));
+      expect(tmpCall).toBeDefined();
+      const opts = tmpCall![2] as { mode?: number };
+      expect(opts?.mode).toBe(0o600);
+    } finally {
+      writeSpy.mockRestore();
+    }
+  });
+
   it.skipIf(process.platform === 'win32')('writes file with mode 0o600', () => {
     // Set process umask to 0 so the test is not sensitive to the environment umask.
     // Without this, a umask of 0o077 would mask 0o600 to 0o600 (same), but a umask
