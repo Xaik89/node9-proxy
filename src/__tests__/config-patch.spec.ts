@@ -88,7 +88,43 @@ describe('patchConfig — smartRule', () => {
   });
 });
 
+describe('patchConfig — sequential writes', () => {
+  it('two back-to-back patches both take effect (no write is lost)', () => {
+    patchConfig(configPath, { type: 'ignoredTool', toolName: 'Bash' });
+    patchConfig(configPath, { type: 'ignoredTool', toolName: 'Read' });
+    const data = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    expect(data.policy.ignoredTools).toContain('Bash');
+    expect(data.policy.ignoredTools).toContain('Read');
+  });
+
+  it('second smartRule patch is appended, not overwritten', () => {
+    const rule1 = {
+      name: 'rule-one',
+      tool: 'Read',
+      conditions: [{ field: 'path', op: 'matchesGlob' as const, value: '/src/**' }],
+      verdict: 'allow' as const,
+    };
+    const rule2 = {
+      name: 'rule-two',
+      tool: 'Write',
+      conditions: [{ field: 'path', op: 'matchesGlob' as const, value: '/tmp/**' }],
+      verdict: 'allow' as const,
+    };
+    patchConfig(configPath, { type: 'smartRule', rule: rule1 });
+    patchConfig(configPath, { type: 'smartRule', rule: rule2 });
+    const data = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    expect(data.policy.smartRules).toHaveLength(2);
+    expect(data.policy.smartRules.map((r: { name: string }) => r.name)).toContain('rule-one');
+    expect(data.policy.smartRules.map((r: { name: string }) => r.name)).toContain('rule-two');
+  });
+});
+
 describe('patchConfig — error handling', () => {
+  afterEach(() => {
+    // Belt-and-suspenders: restore any lingering spies even if a test's
+    // own finally block was skipped by an unexpected framework error.
+    vi.restoreAllMocks();
+  });
   it('throws on corrupted config file and does not clobber it', () => {
     const badContent = 'NOT JSON {{{';
     fs.writeFileSync(configPath, badContent);

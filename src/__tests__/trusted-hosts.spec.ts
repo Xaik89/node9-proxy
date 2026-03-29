@@ -220,4 +220,37 @@ describe('addTrustedHost / removeTrustedHost', () => {
     expect(result).toBe(false);
     expect(writeSpy).not.toHaveBeenCalled();
   });
+
+  // ── Wildcard pattern validation ───────────────────────────────────────────
+  // Single-label wildcards (*.com, *.io) would match virtually any destination
+  // and completely bypass exfiltration detection — they must be rejected at add time.
+
+  it('addTrustedHost rejects single-label wildcard *.com', () => {
+    expect(() => addTrustedHost('*.com')).toThrow(/too broad/);
+  });
+
+  it('addTrustedHost rejects single-label wildcard *.io', () => {
+    expect(() => addTrustedHost('*.io')).toThrow(/too broad/);
+  });
+
+  it('addTrustedHost rejects single-label wildcard regardless of capitalisation', () => {
+    // normalizeHost lowercases before the check, so *.COM is treated as *.com
+    expect(() => addTrustedHost('*.COM')).toThrow(/too broad/);
+  });
+
+  it('addTrustedHost accepts a valid two-label wildcard *.mycompany.com', () => {
+    vi.spyOn(fs, 'readFileSync').mockReturnValue(JSON.stringify({ hosts: [] }));
+    const writeSpy = vi.spyOn(fs, 'writeFileSync').mockReturnValue(undefined);
+
+    expect(() => addTrustedHost('*.mycompany.com')).not.toThrow();
+    expect(writeSpy).toHaveBeenCalledOnce();
+  });
+
+  it('addTrustedHost accepts a three-label wildcard *.api.mycompany.com', () => {
+    vi.spyOn(fs, 'readFileSync').mockReturnValue(JSON.stringify({ hosts: [] }));
+    const writeSpy = vi.spyOn(fs, 'writeFileSync').mockReturnValue(undefined);
+
+    expect(() => addTrustedHost('*.api.mycompany.com')).not.toThrow();
+    expect(writeSpy).toHaveBeenCalledOnce();
+  });
 });

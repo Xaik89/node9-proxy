@@ -72,9 +72,19 @@ function writeTrustedHosts(hosts: TrustedHostEntry[]): void {
   _cache = { hosts, expiry: Date.now() + CACHE_TTL_MS, mtime: getFileMtime() };
 }
 
-/** Add a host to the trusted list. Normalizes input before storing. No-op if already present. */
+/** Add a host to the trusted list. Normalizes input before storing. No-op if already present.
+ *  Throws if the pattern is a single-label wildcard (e.g. *.com, *.io) — these are too broad
+ *  and would bypass exfiltration detection for virtually any destination. */
 export function addTrustedHost(host: string): void {
   const normalized = normalizeHost(host);
+  if (normalized.startsWith('*.')) {
+    const base = normalized.slice(2); // everything after "*."
+    if (!base.includes('.')) {
+      throw new Error(
+        `Wildcard pattern '${normalized}' is too broad — the base domain must have at least one dot (e.g. '*.mycompany.com', not '*.com').`
+      );
+    }
+  }
   const hosts = readTrustedHosts();
   if (hosts.some((h) => h.host === normalized)) return;
   hosts.push({ host: normalized, addedAt: Date.now(), addedBy: 'user' });
