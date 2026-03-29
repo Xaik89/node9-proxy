@@ -587,6 +587,39 @@ describe('authorizeHeadless — persistent decisions', () => {
     expect(result.approved).toBe(false);
     expect(result.reason).toMatch(/always deny/i);
   });
+
+  it('smart-rule review is NOT bypassed by a persistent allow — { "Bash": "allow" } must not skip review-git-push', async () => {
+    // Regression: a blanket persistent allow for the Bash tool must never override
+    // a smart rule with verdict "review". The user explicitly configured review-git-push
+    // to require human approval; a stored "always allow" should not silently bypass it.
+    const decisionsPath = path.join('/mock/home', '.node9', 'decisions.json');
+    const globalPath = path.join('/mock/home', '.node9', 'config.json');
+    const globalConfig = {
+      settings: { mode: 'standard', approvalTimeoutMs: 100 },
+      policy: {
+        smartRules: [
+          {
+            name: 'review-git-push',
+            tool: 'bash',
+            conditions: [{ field: 'command', op: 'matches', value: '\\bgit\\b.*\\bpush\\b' }],
+            conditionMode: 'all',
+            verdict: 'review',
+            reason: 'git push sends changes to a shared remote',
+          },
+        ],
+      },
+    };
+    existsSpy.mockImplementation((p) => String(p) === decisionsPath || String(p) === globalPath);
+    readSpy.mockImplementation((p) => {
+      if (String(p) === decisionsPath) return JSON.stringify({ Bash: 'allow' });
+      if (String(p) === globalPath) return JSON.stringify(globalConfig);
+      return '';
+    });
+    // git push matches the review-git-push smart rule → must NOT be auto-approved
+    const result = await authorizeHeadless('Bash', { command: 'git push origin dev' });
+    expect(result.approved).toBe(false); // should go to approver, not be auto-allowed
+    expect(result.checkedBy).not.toBe('persistent');
+  });
 });
 
 // ── isDaemonRunning ───────────────────────────────────────────────────────────

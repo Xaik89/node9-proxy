@@ -359,7 +359,11 @@ async function _authorizeHeadlessCore(
       policyResult.ruleName
     );
 
-    const persistent = getPersistentDecision(toolName);
+    // A persistent allow must never override a smart rule with verdict "review".
+    // Smart rules represent explicit user intent; a blanket "allow this tool"
+    // should not silently bypass a rule the user wrote (e.g. review-git-push).
+    // policyResult.ruleName is set only when a smart rule matched.
+    const persistent = policyResult.ruleName ? null : getPersistentDecision(toolName);
     if (persistent === 'allow') {
       if (approvers.cloud && creds?.apiKey)
         await auditLocalAllow(toolName, args, 'persistent', creds, meta);
