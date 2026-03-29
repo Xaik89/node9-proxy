@@ -119,6 +119,34 @@ describe('TaintStore — propagate', () => {
   });
 });
 
+describe('TaintStore — propagate TTL inheritance', () => {
+  let store: TaintStore;
+
+  beforeEach(() => {
+    store = new TaintStore();
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('destination inherits remaining TTL from source (not default TTL)', () => {
+    // Taint source with 2-second TTL, then advance 1 second (1 s remaining).
+    store.taint('/tmp/src.txt', 'DLP:TTLTest', 2000);
+    vi.advanceTimersByTime(1000);
+
+    // Propagate: destination should expire ~1 s from now, not 1 h from now.
+    store.propagate('/tmp/src.txt', '/tmp/dest.txt');
+    const dest = store.check('/tmp/dest.txt');
+    expect(dest).not.toBeNull();
+
+    // After another 1100 ms the remaining TTL should be exhausted.
+    vi.advanceTimersByTime(1100);
+    expect(store.check('/tmp/dest.txt')).toBeNull();
+  });
+});
+
 describe('TaintStore — list', () => {
   it('returns all active records', () => {
     const store = new TaintStore();

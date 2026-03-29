@@ -48,6 +48,22 @@ describe('canonicalise', () => {
     const buf = Buffer.from('hello');
     expect(canonicalise(buf)).toBe(buf.toString('base64'));
   });
+
+  it('circular object reference — returns [Circular] instead of throwing', () => {
+    const obj: Record<string, unknown> = { a: 1 };
+    obj['self'] = obj; // circular reference
+    expect(() => canonicalise(obj)).not.toThrow();
+    const result = canonicalise(obj) as Record<string, unknown>;
+    expect(result['self']).toBe('[Circular]');
+  });
+
+  it('circular array reference — returns [Circular] instead of throwing', () => {
+    const arr: unknown[] = [1, 2];
+    arr.push(arr); // circular reference
+    expect(() => canonicalise(arr)).not.toThrow();
+    const result = canonicalise(arr) as unknown[];
+    expect(result[2]).toBe('[Circular]');
+  });
 });
 
 describe('hashArgs', () => {
