@@ -39,6 +39,9 @@ function readBody(req: http.IncomingMessage): Promise<string> {
       if (destroyed) return; // 'end' can fire after destroy() on some Node.js versions
       resolve(body);
     });
+    // req.on('error', reject) also handles ERR_STREAM_DESTROYED emitted by
+    // req.destroy() above. reject() being called a second time is a no-op
+    // (Promise resolution is idempotent), so this is safe.
     req.on('error', reject);
   });
 }
@@ -174,6 +177,22 @@ async function postTaintCheck(
   ) {
     throw new Error(`Unexpected taint/check response shape: ${JSON.stringify(json)}`);
   }
+  const obj = json as Record<string, unknown>;
+  // Validate the record field when present — a malformed response would otherwise
+  // propagate silently and cause misleading test failures at the assertion site.
+  if (obj.record !== undefined) {
+    const rec = obj.record as Record<string, unknown>;
+    if (
+      typeof rec !== 'object' ||
+      rec === null ||
+      typeof rec.source !== 'string' ||
+      typeof rec.path !== 'string' ||
+      typeof rec.createdAt !== 'number' ||
+      typeof rec.expiresAt !== 'number'
+    ) {
+      throw new Error(`Unexpected TaintRecord shape: ${JSON.stringify(rec)}`);
+    }
+  }
   return json as { tainted: boolean; record?: TaintRecord };
 }
 
@@ -207,13 +226,16 @@ describe('Taint daemon endpoints', () => {
   });
 
   it('POST /taint/check → first-match-wins: returns correct record when first path is clean', async () => {
-    // Verify both which path was matched AND that the returned record is for that path,
-    // not vacuously tainted:true without a corresponding record.
-    await postTaint('/tmp/second-is-tainted.txt', 'DLP:AWSKey');
-    const result = await postTaintCheck(['/tmp/first-is-clean.txt', '/tmp/second-is-tainted.txt']);
+    // Verify both that the tainted path is found AND that the returned record is
+    // exactly for that path — not vacuously tainted:true with a wrong or missing record.
+    // Uses path.resolve() for the assertion so the test is not sensitive to whether
+    // the store uses realpathSync or path.resolve internally.
+    const taintedPath = path.resolve('/tmp/second-is-tainted.txt');
+    await postTaint(taintedPath, 'DLP:AWSKey');
+    const result = await postTaintCheck(['/tmp/first-is-clean.txt', taintedPath]);
     expect(result.tainted).toBe(true);
     expect(result.record?.source).toBe('DLP:AWSKey');
-    expect(result.record?.path).toContain('second-is-tainted');
+    expect(result.record?.path).toBe(taintedPath);
   });
 
   it('POST /taint/check → returns the taint record with source', async () => {

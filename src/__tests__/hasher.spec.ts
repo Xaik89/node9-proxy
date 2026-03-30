@@ -11,6 +11,13 @@ describe('canonicalise', () => {
     expect(canonicalise(true)).toBe(true);
   });
 
+  it('returns undefined unchanged — hashArgs(undefined) relies on this', () => {
+    // canonicalise(undefined) must not throw and must return undefined so that
+    // hashArgs can coerce it to null via `canonicalise(args) ?? null`.
+    expect(() => canonicalise(undefined)).not.toThrow();
+    expect(canonicalise(undefined)).toBeUndefined();
+  });
+
   it('sorts object keys alphabetically', () => {
     const result = canonicalise({ z: 1, a: 2, m: 3 }) as Record<string, number>;
     expect(Object.keys(result)).toEqual(['a', 'm', 'z']);
@@ -128,6 +135,16 @@ describe('hashArgs', () => {
     const h1 = hashArgs(['a', 'b', 'c']);
     const h2 = hashArgs(['c', 'b', 'a']);
     expect(h1).not.toBe(h2);
+  });
+
+  it('handles deeply nested circular structure — does not throw', () => {
+    // Mirrors the canonicalise deeply-nested test but exercises hashArgs end-to-end:
+    // canonicalise + JSON.stringify + sha256.
+    const inner: Record<string, unknown> = { value: 42 };
+    const outer = { level1: { level2: inner } };
+    inner['back'] = outer;
+    expect(() => hashArgs(outer)).not.toThrow();
+    expect(hashArgs(outer)).toMatch(/^[0-9a-f]{32}$/);
   });
 
   it('string "1" and number 1 produce different hashes — JSON type is preserved', () => {
