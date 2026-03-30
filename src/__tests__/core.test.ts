@@ -709,6 +709,36 @@ describe('authorizeHeadless — persistent decisions', () => {
     // Race engine was NOT entered — no blockedBy value.
     expect(result.blockedBy).toBeUndefined();
   });
+
+  it('persistent allow DOES short-circuit when smart rule is present but command does not match — same tool', async () => {
+    // Variant of the positive-path test above: the call is authorizeHeadless('Bash', ...)
+    // so the tool name matches the rule, but the command ('mkfs /dev/sdb') does not
+    // match the rule's condition (which fires on git-push patterns). Persistent allow
+    // must still win without entering the race engine.
+    //
+    // 'mkfs' is a DANGEROUS_WORDS hit — local-policy skips auto-allow and consults
+    // persistent. The persistent store finds { Bash: 'allow' } and approves immediately
+    // (checkedBy:'persistent'). The smart rule is present for tool:'bash' but its
+    // condition doesn't match 'mkfs /dev/sdb', so it never suppresses persistent.
+    //
+    // This confirms that tool-name matching alone is insufficient to suppress persistent;
+    // the rule's condition must also evaluate to true.
+    const decisionsPath = path.join('/mock/home', '.node9', 'decisions.json');
+    const globalPath = path.join('/mock/home', '.node9', 'config.json');
+    existsSpy.mockImplementation((p) => String(p) === decisionsPath || String(p) === globalPath);
+    readSpy.mockImplementation((p) => {
+      if (String(p) === decisionsPath) return JSON.stringify({ Bash: 'allow' });
+      if (String(p) === globalPath) return JSON.stringify(reviewGitPushConfig);
+      return '';
+    });
+    // 'Bash' matches the rule's tool, but 'mkfs /dev/sdb' does not match the
+    // git-push condition — so the rule is a no-op and persistent allow short-circuits.
+    const result = await authorizeHeadless('Bash', { command: 'mkfs /dev/sdb' });
+    expect(result.approved).toBe(true);
+    const expectedCheckedBy: AuthResult['checkedBy'] = 'persistent';
+    expect(result.checkedBy).toBe(expectedCheckedBy);
+    expect(result.blockedBy).toBeUndefined();
+  });
 });
 
 // ── isDaemonRunning ───────────────────────────────────────────────────────────

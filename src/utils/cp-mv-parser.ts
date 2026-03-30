@@ -78,9 +78,13 @@ export function parseCpMvOp(command: string): CpMvOp | null {
 
 /** Returns true if the token contains shell metacharacters that require expansion. */
 function containsShellMetachar(token: string): boolean {
-  // $VAR / ${VAR} / $(cmd) / `cmd` / {a,b} brace expansion / trailing ; command separator
+  // $VAR / ${VAR} / $(cmd) / `cmd` / {a,b} brace expansion / trailing ; command separator /
+  // * and ? glob patterns.
   // Semicolon matters because `cp /tmp/a /tmp/b;` (no space before ;) produces a
   // single token '/tmp/b;' — the real dest is '/tmp/b' but we'd taint '/tmp/b;'
   // (non-existent) and miss the real path. Bail out; taint stays on the source.
-  return /[$`{;]/.test(token);
+  // * and ? matter because `cp /tmp/*.txt /dest` produces src '/tmp/*.txt' which
+  // doesn't match any real tainted path (the shell expands it before exec). Bail;
+  // taint stays on the source rather than propagating to a non-existent glob literal.
+  return /[$`{;*?]/.test(token);
 }

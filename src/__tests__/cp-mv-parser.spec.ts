@@ -152,6 +152,32 @@ describe('parseCpMvOp — adversarial / shell metacharacter inputs', () => {
     // ';' is in the metacharacter set so we bail; taint stays on the source.
     expect(parseCpMvOp('cp /tmp/a /tmp/b;')).toBeNull();
   });
+
+  it('glob wildcard * in src — bail out (glob literal does not match real tainted path)', () => {
+    // The shell expands /tmp/*.txt before exec; our parser sees the literal string
+    // '/tmp/*.txt' as the src. If we returned that as the src, taint would be
+    // propagated from '/tmp/*.txt' (non-existent) to dest — the real expanded files
+    // stay untainted. Bail; taint stays on source.
+    expect(parseCpMvOp('cp /tmp/*.txt /tmp/dest')).toBeNull();
+  });
+
+  it('glob wildcard ? in src — bail out', () => {
+    expect(parseCpMvOp('cp /tmp/tainted? /tmp/dest')).toBeNull();
+  });
+
+  it('glob wildcard * in dest — bail out', () => {
+    expect(parseCpMvOp('cp /tmp/src /tmp/dest*')).toBeNull();
+  });
+});
+
+describe('parseCpMvOp — uppercase -T is NOT bailed (only lowercase -t is destination-first)', () => {
+  it('cp -T src dest — uppercase T is a different flag (treat-dest-as-normal-file), not destination-first', () => {
+    // GNU cp -T / --no-target-directory treats dest as a normal file, not a dir.
+    // It does NOT reorder src/dest, so positional args are still [src, dest].
+    // We intentionally do NOT bail on -T — the src/dest order is unchanged.
+    const op = parseCpMvOp('cp -T /tmp/a /tmp/b');
+    expect(op).toEqual({ src: '/tmp/a', dest: '/tmp/b', clearSource: false });
+  });
 });
 
 describe('parseCpMvOp — long flags other than --target-directory are skipped', () => {
