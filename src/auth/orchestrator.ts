@@ -166,6 +166,12 @@ export async function authorizeHeadless(
   if (!options?.calledFromDaemon) {
     const actId = randomUUID();
     const actTs = Date.now();
+    // DESIGN NOTE: notifyActivity opens a real Unix socket. The approval timeout
+    // racer (setTimeout) is registered inside _authorizeHeadlessCore, which runs
+    // AFTER this I/O round-trip completes. This means fake timers cannot be used
+    // in tests — vi.advanceTimersByTime fires before the setTimeout is registered.
+    // Future refactor: move timeout racer registration to before this call so the
+    // clock starts before any I/O side effects, and fake timers become usable.
     await notifyActivity({ id: actId, ts: actTs, tool: toolName, args, status: 'pending' });
     const result = await _authorizeHeadlessCore(toolName, args, meta, {
       ...options,

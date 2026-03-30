@@ -6,7 +6,7 @@ import path from 'path';
 // Allow CI to increase the approval timeout without touching test logic.
 // On a loaded runner the 500ms default may be tight; set TEST_APPROVAL_TIMEOUT_MS
 // (e.g. to 2000) in the CI environment to reduce flakiness without code changes.
-const TEST_APPROVAL_TIMEOUT_MS = parseInt(process.env.TEST_APPROVAL_TIMEOUT_MS ?? '500', 10);
+const TEST_APPROVAL_TIMEOUT_MS = parseInt(process.env.TEST_APPROVAL_TIMEOUT_MS ?? '500', 10) || 500;
 
 // 1. Lock down the testing environment globally so it survives between tests.
 process.env.NODE9_TESTING = '1';

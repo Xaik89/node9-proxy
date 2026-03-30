@@ -72,7 +72,11 @@ function _canonicalise(value: unknown, seen: WeakSet<object>): unknown {
  * (birthday bound ~2^64 entries for 50% collision chance).
  *
  * null and undefined both produce the same hash (both canonicalise to JSON null).
- * This is intentional: both represent "no args" and are equivalent for correlation.
+ * CONTRACT: `canonicalise(undefined)` returns undefined; the `?? null` coerces it
+ * to null so both serialise to the JSON string 'null'. This is intentional — both
+ * represent "no args" for audit correlation purposes. Callers that need to distinguish
+ * null args from absent args must do so before calling hashArgs, not after.
+ * Changing this contract would silently break audit log correlation across upgrades.
  */
 export function hashArgs(args: unknown): string {
   const canonical = JSON.stringify(canonicalise(args) ?? null);
