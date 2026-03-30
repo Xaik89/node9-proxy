@@ -691,6 +691,14 @@ describe('authorizeHeadless — persistent decisions', () => {
     // DANGEROUS_WORDS → skip local-policy auto-allow → consult persistent store
     // → persistent allow found → approved:true, checkedBy:'persistent'.
     //
+    // FRAGILITY NOTE: this test depends on 'mkfs' remaining in DANGEROUS_WORDS.
+    // If 'mkfs_disk' is ever removed from DANGEROUS_WORDS, local-policy would
+    // auto-allow it directly (checkedBy:'local-policy') and the persistent store
+    // path would no longer be exercised — the test would still pass but would
+    // silently cover a different code path. If DANGEROUS_WORDS is refactored,
+    // update this test to use a tool name that still triggers the dangerous-word
+    // check, or add an explicit assertion that checkedBy is NOT 'local-policy'.
+    //
     // DANGEROUS_WORDS does NOT force the race engine the way a smart rule does.
     // Only a smart rule with verdict:'review' suppresses the persistent short-circuit.
     //
