@@ -803,6 +803,50 @@ describe('authorizeHeadless — persistent decisions', () => {
     const localPolicyCheckedBy: AuthResult['checkedBy'] = 'local-policy';
     expect(result.checkedBy).toBe(localPolicyCheckedBy);
   });
+
+  it('smart rule verdict:deny blocks even when persistent allow exists — persistent cannot override a block', async () => {
+    // Security invariant: a smart rule with verdict:'deny' must always block,
+    // regardless of what the persistent decisions store says.
+    // The orchestrator exits at the hard-block path before reaching the
+    // persistent check (`policyResult.ruleName ? null : getPersistentDecision`
+    // is never reached when decision === 'block').
+    //
+    // If this test fails (approved: true), the persistent store is overriding
+    // an explicit user-configured block rule — a critical security regression.
+    const decisionsPath = path.join('/mock/home', '.node9', 'decisions.json');
+    const globalPath = path.join('/mock/home', '.node9', 'config.json');
+    existsSpy.mockImplementation((p) => String(p) === decisionsPath || String(p) === globalPath);
+    readSpy.mockImplementation((p) => {
+      if (String(p) === decisionsPath) return JSON.stringify({ bash: 'allow' }); // would approve if reached
+      if (String(p) === globalPath)
+        return JSON.stringify({
+          settings: { mode: 'standard', approvalTimeoutMs: 0 },
+          policy: {
+            smartRules: [
+              {
+                name: 'block-deploy-script',
+                tool: 'bash',
+                conditions: [{ field: 'command', op: 'matches', value: 'restricted_deploy\\.sh' }],
+                conditionMode: 'all',
+                verdict: 'block',
+                reason: 'deploy script is explicitly blocked',
+              },
+            ],
+          },
+        });
+      return '';
+    });
+    const result = await authorizeHeadless('bash', {
+      command: './restricted_deploy.sh --env prod',
+    });
+    expect(result.approved).toBe(false);
+    // Blocked by smart rule hard-block, not by persistent or timeout.
+    const localConfigBlockedBy: AuthResult['blockedBy'] = 'local-config';
+    expect(result.blockedBy).toBe(localConfigBlockedBy);
+    // decisions.json must never have been read — the block fired before
+    // getPersistentDecision was consulted (the self-documenting assertion).
+    expect(readSpy).not.toHaveBeenCalledWith(decisionsPath, expect.anything());
+  });
 });
 
 // ── isDaemonRunning ───────────────────────────────────────────────────────────
