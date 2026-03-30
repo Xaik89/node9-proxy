@@ -8,6 +8,7 @@
 //   - multi-source:       cp a b c /dest/
 //   - destination-first:  cp -t /dest src
 //   - heredoc / process substitution
+//   - shell metacharacters in paths: $VAR, $(cmd), `cmd`, {a,b} — returns null
 
 export interface CpMvOp {
   src: string;
@@ -65,5 +66,18 @@ export function parseCpMvOp(command: string): CpMvOp | null {
   const [src, dest] = args;
   if (!src || !dest) return null;
 
+  // Bail out if either path contains shell metacharacters that would require
+  // shell expansion to resolve. Without expansion we'd propagate taint to a
+  // literal string like '$HOME/.ssh/authorized_keys' that doesn't exist as a
+  // file — producing a silent false negative (the real expanded path stays clean).
+  // Better to bail and leave taint on the source than to propagate to the wrong path.
+  if (containsShellMetachar(src) || containsShellMetachar(dest)) return null;
+
   return { src, dest, clearSource: base === 'mv' };
+}
+
+/** Returns true if the token contains shell metacharacters that require expansion. */
+function containsShellMetachar(token: string): boolean {
+  // $VAR / ${VAR} / $(cmd) / `cmd` / {a,b} brace expansion
+  return /[$`{]/.test(token);
 }

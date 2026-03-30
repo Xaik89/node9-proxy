@@ -84,18 +84,21 @@ describe('parseCpMvOp — adversarial / shell metacharacter inputs', () => {
   // These cases matter for a security tool: the AI may generate commands
   // with shell metacharacters as an evasion attempt or just as normal usage.
 
-  it('shell variable in dest — parser treats it as a literal string, returns op', () => {
-    // The shell would expand $HOME, but our parser never runs the command —
-    // it sees the literal token '$HOME/.ssh/authorized_keys'. We propagate taint
-    // to that literal path (which likely doesn't exist), so no false negative and
-    // no security impact. The alternative (bailing out) would miss real mv/cp ops
-    // where the AI uses env vars. Document the behavior explicitly.
-    const op = parseCpMvOp('cp /tmp/tainted.txt $HOME/.ssh/authorized_keys');
-    expect(op).toEqual({
-      src: '/tmp/tainted.txt',
-      dest: '$HOME/.ssh/authorized_keys',
-      clearSource: false,
-    });
+  it('shell variable in dest — bails out (null) rather than propagating to unexpanded literal', () => {
+    // cp /tmp/tainted.txt $HOME/.ssh/authorized_keys — the shell expands $HOME,
+    // but our parser never runs the command. If we returned an op with the literal
+    // '$HOME/.ssh/authorized_keys' as the dest, taint would be propagated to that
+    // non-existent path and the real expanded path would stay clean — a silent
+    // false negative. Bail out instead; taint stays on the source (safe).
+    expect(parseCpMvOp('cp /tmp/tainted.txt $HOME/.ssh/authorized_keys')).toBeNull();
+  });
+
+  it('$VAR in src — bails out', () => {
+    expect(parseCpMvOp('cp $SECRET_FILE /tmp/dest')).toBeNull();
+  });
+
+  it('backtick command substitution — bails out', () => {
+    expect(parseCpMvOp('cp /tmp/a `echo /tmp/b`')).toBeNull();
   });
 
   it('command substitution in dest — splits into multiple tokens, bail out safely', () => {
@@ -130,6 +133,24 @@ describe('parseCpMvOp — long flags other than --target-directory are skipped',
 
   it('cp --no-clobber src dest', () => {
     const op = parseCpMvOp('cp --no-clobber /tmp/a /tmp/b');
+    expect(op).toEqual({ src: '/tmp/a', dest: '/tmp/b', clearSource: false });
+  });
+
+  it('cp -r --target-directory=/dest src — combined short flag + long target-directory, bail out', () => {
+    // Covers the case where -r and --target-directory= appear together.
+    // Each was tested separately; this confirms the combined form also bails.
+    expect(parseCpMvOp('cp -r --target-directory=/destdir /tmp/src')).toBeNull();
+  });
+});
+
+describe('parseCpMvOp — leading path variations', () => {
+  it('/bin/cp — one path component before cp', () => {
+    const op = parseCpMvOp('/bin/cp /tmp/a /tmp/b');
+    expect(op).toEqual({ src: '/tmp/a', dest: '/tmp/b', clearSource: false });
+  });
+
+  it('/usr/bin/cp — two path components before cp', () => {
+    const op = parseCpMvOp('/usr/bin/cp /tmp/a /tmp/b');
     expect(op).toEqual({ src: '/tmp/a', dest: '/tmp/b', clearSource: false });
   });
 });

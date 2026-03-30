@@ -94,6 +94,12 @@ describe('canonicalise', () => {
     // not the entire top-level object. So { x:1, self:'[Circular]' } and
     // { x:2, self:'[Circular]' } are distinct because x differs — the sentinel
     // alone is not what differentiates them.
+    //
+    // Known limitation: two objects with identical non-circular fields but
+    // different cycle topology (e.g. cycle at depth 1 vs depth 2) produce the
+    // same canonicalised form if the non-circular fields are identical. For
+    // audit-log correlation this is acceptable — structurally equivalent objects
+    // are intentionally treated as the same for hashing purposes.
     const a: Record<string, unknown> = { x: 1 };
     a['self'] = a;
     const b: Record<string, unknown> = { x: 2 };

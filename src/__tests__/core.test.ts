@@ -597,33 +597,38 @@ describe('authorizeHeadless — persistent decisions', () => {
     expect(result.reason).toMatch(/always deny/i);
   });
 
+  // Shared config for the regression test and its positive-path complement.
+  // Both tests use the same smart rule (review-git-push scoped to tool:'bash')
+  // to prove the rule fires when it should and stays silent when it shouldn't.
+  const reviewGitPushConfig = {
+    // Short timeout so the race engine resolves deterministically in test mode.
+    // See wall-clock comment in the regression test below for why fake timers
+    // can't be used here.
+    settings: { mode: 'standard', approvalTimeoutMs: TEST_APPROVAL_TIMEOUT_MS },
+    policy: {
+      smartRules: [
+        {
+          name: 'review-git-push',
+          tool: 'bash',
+          conditions: [{ field: 'command', op: 'matches', value: '\\bgit\\b.*\\bpush\\b' }],
+          conditionMode: 'all',
+          verdict: 'review',
+          reason: 'git push sends changes to a shared remote',
+        },
+      ],
+    },
+  };
+
   it('smart-rule review is NOT bypassed by a persistent allow — { "Bash": "allow" } must not skip review-git-push', async () => {
     // Regression: a blanket persistent allow for the Bash tool must never override
     // a smart rule with verdict "review". The user explicitly configured review-git-push
     // to require human approval; a stored "always allow" should not silently bypass it.
     const decisionsPath = path.join('/mock/home', '.node9', 'decisions.json');
     const globalPath = path.join('/mock/home', '.node9', 'config.json');
-    const globalConfig = {
-      // Short timeout so the race engine resolves deterministically in test mode
-      // (no UI approvers are available). The specific blockedBy value is 'timeout'.
-      settings: { mode: 'standard', approvalTimeoutMs: TEST_APPROVAL_TIMEOUT_MS },
-      policy: {
-        smartRules: [
-          {
-            name: 'review-git-push',
-            tool: 'bash',
-            conditions: [{ field: 'command', op: 'matches', value: '\\bgit\\b.*\\bpush\\b' }],
-            conditionMode: 'all',
-            verdict: 'review',
-            reason: 'git push sends changes to a shared remote',
-          },
-        ],
-      },
-    };
     existsSpy.mockImplementation((p) => String(p) === decisionsPath || String(p) === globalPath);
     readSpy.mockImplementation((p) => {
       if (String(p) === decisionsPath) return JSON.stringify({ Bash: 'allow' });
-      if (String(p) === globalPath) return JSON.stringify(globalConfig);
+      if (String(p) === globalPath) return JSON.stringify(reviewGitPushConfig);
       return '';
     });
     // git push matches the review-git-push smart rule → must NOT be auto-approved
@@ -670,25 +675,10 @@ describe('authorizeHeadless — persistent decisions', () => {
     // race engine.
     const decisionsPath = path.join('/mock/home', '.node9', 'decisions.json');
     const globalPath = path.join('/mock/home', '.node9', 'config.json');
-    const globalConfig = {
-      settings: { mode: 'standard', approvalTimeoutMs: TEST_APPROVAL_TIMEOUT_MS },
-      policy: {
-        smartRules: [
-          {
-            name: 'review-git-push',
-            tool: 'bash',
-            conditions: [{ field: 'command', op: 'matches', value: '\\bgit\\b.*\\bpush\\b' }],
-            conditionMode: 'all',
-            verdict: 'review',
-            reason: 'git push sends changes to a shared remote',
-          },
-        ],
-      },
-    };
     existsSpy.mockImplementation((p) => String(p) === decisionsPath || String(p) === globalPath);
     readSpy.mockImplementation((p) => {
       if (String(p) === decisionsPath) return JSON.stringify({ mkfs_disk: 'allow' });
-      if (String(p) === globalPath) return JSON.stringify(globalConfig);
+      if (String(p) === globalPath) return JSON.stringify(reviewGitPushConfig);
       return '';
     });
     // 'mkfs_disk' contains 'mkfs' (a DANGEROUS_WORDS hit), so it is risky enough
