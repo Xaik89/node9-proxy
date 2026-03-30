@@ -9,11 +9,11 @@ import type { AuthResult } from '../auth/orchestrator.js';
 // (e.g. to 2000) in the CI environment to reduce flakiness without code changes.
 // Use isNaN guard (not || 500) so an intentional 0 is preserved — || would
 // silently override 0 with 500, masking a deliberate "no timeout" configuration.
-const _rawTimeout = parseInt(process.env.TEST_APPROVAL_TIMEOUT_MS ?? '', 10);
+const rawTimeout = parseInt(process.env.TEST_APPROVAL_TIMEOUT_MS ?? '', 10);
 // Minimum 50ms: a zero timeout would fire the race engine before notifyActivity's
 // I/O callback is even queued, producing intermittent false passes unrelated to
 // policy logic. 50ms is enough to let the I/O round-trip complete.
-const TEST_APPROVAL_TIMEOUT_MS = Number.isNaN(_rawTimeout) ? 500 : Math.max(50, _rawTimeout); // floor: 0 fires before notifyActivity I/O callback is queued
+const TEST_APPROVAL_TIMEOUT_MS = Number.isNaN(rawTimeout) ? 500 : Math.max(50, rawTimeout); // floor: 0 fires before notifyActivity I/O callback is queued
 
 // 1. Lock down the testing environment globally so it survives between tests.
 process.env.NODE9_TESTING = '1';
@@ -626,6 +626,12 @@ describe('authorizeHeadless — persistent decisions', () => {
   // and config.json returns reviewGitPushConfig. Extracted to avoid repeating
   // the same mock structure verbatim across three tests — a single change to
   // the mock layout (e.g. adding a third spy target) only needs to land here.
+  //
+  // Closure note: the function closes over the existsSpy/readSpy *variables*
+  // (not their values at definition time). beforeEach reassigns these variables
+  // before each test, so the helper always references the current spy when
+  // called inside a test body. Vitest runs tests sequentially within a file,
+  // so there is no concurrent-reassignment risk.
   function setupReviewGitPushMocks(decisions: Record<string, string>): void {
     const decisionsPath = path.join('/mock/home', '.node9', 'decisions.json');
     const globalPath = path.join('/mock/home', '.node9', 'config.json');
@@ -764,6 +770,11 @@ describe('authorizeHeadless — persistent decisions', () => {
     // This is distinct from verdict:'review' suppression: 'review' falls through
     // to the persistent check and then nulls it out (ruleName is set). 'allow'
     // never reaches that code at all.
+    //
+    // approvalTimeoutMs: 0 is safe here (unlike the regression test which needs
+    // 50ms+): the verdict:'allow' fast-path exits before the race engine is
+    // entered — no setTimeout is ever registered, so a zero timeout cannot fire
+    // prematurely and cause a hang.
     const decisionsPath = path.join('/mock/home', '.node9', 'decisions.json');
     const globalPath = path.join('/mock/home', '.node9', 'config.json');
     existsSpy.mockImplementation((p) => String(p) === decisionsPath || String(p) === globalPath);

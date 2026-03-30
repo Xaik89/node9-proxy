@@ -152,6 +152,15 @@ describe('parseCpMvOp — adversarial / shell metacharacter inputs', () => {
     expect(parseCpMvOp('cp /tmp/a $(cat /tmp/dest)')).toBeNull();
   });
 
+  it('single-token command substitution in dest — $ regex fires directly', () => {
+    // $(pwd)/dest has no internal spaces so it stays as a single token: exactly
+    // 2 positional args. The multi-source bail does NOT fire here — only the
+    // $ metacharacter check catches it. This directly exercises the $ branch of
+    // containsShellMetachar; removing $ from the regex would make this return an
+    // op instead of null (false negative).
+    expect(parseCpMvOp('cp /tmp/a $(pwd)/dest')).toBeNull();
+  });
+
   it('quoted path with space — tokeniser splits on whitespace, bail out safely', () => {
     // Our tokeniser does not parse shell quoting. "/tmp/my file" splits into
     // '"/tmp/my' and 'file"' — 4 positional args total → bail out.
