@@ -67,6 +67,16 @@ export function registerLogCommand(program: Command): void {
                 : null;
             if (command) {
               const op = parseCpMvOp(command);
+              // parseCpMvOp returns null for two distinct reasons:
+              //   1. Not a cp/mv command — no taint propagation needed (correct).
+              //   2. cp/mv that couldn't be safely parsed — e.g. env-prefixed
+              //      commands like `IFS=/ cp src dest`, glob patterns, shell
+              //      metacharacters, or multi-source invocations. In these cases
+              //      null is the safe/conservative choice: taint stays on the
+              //      source rather than propagating to a potentially wrong dest.
+              // Callers that need to distinguish the two cases should extend
+              // parseCpMvOp to return a reason code. For audit purposes here,
+              // both cases are equivalent: no propagation occurs.
               if (op) {
                 await notifyTaintPropagate(op.src, op.dest, op.clearSource);
               }

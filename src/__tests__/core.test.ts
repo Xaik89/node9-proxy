@@ -600,8 +600,8 @@ describe('authorizeHeadless — persistent decisions', () => {
     expect(result.reason).toMatch(/always deny/i);
   });
 
-  // Shared config for the regression test and its positive-path complement.
-  // Both tests use the same smart rule (review-git-push scoped to tool:'bash')
+  // Shared config for the regression test and its positive-path complements.
+  // All three tests use the same smart rule (review-git-push scoped to tool:'bash')
   // to prove the rule fires when it should and stays silent when it shouldn't.
   const reviewGitPushConfig = {
     // Short timeout so the race engine resolves deterministically in test mode.
@@ -622,18 +622,26 @@ describe('authorizeHeadless — persistent decisions', () => {
     },
   };
 
-  it('smart-rule review is NOT bypassed by a persistent allow — { "Bash": "allow" } must not skip review-git-push', async () => {
-    // Regression: a blanket persistent allow for the Bash tool must never override
-    // a smart rule with verdict "review". The user explicitly configured review-git-push
-    // to require human approval; a stored "always allow" should not silently bypass it.
+  // Helper: wire existsSpy and readSpy so decisions.json returns `decisions`
+  // and config.json returns reviewGitPushConfig. Extracted to avoid repeating
+  // the same mock structure verbatim across three tests — a single change to
+  // the mock layout (e.g. adding a third spy target) only needs to land here.
+  function setupReviewGitPushMocks(decisions: Record<string, string>): void {
     const decisionsPath = path.join('/mock/home', '.node9', 'decisions.json');
     const globalPath = path.join('/mock/home', '.node9', 'config.json');
     existsSpy.mockImplementation((p) => String(p) === decisionsPath || String(p) === globalPath);
     readSpy.mockImplementation((p) => {
-      if (String(p) === decisionsPath) return JSON.stringify({ Bash: 'allow' });
+      if (String(p) === decisionsPath) return JSON.stringify(decisions);
       if (String(p) === globalPath) return JSON.stringify(reviewGitPushConfig);
       return '';
     });
+  }
+
+  it('smart-rule review is NOT bypassed by a persistent allow — { "Bash": "allow" } must not skip review-git-push', async () => {
+    // Regression: a blanket persistent allow for the Bash tool must never override
+    // a smart rule with verdict "review". The user explicitly configured review-git-push
+    // to require human approval; a stored "always allow" should not silently bypass it.
+    setupReviewGitPushMocks({ Bash: 'allow' });
     // git push matches the review-git-push smart rule → must NOT be auto-approved
     // by the persistent store. The request must reach the race engine.
     //
@@ -676,14 +684,7 @@ describe('authorizeHeadless — persistent decisions', () => {
     // but the tool is 'mkfs_disk' which is scoped to tool:'bash' — so the rule
     // does not fire. Result must be approved via the persistent store, not the
     // race engine.
-    const decisionsPath = path.join('/mock/home', '.node9', 'decisions.json');
-    const globalPath = path.join('/mock/home', '.node9', 'config.json');
-    existsSpy.mockImplementation((p) => String(p) === decisionsPath || String(p) === globalPath);
-    readSpy.mockImplementation((p) => {
-      if (String(p) === decisionsPath) return JSON.stringify({ mkfs_disk: 'allow' });
-      if (String(p) === globalPath) return JSON.stringify(reviewGitPushConfig);
-      return '';
-    });
+    setupReviewGitPushMocks({ mkfs_disk: 'allow' });
     // 'mkfs_disk' contains 'mkfs' (a DANGEROUS_WORDS hit) — this makes it
     // "risky" in the local policy evaluation, which means it does NOT get
     // auto-allowed by the local-policy path. Instead, the orchestrator checks
@@ -731,14 +732,13 @@ describe('authorizeHeadless — persistent decisions', () => {
     //
     // This confirms that tool-name matching alone is insufficient to suppress persistent;
     // the rule's condition must also evaluate to true.
-    const decisionsPath = path.join('/mock/home', '.node9', 'decisions.json');
-    const globalPath = path.join('/mock/home', '.node9', 'config.json');
-    existsSpy.mockImplementation((p) => String(p) === decisionsPath || String(p) === globalPath);
-    readSpy.mockImplementation((p) => {
-      if (String(p) === decisionsPath) return JSON.stringify({ Bash: 'allow' });
-      if (String(p) === globalPath) return JSON.stringify(reviewGitPushConfig);
-      return '';
-    });
+    //
+    // FRAGILITY NOTE: same DANGEROUS_WORDS dependency as the mkfs_disk test above.
+    // 'mkfs' must remain in DANGEROUS_WORDS for local-policy to skip auto-allow and
+    // reach the persistent store check. If 'mkfs' is removed from DANGEROUS_WORDS,
+    // local-policy would auto-allow this call (checkedBy:'local-policy') and the
+    // persistent path would no longer be exercised.
+    setupReviewGitPushMocks({ Bash: 'allow' });
     // 'Bash' matches the rule's tool, but 'mkfs /dev/sdb' does not match the
     // git-push condition — so the rule is a no-op and persistent allow short-circuits.
     const result = await authorizeHeadless('Bash', { command: 'mkfs /dev/sdb' });
