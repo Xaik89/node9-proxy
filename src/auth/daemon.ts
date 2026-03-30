@@ -164,6 +164,29 @@ export async function notifyTaint(filePath: string, source: string): Promise<voi
   }
 }
 
+/**
+ * Notify the daemon to propagate taint from src to dest (cp/mv semantics).
+ * clearSource=true implements mv: the source taint is removed after propagation.
+ */
+export async function notifyTaintPropagate(
+  src: string,
+  dest: string,
+  clearSource = false
+): Promise<void> {
+  if (!isDaemonRunning()) return;
+  const base = `http://${DAEMON_HOST}:${DAEMON_PORT}`;
+  try {
+    await fetch(`${base}/taint/propagate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ src, dest, clearSource }),
+      signal: AbortSignal.timeout(1000),
+    });
+  } catch {
+    // Propagation is best-effort — daemon unreachable is non-fatal
+  }
+}
+
 // Re-export TaintRecord so callers share one canonical type instead of an inline duplicate.
 export type { TaintRecord } from '../daemon/taint-store.js';
 import type { TaintRecord } from '../daemon/taint-store.js';

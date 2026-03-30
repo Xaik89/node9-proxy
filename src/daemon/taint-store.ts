@@ -82,6 +82,11 @@ export class TaintStore {
     return [...this.records.values()];
   }
 
+  /** Remove all taint records atomically. Used by tests to reset state between runs. */
+  clear(): void {
+    this.records.clear();
+  }
+
   /** Resolve to absolute path, falling back to path.resolve if file doesn't exist yet. */
   private _resolve(filePath: string): string {
     try {

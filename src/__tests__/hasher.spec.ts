@@ -128,7 +128,7 @@ describe('hashArgs', () => {
   });
 });
 
-describe('hashArgs contract: used by appendLocalAudit when auditHashArgs is enabled', () => {
+describe('hashArgs — audit log safety', () => {
   it('hash is a 32-char hex string that does not contain the original secret content', async () => {
     // When auditHashArgsEnabled=true, appendLocalAudit stores argsHash (not args).
     // Verify the hash contract: 32 hex chars, no plaintext leakage.

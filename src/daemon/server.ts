@@ -800,8 +800,13 @@ export function startDaemon(): void {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           return res.end(JSON.stringify({ error: 'paths must be an array' }));
         }
-        for (const p of body.paths) {
-          if (typeof p !== 'string') continue;
+        // Reject upfront if any element is not a string — silently skipping
+        // non-strings would allow a mixed array to sneak through the check.
+        if ((body.paths as unknown[]).some((p) => typeof p !== 'string')) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ error: 'all paths must be strings' }));
+        }
+        for (const p of body.paths as string[]) {
           const record = taintStore.check(p);
           if (record) {
             res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -810,6 +815,30 @@ export function startDaemon(): void {
         }
         res.writeHead(200, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ tainted: false }));
+      } catch {
+        res.writeHead(400).end();
+        return;
+      }
+    }
+
+    // ── Taint propagate — copy/move taint from source to destination path ────
+    // Called by the hook process after a file copy (cp) or move (mv) involving
+    // a tainted source. clearSource=true implements mv semantics.
+    if (req.method === 'POST' && pathname === '/taint/propagate') {
+      try {
+        const body = JSON.parse(await readBody(req)) as {
+          src?: unknown;
+          dest?: unknown;
+          clearSource?: unknown;
+        };
+        if (typeof body.src !== 'string' || typeof body.dest !== 'string') {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ error: 'src and dest are required strings' }));
+        }
+        const clearSource = body.clearSource === true;
+        taintStore.propagate(body.src, body.dest, clearSource);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ ok: true }));
       } catch {
         res.writeHead(400).end();
         return;

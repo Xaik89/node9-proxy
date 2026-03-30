@@ -11,7 +11,9 @@ import { checkTaint } from '../auth/daemon.js';
 
 // ── Minimal stub daemon that only serves /taint and /taint/check ──────────────
 
-const MAX_BODY_BYTES = 64 * 1024; // 64 KB — test stub guard against runaway bodies
+// 64 KB — matches the production daemon's body limit for the /check endpoint
+// (server.ts line ~194: `if (body.length > 65_536) return res.writeHead(413).end()`).
+const MAX_BODY_BYTES = 65_536;
 
 function readBody(req: http.IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -72,8 +74,14 @@ beforeAll(
             res.writeHead(400, { 'Content-Type': 'application/json' });
             return res.end(JSON.stringify({ error: 'paths must be an array' }));
           }
-          for (const p of body.paths) {
-            if (typeof p !== 'string') continue;
+          // Reject upfront if any element is non-string — silently skipping would
+          // allow an attacker-controlled array like [null, "/tainted/file"] to
+          // bypass the type guard and still receive a taint response.
+          if ((body.paths as unknown[]).some((p) => typeof p !== 'string')) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify({ error: 'all paths must be strings' }));
+          }
+          for (const p of body.paths as string[]) {
             // store.check() normalises via path.resolve()/realpathSync so traversal
             // sequences (e.g. ../../etc/passwd) are canonicalised before the lookup.
             const record = store.check(p);
@@ -84,6 +92,27 @@ beforeAll(
           }
           res.writeHead(200, { 'Content-Type': 'application/json' });
           return res.end(JSON.stringify({ tainted: false }));
+        }
+
+        if (req.method === 'POST' && pathname === '/taint/propagate') {
+          let body: { src?: unknown; dest?: unknown; clearSource?: unknown };
+          try {
+            body = JSON.parse(await readBody(req)) as {
+              src?: unknown;
+              dest?: unknown;
+              clearSource?: unknown;
+            };
+          } catch {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify({ error: 'invalid JSON' }));
+          }
+          if (typeof body.src !== 'string' || typeof body.dest !== 'string') {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify({ error: 'src and dest are required strings' }));
+          }
+          store.propagate(body.src, body.dest, body.clearSource === true);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ ok: true }));
         }
 
         res.writeHead(404).end();
@@ -99,12 +128,11 @@ beforeAll(
 afterAll(() => new Promise<void>((resolve) => server.close(() => resolve())));
 
 // Reset the store before every test — each test is fully isolated.
-// The server handler reads `store` as a free variable on each request; it is
-// NOT captured once at server-creation time. Reassigning the module-level
-// `let` binding here is sufficient — the next inbound request will see the
-// new TaintStore instance. Tests use distinct path prefixes for clarity.
+// clear() is atomic (one Map.clear() call) and avoids rebinding the module-level
+// `store` variable. The handler always reads `store` at request time so the
+// cleared instance is immediately visible to the next inbound request.
 beforeEach(() => {
-  store = new TaintStore();
+  store.clear();
 });
 
 // ── Helper: call the stub daemon directly ─────────────────────────────────────
@@ -135,6 +163,19 @@ async function postTaintCheck(
     throw new Error(`Unexpected taint/check response shape: ${JSON.stringify(json)}`);
   }
   return json as { tainted: boolean; record?: TaintRecord };
+}
+
+async function postTaintPropagate(
+  src: string,
+  dest: string,
+  clearSource?: boolean
+): Promise<void> {
+  const res = await fetch(`http://127.0.0.1:${port}/taint/propagate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ src, dest, ...(clearSource !== undefined && { clearSource }) }),
+  });
+  expect(res.ok).toBe(true);
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -200,6 +241,38 @@ describe('Taint daemon endpoints', () => {
     });
     expect(res.status).toBe(400);
   });
+
+  it('POST /taint/check → mixed-type paths array (null element) returns 400', async () => {
+    const res = await fetch(`http://127.0.0.1:${port}/taint/check`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ paths: [null, '/some/path'] }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('GET /taint → 404', async () => {
+    const res = await fetch(`http://127.0.0.1:${port}/taint`);
+    expect(res.status).toBe(404);
+  });
+
+  it('DELETE /taint → 404', async () => {
+    const res = await fetch(`http://127.0.0.1:${port}/taint`, { method: 'DELETE' });
+    expect(res.status).toBe(404);
+  });
+
+  it('GET /taint/check → 404', async () => {
+    const res = await fetch(`http://127.0.0.1:${port}/taint/check`);
+    expect(res.status).toBe(404);
+  });
+
+  it('POST /taint/check → traversal path is canonicalised — ../subdir resolves to real path', async () => {
+    // Taint the canonical path; look it up via a traversal form.
+    // /tmp/subdir/../traversal-target.txt → path.resolve → /tmp/traversal-target.txt
+    await postTaint('/tmp/traversal-target.txt', 'DLP:Test');
+    const result = await postTaintCheck(['/tmp/subdir/../traversal-target.txt']);
+    expect(result.tainted).toBe(true);
+  });
 });
 
 describe('Exfiltration scenario: write secret → upload blocked', () => {
@@ -227,11 +300,58 @@ describe('Exfiltration scenario: write secret → upload blocked', () => {
   });
 });
 
+describe('Taint propagation: cp and mv semantics via HTTP', () => {
+  it('cp semantics: source taint persists after propagation', async () => {
+    await postTaint('/tmp/prop-src.txt', 'DLP:PropTest');
+    await postTaintPropagate('/tmp/prop-src.txt', '/tmp/prop-dest.txt');
+    const src = await postTaintCheck(['/tmp/prop-src.txt']);
+    const dest = await postTaintCheck(['/tmp/prop-dest.txt']);
+    expect(src.tainted).toBe(true);
+    expect(dest.tainted).toBe(true);
+    expect(dest.record?.source).toBe('propagated:DLP:PropTest');
+  });
+
+  it('mv semantics: source taint cleared after propagation with clearSource:true', async () => {
+    await postTaint('/tmp/mv-src.txt', 'DLP:MvTest');
+    await postTaintPropagate('/tmp/mv-src.txt', '/tmp/mv-dest.txt', true);
+    const src = await postTaintCheck(['/tmp/mv-src.txt']);
+    const dest = await postTaintCheck(['/tmp/mv-dest.txt']);
+    expect(src.tainted).toBe(false);
+    expect(dest.tainted).toBe(true);
+  });
+
+  it('propagation from an untainted source does nothing', async () => {
+    await postTaintPropagate('/tmp/clean-src.txt', '/tmp/would-be-tainted.txt');
+    const dest = await postTaintCheck(['/tmp/would-be-tainted.txt']);
+    expect(dest.tainted).toBe(false);
+  });
+
+  it('chained propagation does not accumulate "propagated:" prefixes', async () => {
+    await postTaint('/tmp/chain-a.txt', 'DLP:ChainTest');
+    await postTaintPropagate('/tmp/chain-a.txt', '/tmp/chain-b.txt');
+    await postTaintPropagate('/tmp/chain-b.txt', '/tmp/chain-c.txt');
+    const result = await postTaintCheck(['/tmp/chain-c.txt']);
+    expect(result.tainted).toBe(true);
+    expect(result.record?.source).toBe('propagated:DLP:ChainTest');
+  });
+
+  it('POST /taint/propagate → missing dest returns 400', async () => {
+    const res = await fetch(`http://127.0.0.1:${port}/taint/propagate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ src: '/tmp/src.txt' }), // dest missing
+    });
+    expect(res.status).toBe(400);
+  });
+});
+
 // Fail-open is the intentional security trade-off here: if the taint daemon is
 // unavailable we allow the tool call to proceed rather than blocking all work.
 // The alternative (fail-closed) would mean a crashed daemon halts Claude entirely.
 // Taint tracking is defence-in-depth; DLP scanning is the primary gate and runs
 // independently of the daemon, so a temporary daemon outage does not disable DLP.
+// Errors ARE logged to hook-debug.log via appendToLog so operators can diagnose
+// daemon instability — fail-open is a conscious choice, not a silent failure.
 describe('checkTaint fail-open: tests the real checkTaint() function', () => {
   it('checkTaint returns daemonUnavailable:true when fetch throws — does not propagate the error', async () => {
     // Mock global fetch to throw so we test the actual catch path in checkTaint().
