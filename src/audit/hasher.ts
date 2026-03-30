@@ -37,6 +37,13 @@ function _canonicalise(value: unknown, seen: WeakSet<object>): unknown {
   // Date/RegExp/Buffer are leaf nodes (no children, can't form cycles).
   if (value instanceof Date) return value.toISOString();
   if (value instanceof RegExp) return value.toString();
+  // SECURITY: Buffer is coerced to its base64 string representation.
+  // Known design trade-off: this creates a hash collision between
+  // Buffer.from(x) and the string x.toString('base64') — both produce
+  // the same hash. Callers that need type fidelity (e.g. hash-based denylists
+  // keyed on Buffer payloads) must not rely on hashArgs alone; they should
+  // compare the raw args as well. The audit log uses hashes for correlation
+  // only, not for access-control decisions, so this collision is acceptable.
   if (Buffer.isBuffer(value)) return value.toString('base64');
   if (seen.has(value)) return '[Circular]';
   seen.add(value);

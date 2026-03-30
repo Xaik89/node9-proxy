@@ -422,9 +422,18 @@ describe('Taint propagation: cp and mv semantics via HTTP', () => {
 // daemon instability — fail-open is a conscious choice, not a silent failure.
 describe('checkTaint fail-open: tests the real checkTaint() function', () => {
   it('checkTaint returns daemonUnavailable:true when fetch throws — does not propagate the error', async () => {
-    // Mock global fetch to throw so we test the actual catch path in checkTaint().
-    // isDaemonRunning() will return true in this environment (real daemon is up),
-    // so the fetch IS attempted — this validates the real catch/fail-open logic.
+    // Isolation note: global fetch is replaced with a mock before checkTaint()
+    // is called, so this test never contacts the real daemon (port 7391) or the
+    // stub server above. No misconfiguration can route the call elsewhere.
+    //
+    // Two code paths both satisfy the assertions:
+    //   a) daemon is running  → checkTaint calls (mocked) fetch, which throws,
+    //      catch block returns { tainted: false, daemonUnavailable: true }
+    //   b) daemon not running → isDaemonRunning() returns false, checkTaint
+    //      short-circuits with { tainted: false, daemonUnavailable: true }
+    //      before fetch is ever called
+    // Both are valid fail-open outcomes. Path (a) specifically exercises the
+    // catch block; path (b) exercises the isDaemonRunning guard.
     vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('ECONNREFUSED')));
     try {
       const result = await checkTaint(['/tmp/secret.txt']);
