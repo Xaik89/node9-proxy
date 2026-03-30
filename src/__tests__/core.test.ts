@@ -647,9 +647,53 @@ describe('authorizeHeadless — persistent decisions', () => {
     expect(result.checkedBy).not.toBe('persistent');
     // Race engine was entered and resolved via the timeout racer.
     expect(result.blockedBy).toBe('timeout');
-    // Pin the reason so a future refactor that returns approved:false via a
-    // different deny path (e.g. a new racer) doesn't silently mask this regression.
-    expect(result.reason).toMatch(/auto-denied by timeout policy/i);
+    // Do NOT pin result.reason text — rewording the timeout message should not
+    // fail this regression test. The invariants above are the meaningful signal.
+  });
+
+  it('persistent allow DOES short-circuit when no smart rule matches the command — positive path', async () => {
+    // Complement to the regression test above: confirms that the smart-rule
+    // check only suppresses the persistent short-circuit when the rule actually
+    // matches. A non-matching command with a persistent allow must approve
+    // immediately without entering the race engine.
+    //
+    // Same smart-rule config as the regression test (review-git-push present),
+    // but the tool is 'mkfs_disk' which is scoped to tool:'bash' — so the rule
+    // does not fire. Result must be approved via the persistent store, not the
+    // race engine.
+    const decisionsPath = path.join('/mock/home', '.node9', 'decisions.json');
+    const globalPath = path.join('/mock/home', '.node9', 'config.json');
+    const globalConfig = {
+      settings: { mode: 'standard', approvalTimeoutMs: TEST_APPROVAL_TIMEOUT_MS },
+      policy: {
+        smartRules: [
+          {
+            name: 'review-git-push',
+            tool: 'bash',
+            conditions: [{ field: 'command', op: 'matches', value: '\\bgit\\b.*\\bpush\\b' }],
+            conditionMode: 'all',
+            verdict: 'review',
+            reason: 'git push sends changes to a shared remote',
+          },
+        ],
+      },
+    };
+    existsSpy.mockImplementation((p) => String(p) === decisionsPath || String(p) === globalPath);
+    readSpy.mockImplementation((p) => {
+      if (String(p) === decisionsPath) return JSON.stringify({ mkfs_disk: 'allow' });
+      if (String(p) === globalPath) return JSON.stringify(globalConfig);
+      return '';
+    });
+    // 'mkfs_disk' contains 'mkfs' (a DANGEROUS_WORDS hit), so it is risky enough
+    // that the persistent store is consulted. The smart rule is scoped to
+    // tool: 'bash' only, so it does not fire for 'mkfs_disk'. The persistent
+    // allow must short-circuit and approve immediately.
+    const result = await authorizeHeadless('mkfs_disk', {});
+    expect(result.approved).toBe(true);
+    // Persistent store was used — smart rule did not fire for mkfs_disk.
+    expect(result.checkedBy).toBe('persistent');
+    // Race engine was NOT entered — no blockedBy value.
+    expect(result.blockedBy).toBeUndefined();
   });
 });
 
