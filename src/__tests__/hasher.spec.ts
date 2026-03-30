@@ -168,11 +168,16 @@ describe('hashArgs', () => {
   });
 
   it('Buffer coercion to base64 is a known collision with equivalent base64 strings', () => {
+    // TODO: known limitation — an agent that controls whether args contain a Buffer
+    // vs. its base64 string can produce identical hashes for two distinct calls.
+    // For audit correlation this is acceptable (hashes are not used for access
+    // control), but callers building denylist logic on top of hashArgs must be
+    // aware. Tracked as a known limitation in hasher.ts (SECURITY comment).
+    //
     // canonicalise converts Buffer → base64 string (the Buffer.isBuffer branch in
     // hasher.ts). This means hashArgs({ data: buf }) === hashArgs({ data: b64 })
-    // when b64 === buf.toString('base64'). This is an intentional design trade-off:
-    // stable, cross-platform hashing takes priority over type fidelity. The audit
-    // log records the tool name + args hash for correlation, not reconstruction.
+    // when b64 === buf.toString('base64'). Stable, cross-platform hashing takes
+    // priority over type fidelity for the audit-log use case.
     const buf = Buffer.from('hello');
     expect(hashArgs({ data: buf })).toBe(hashArgs({ data: buf.toString('base64') }));
   });

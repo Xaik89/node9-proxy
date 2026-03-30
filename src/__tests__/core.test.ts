@@ -2,11 +2,15 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import type { AuthResult } from '../auth/orchestrator.js';
 
 // Allow CI to increase the approval timeout without touching test logic.
 // On a loaded runner the 500ms default may be tight; set TEST_APPROVAL_TIMEOUT_MS
 // (e.g. to 2000) in the CI environment to reduce flakiness without code changes.
-const TEST_APPROVAL_TIMEOUT_MS = parseInt(process.env.TEST_APPROVAL_TIMEOUT_MS ?? '500', 10) || 500;
+// Use isNaN guard (not || 500) so an intentional 0 is preserved — || would
+// silently override 0 with 500, masking a deliberate "no timeout" configuration.
+const _rawTimeout = parseInt(process.env.TEST_APPROVAL_TIMEOUT_MS ?? '', 10);
+const TEST_APPROVAL_TIMEOUT_MS = Number.isNaN(_rawTimeout) ? 500 : _rawTimeout;
 
 // 1. Lock down the testing environment globally so it survives between tests.
 process.env.NODE9_TESTING = '1';
@@ -644,9 +648,12 @@ describe('authorizeHeadless — persistent decisions', () => {
     const result = await authorizeHeadless('Bash', { command: 'git push origin dev' });
     expect(result.approved).toBe(false);
     // Key invariant: the persistent store was NOT used to decide.
-    expect(result.checkedBy).not.toBe('persistent');
+    // Typed so TypeScript catches it if 'persistent' is removed from AuthResult['checkedBy'].
+    const persistentCheckedBy: AuthResult['checkedBy'] = 'persistent';
+    expect(result.checkedBy).not.toBe(persistentCheckedBy);
     // Race engine was entered and resolved via the timeout racer.
-    expect(result.blockedBy).toBe('timeout');
+    const timeoutBlockedBy: AuthResult['blockedBy'] = 'timeout';
+    expect(result.blockedBy).toBe(timeoutBlockedBy);
     // Do NOT pin result.reason text — rewording the timeout message should not
     // fail this regression test. The invariants above are the meaningful signal.
   });
@@ -691,7 +698,8 @@ describe('authorizeHeadless — persistent decisions', () => {
     const result = await authorizeHeadless('mkfs_disk', {});
     expect(result.approved).toBe(true);
     // Persistent store was used — smart rule did not fire for mkfs_disk.
-    expect(result.checkedBy).toBe('persistent');
+    const expectedCheckedBy: AuthResult['checkedBy'] = 'persistent';
+    expect(result.checkedBy).toBe(expectedCheckedBy);
     // Race engine was NOT entered — no blockedBy value.
     expect(result.blockedBy).toBeUndefined();
   });
