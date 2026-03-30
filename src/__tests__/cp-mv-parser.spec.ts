@@ -97,6 +97,13 @@ describe('parseCpMvOp — adversarial / shell metacharacter inputs', () => {
     expect(parseCpMvOp('cp $SECRET_FILE /tmp/dest')).toBeNull();
   });
 
+  it('${VAR} brace-style variable in dest — bails out', () => {
+    // ${HOME} contains '{' which is in the metacharacter set — same bail path as $HOME.
+    // Explicitly tested because the regex /[$`{]/ catches '$' and '{' independently;
+    // this confirms ${...} syntax is covered via the '{' branch.
+    expect(parseCpMvOp('cp /tmp/tainted.txt ${HOME}/.ssh/authorized_keys')).toBeNull();
+  });
+
   it('backtick command substitution — bails out', () => {
     expect(parseCpMvOp('cp /tmp/a `echo /tmp/b`')).toBeNull();
   });
@@ -136,10 +143,17 @@ describe('parseCpMvOp — long flags other than --target-directory are skipped',
     expect(op).toEqual({ src: '/tmp/a', dest: '/tmp/b', clearSource: false });
   });
 
-  it('cp -r --target-directory=/dest src — combined short flag + long target-directory, bail out', () => {
+  it('cp -r --target-directory=/dest src — combined short flag + long target-directory=value, bail out', () => {
     // Covers the case where -r and --target-directory= appear together.
     // Each was tested separately; this confirms the combined form also bails.
     expect(parseCpMvOp('cp -r --target-directory=/destdir /tmp/src')).toBeNull();
+  });
+
+  it('cp --target-directory /dest src — space-separated (no =), bail out', () => {
+    // GNU cp accepts both --target-directory=/dest and --target-directory /dest.
+    // The parser checks for the exact token '--target-directory' (line: tok === '--target-directory')
+    // so the space-separated form is handled identically to the = form.
+    expect(parseCpMvOp('cp --target-directory /destdir /tmp/src')).toBeNull();
   });
 });
 

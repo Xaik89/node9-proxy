@@ -681,10 +681,17 @@ describe('authorizeHeadless — persistent decisions', () => {
       if (String(p) === globalPath) return JSON.stringify(reviewGitPushConfig);
       return '';
     });
-    // 'mkfs_disk' contains 'mkfs' (a DANGEROUS_WORDS hit), so it is risky enough
-    // that the persistent store is consulted. The smart rule is scoped to
-    // tool: 'bash' only, so it does not fire for 'mkfs_disk'. The persistent
-    // allow must short-circuit and approve immediately.
+    // 'mkfs_disk' contains 'mkfs' (a DANGEROUS_WORDS hit) — this makes it
+    // "risky" in the local policy evaluation, which means it does NOT get
+    // auto-allowed by the local-policy path. Instead, the orchestrator checks
+    // the persistent decisions store. That is the path this test exercises:
+    // DANGEROUS_WORDS → skip local-policy auto-allow → consult persistent store
+    // → persistent allow found → approved:true, checkedBy:'persistent'.
+    //
+    // DANGEROUS_WORDS does NOT force the race engine the way a smart rule does.
+    // Only a smart rule with verdict:'review' suppresses the persistent short-circuit.
+    // The review-git-push smart rule is scoped to tool:'bash' and does not fire
+    // for 'mkfs_disk', so persistent allow wins.
     const result = await authorizeHeadless('mkfs_disk', {});
     expect(result.approved).toBe(true);
     // Persistent store was used — smart rule did not fire for mkfs_disk.
