@@ -272,15 +272,14 @@ function buildRecoveryCardLines(req: ApprovalRequest): string[] {
   const command =
     typeof argsObj?.command === 'string'
       ? argsObj.command
-      : JSON.stringify(req.args ?? {}).replace(/\s+/g, ' ').slice(0, 60);
-  const ruleName =
-    req.riskMetadata?.ruleName?.replace(/^Smart Rule:\s*/i, '') ?? 'policy rule';
+      : JSON.stringify(req.args ?? {})
+          .replace(/\s+/g, ' ')
+          .slice(0, 60);
+  const ruleName = req.riskMetadata?.ruleName?.replace(/^Smart Rule:\s*/i, '') ?? 'policy rule';
   const recoveryCommand = req.recoveryCommand!;
 
   const interactiveLines = req.viewOnly
-    ? [
-        `  ${GRAY}→ Awaiting decision from interactive terminal...${RESET}`,
-      ]
+    ? [`  ${GRAY}→ Awaiting decision from interactive terminal...${RESET}`]
     : [
         `  ${BOLD}${GREEN}[1]${RESET} Allow anyway  ${GRAY}(override policy)${RESET}`,
         `  ${BOLD}${YELLOW}[2]${RESET} Redirect AI: "Run '${recoveryCommand}' first, then retry"`,
@@ -466,7 +465,9 @@ export async function startTail(options: TailOptions = {}): Promise<void> {
 
       // Map action to decision + options for the daemon
       let httpDecision: 'allow' | 'deny' | 'trust';
-      let httpOpts: { persist?: boolean; trustDuration?: string; reason?: string; source?: string } | undefined;
+      let httpOpts:
+        | { persist?: boolean; trustDuration?: string; reason?: string; source?: string }
+        | undefined;
       if (action === 'always-allow') {
         httpDecision = 'allow';
         httpOpts = { persist: true };

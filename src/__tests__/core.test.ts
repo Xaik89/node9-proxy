@@ -2057,13 +2057,15 @@ describe('stateful smart rules — dependsOnState', () => {
     mockProjectConfig({
       settings: { mode: 'standard', approvalTimeoutMs: 100 },
       policy: {
-        smartRules: [{
-          name: 'block-deploy',
-          tool: 'Bash',
-          conditions: [{ field: 'command', op: 'matches', value: './deploy.sh' }],
-          verdict: 'block',
-          reason: 'No stateful check',
-        }],
+        smartRules: [
+          {
+            name: 'block-deploy',
+            tool: 'Bash',
+            conditions: [{ field: 'command', op: 'matches', value: './deploy.sh' }],
+            verdict: 'block',
+            reason: 'No stateful check',
+          },
+        ],
       },
     });
     const result = await authorizeHeadless('Bash', { command: DEPLOY_CMD });
@@ -2122,12 +2124,14 @@ describe('stateful smart rules — dependsOnState', () => {
     mockProjectConfig({
       settings: { mode: 'standard' },
       policy: {
-        smartRules: [{
-          name: 'plain-block',
-          tool: 'Bash',
-          conditions: [{ field: 'command', op: 'matches', value: 'rm -rf' }],
-          verdict: 'block',
-        }],
+        smartRules: [
+          {
+            name: 'plain-block',
+            tool: 'Bash',
+            conditions: [{ field: 'command', op: 'matches', value: 'rm -rf' }],
+            verdict: 'block',
+          },
+        ],
       },
     });
     const policyResult = await evaluatePolicy('Bash', { command: 'rm -rf /' });
@@ -2142,10 +2146,12 @@ describe('stateful smart rules — dependsOnState', () => {
     mockProjectConfig({
       settings: { mode: 'standard', approvalTimeoutMs: 500 },
       policy: {
-        smartRules: [{
-          ...STATEFUL_RULE,
-          recoveryCommand: 'npm test',
-        }],
+        smartRules: [
+          {
+            ...STATEFUL_RULE,
+            recoveryCommand: 'npm test',
+          },
+        ],
       },
     });
     const result = await authorizeHeadless('Bash', { command: DEPLOY_CMD });
@@ -2157,14 +2163,16 @@ describe('stateful smart rules — dependsOnState', () => {
     mockProjectConfig({
       settings: { mode: 'standard', approvalTimeoutMs: 100 },
       policy: {
-        smartRules: [{
-          name: 'block-deploy',
-          tool: 'Bash',
-          conditions: [{ field: 'command', op: 'matches', value: './deploy.sh' }],
-          verdict: 'block',
-          reason: 'Must run tests first',
-          recoveryCommand: 'npm test',
-        }],
+        smartRules: [
+          {
+            name: 'block-deploy',
+            tool: 'Bash',
+            conditions: [{ field: 'command', op: 'matches', value: './deploy.sh' }],
+            verdict: 'block',
+            reason: 'Must run tests first',
+            recoveryCommand: 'npm test',
+          },
+        ],
       },
     });
     const result = await authorizeHeadless('Bash', { command: DEPLOY_CMD });
@@ -2176,12 +2184,14 @@ describe('stateful smart rules — dependsOnState', () => {
     mockProjectConfig({
       settings: { mode: 'standard', approvalTimeoutMs: 100 },
       policy: {
-        smartRules: [{
-          name: 'block-deploy',
-          tool: 'Bash',
-          conditions: [{ field: 'command', op: 'matches', value: './deploy.sh' }],
-          verdict: 'block',
-        }],
+        smartRules: [
+          {
+            name: 'block-deploy',
+            tool: 'Bash',
+            conditions: [{ field: 'command', op: 'matches', value: './deploy.sh' }],
+            verdict: 'block',
+          },
+        ],
       },
     });
     const result = await authorizeHeadless('Bash', { command: DEPLOY_CMD });
@@ -2193,10 +2203,12 @@ describe('stateful smart rules — dependsOnState', () => {
     mockProjectConfig({
       settings: { mode: 'standard' },
       policy: {
-        smartRules: [{
-          ...STATEFUL_RULE,
-          recoveryCommand: 'npm test',
-        }],
+        smartRules: [
+          {
+            ...STATEFUL_RULE,
+            recoveryCommand: 'npm test',
+          },
+        ],
       },
     });
     const policyResult = await evaluatePolicy('Bash', { command: DEPLOY_CMD });
@@ -2214,10 +2226,12 @@ describe('stateful smart rules — dependsOnState', () => {
     mockProjectConfig({
       settings: { mode: 'standard', approvalTimeoutMs: 500 },
       policy: {
-        smartRules: [{
-          ...STATEFUL_RULE,
-          recoveryCommand: 'npm test',
-        }],
+        smartRules: [
+          {
+            ...STATEFUL_RULE,
+            recoveryCommand: 'npm test',
+          },
+        ],
       },
     });
     const result = await authorizeHeadless('Bash', { command: DEPLOY_CMD });
@@ -2244,14 +2258,16 @@ describe('stateful smart rules — dependsOnState', () => {
     mockProjectConfig({
       settings: { mode: 'standard', approvalTimeoutMs: 100 },
       policy: {
-        smartRules: [{
-          name: 'block-deploy',
-          tool: 'Bash',
-          conditions: [{ field: 'command', op: 'matches', value: './deploy.sh' }],
-          verdict: 'block',
-          reason: 'Must run tests first',
-          recoveryCommand: 'npm test',
-        }],
+        smartRules: [
+          {
+            name: 'block-deploy',
+            tool: 'Bash',
+            conditions: [{ field: 'command', op: 'matches', value: './deploy.sh' }],
+            verdict: 'block',
+            reason: 'Must run tests first',
+            recoveryCommand: 'npm test',
+          },
+        ],
       },
     });
     const result = await authorizeHeadless('Bash', { command: DEPLOY_CMD });

@@ -42,10 +42,9 @@ export async function checkStatePredicates(
   if (predicates.length === 0) return {};
   try {
     const qs = predicates.map(encodeURIComponent).join(',');
-    const res = await fetch(
-      `http://${DAEMON_HOST}:${DAEMON_PORT}/state/check?predicates=${qs}`,
-      { signal: AbortSignal.timeout(100) }
-    );
+    const res = await fetch(`http://${DAEMON_HOST}:${DAEMON_PORT}/state/check?predicates=${qs}`, {
+      signal: AbortSignal.timeout(100),
+    });
     if (!res.ok) return null;
     return (await res.json()) as Record<string, boolean>;
   } catch {

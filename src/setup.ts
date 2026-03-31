@@ -577,7 +577,8 @@ export function setupHud(): void {
   if (existing && existingCommand !== hudCommand) {
     console.log(
       chalk.yellow(
-        `  ⚠️  statusLine is already set to: "${existingCommand}"\n` + `     Overwriting with node9 HUD.`
+        `  ⚠️  statusLine is already set to: "${existingCommand}"\n` +
+          `     Overwriting with node9 HUD.`
       )
     );
   }

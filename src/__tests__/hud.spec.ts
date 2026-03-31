@@ -138,7 +138,9 @@ describe('HUD render — offline indicator', () => {
     // Provide stdin as empty (no Claude data)
     const stdinSpy = vi.spyOn(process.stdin, Symbol.asyncIterator as typeof Symbol.asyncIterator);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    stdinSpy.mockImplementation(async function* (): AsyncGenerator<any, undefined, any> { return undefined; });
+    stdinSpy.mockImplementation(async function* (): AsyncGenerator<any, undefined, any> {
+      return undefined;
+    });
 
     const { main } = await import('../cli/hud.js');
     await main();
@@ -228,12 +230,19 @@ describe('countConfigs', () => {
 describe('renderEnvironmentLine', () => {
   it('returns null when all counts are zero', async () => {
     const { renderEnvironmentLine } = await import('../cli/hud.js');
-    expect(renderEnvironmentLine({ claudeMdCount: 0, rulesCount: 0, mcpCount: 0, hooksCount: 0 })).toBeNull();
+    expect(
+      renderEnvironmentLine({ claudeMdCount: 0, rulesCount: 0, mcpCount: 0, hooksCount: 0 })
+    ).toBeNull();
   });
 
   it('always shows all 4 fields including zeros', async () => {
     const { renderEnvironmentLine } = await import('../cli/hud.js');
-    const line = renderEnvironmentLine({ claudeMdCount: 2, rulesCount: 0, mcpCount: 0, hooksCount: 0 });
+    const line = renderEnvironmentLine({
+      claudeMdCount: 2,
+      rulesCount: 0,
+      mcpCount: 0,
+      hooksCount: 0,
+    });
     expect(line).toContain('2 CLAUDE.md');
     expect(line).toContain('0 rules');
     expect(line).toContain('0 MCPs');
@@ -242,7 +251,12 @@ describe('renderEnvironmentLine', () => {
 
   it('includes all counts', async () => {
     const { renderEnvironmentLine } = await import('../cli/hud.js');
-    const line = renderEnvironmentLine({ claudeMdCount: 1, rulesCount: 4, mcpCount: 3, hooksCount: 2 });
+    const line = renderEnvironmentLine({
+      claudeMdCount: 1,
+      rulesCount: 4,
+      mcpCount: 3,
+      hooksCount: 2,
+    });
     expect(line).toContain('1 CLAUDE.md');
     expect(line).toContain('4 rules');
     expect(line).toContain('3 MCPs');
@@ -251,7 +265,12 @@ describe('renderEnvironmentLine', () => {
 
   it('shows zero counts for missing fields', async () => {
     const { renderEnvironmentLine } = await import('../cli/hud.js');
-    const line = renderEnvironmentLine({ claudeMdCount: 0, rulesCount: 0, mcpCount: 5, hooksCount: 0 });
+    const line = renderEnvironmentLine({
+      claudeMdCount: 0,
+      rulesCount: 0,
+      mcpCount: 5,
+      hooksCount: 0,
+    });
     expect(line).toContain('0 CLAUDE.md');
     expect(line).toContain('0 rules');
     expect(line).toContain('5 MCPs');

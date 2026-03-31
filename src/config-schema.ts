@@ -55,9 +55,7 @@ export const SmartRuleSchema = z.object({
     errorMap: () => ({ message: 'verdict must be one of: allow, review, block' }),
   }),
   reason: z.string().optional(),
-  dependsOnState: z
-    .array(z.enum(['no_test_passed_since_last_edit']))
-    .optional(),
+  dependsOnState: z.array(z.enum(['no_test_passed_since_last_edit'])).optional(),
   recoveryCommand: z.string().optional(),
 });
 

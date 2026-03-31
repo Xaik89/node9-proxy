@@ -16,15 +16,14 @@ import { parseCpMvOp } from '../../utils/cp-mv-parser';
 const TEST_COMMAND_RE =
   /(?:^|\s)(npm\s+(?:run\s+)?test|npx\s+(?:vitest|jest|mocha)|yarn\s+(?:run\s+)?test|pnpm\s+(?:run\s+)?test|vitest|jest|mocha|pytest|py\.test|cargo\s+test|go\s+test|bundle\s+exec\s+rspec|rspec|phpunit|dotnet\s+test)\b/i;
 
-function detectTestResult(
-  command: string,
-  output: string
-): 'pass' | 'fail' | null {
+function detectTestResult(command: string, output: string): 'pass' | 'fail' | null {
   if (!TEST_COMMAND_RE.test(command)) return null;
   const out = output.toLowerCase();
   // Success indicators (check these first — some failure messages contain "pass")
   if (
-    /\b(tests?\s+passed|all\s+tests?\s+passed|passing|test\s+suites?.*passed|ok\b|\d+\s+passed)/i.test(out) &&
+    /\b(tests?\s+passed|all\s+tests?\s+passed|passing|test\s+suites?.*passed|ok\b|\d+\s+passed)/i.test(
+      out
+    ) &&
     !/\b(fail|error|failed)\b/.test(out)
   ) {
     return 'pass';
