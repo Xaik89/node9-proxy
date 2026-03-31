@@ -233,7 +233,10 @@ describe('SmartRule schema — dependsOnState field', () => {
     expect(err).toBeNull();
   });
 
-  it('rejects unknown predicate names', async () => {
+  it('filters unknown predicate names instead of rejecting the whole rule', async () => {
+    // Unknown names are stripped by a schema transform (not a Zod error).
+    // This prevents sanitizeConfig from dropping the entire `policy` key and
+    // silently disabling all other smart rules in the config.
     const { validateConfig } = await import('../config-schema.js');
     const err = validateConfig(
       {
@@ -251,8 +254,8 @@ describe('SmartRule schema — dependsOnState field', () => {
       },
       '/test.json'
     );
-    expect(err).not.toBeNull();
-    expect(err).toContain('dependsOnState');
+    // No validation error — unknown predicate is silently filtered out
+    expect(err).toBeNull();
   });
 
   it('accepts a rule without dependsOnState (optional field)', async () => {

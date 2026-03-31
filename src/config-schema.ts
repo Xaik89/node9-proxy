@@ -55,7 +55,17 @@ export const SmartRuleSchema = z.object({
     errorMap: () => ({ message: 'verdict must be one of: allow, review, block' }),
   }),
   reason: z.string().optional(),
-  dependsOnState: z.array(z.enum(['no_test_passed_since_last_edit'])).optional(),
+  // Unknown predicate names are filtered out rather than failing the whole rule.
+  // Failing the whole z.array() would cause sanitizeConfig to drop the entire
+  // `policy` top-level key, silently disabling ALL smart rules in the config.
+  dependsOnState: z
+    .array(z.string())
+    .transform((arr) =>
+      arr.filter(
+        (p): p is 'no_test_passed_since_last_edit' => p === 'no_test_passed_since_last_edit'
+      )
+    )
+    .optional(),
   recoveryCommand: z.string().optional(),
 });
 

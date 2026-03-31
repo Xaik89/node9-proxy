@@ -2201,10 +2201,12 @@ describe('stateful smart rules — dependsOnState', () => {
     expect(policyResult.dependsOnStatePredicates).toBeUndefined();
   });
 
-  it('unknown predicate name in dependsOnState is rejected by Zod schema — rule has no predicates', async () => {
-    // The schema uses z.enum(['no_test_passed_since_last_edit']) so unknown
-    // predicate names cause Zod validation to warn and strip dependsOnState.
-    // Result: the rule has no dependsOnState → treated as a plain block rule → hard-block.
+  it('unknown predicate name in dependsOnState is filtered out — does not disable other rules', async () => {
+    // Unknown predicate names are stripped by the schema transform (not rejected with
+    // a Zod error). This prevents sanitizeConfig from dropping the entire `policy`
+    // key, which would silently disable ALL smart rules including unrelated ones.
+    // Result: the rule survives with an empty dependsOnState array → treated as a
+    // plain block rule (no state check) → hard-blocks immediately.
     mockProjectConfig({
       settings: { mode: 'standard', approvalTimeoutMs: 100 },
       policy: {
@@ -2220,8 +2222,10 @@ describe('stateful smart rules — dependsOnState', () => {
       },
     });
     const policyResult = await evaluatePolicy('Bash', { command: DEPLOY_CMD });
-    // Zod strips the invalid enum value — dependsOnStatePredicates should be absent or empty
+    // Unknown name is filtered out — rule still exists but has no active predicates
     expect(policyResult.dependsOnStatePredicates?.length ?? 0).toBe(0);
+    // Rule itself must still be present (not dropped entirely)
+    expect(policyResult.decision).toBe('block');
   });
 
   it('registerDaemonEntry sends recoveryCommand in POST body', async () => {
