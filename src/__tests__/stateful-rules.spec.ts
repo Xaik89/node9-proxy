@@ -121,9 +121,14 @@ describe('stateful smart rules — dependsOnState', () => {
     });
 
     const result = await authorizeHeadless('Bash', { command: './deploy.sh --env=production' });
+    // Stateful blocks intentionally route through the race engine so a human
+    // can override via the approvers (tail [1]/[2]/[3], native popup, browser).
+    // This differs from plain block rules which hard-block immediately.
+    // With no interactive channels active in tests, the race engine expires → 'timeout'.
     expect(result.approved).toBe(false);
-    // Predicates met → race engine → timeout (no interactive channels in test)
     expect(result.blockedBy).toBe('timeout');
+    // Must NOT hard-block directly — a human must have the chance to decide
+    expect(result.blockedBy).not.toBe('local-config');
     expect(mockCheckState).toHaveBeenCalledWith(['no_test_passed_since_last_edit']);
   });
 
@@ -146,11 +151,14 @@ describe('stateful smart rules — dependsOnState', () => {
       },
     });
 
-    // Predicate false → rule is downgraded to review → race engine runs
+    // Predicate false (tests already passed) → rule does not apply → race engine runs
     const result = await authorizeHeadless('Bash', { command: './deploy.sh --env=production' });
-    // Must NOT be hard-blocked by the smart rule
+    // Must NOT be hard-blocked by this smart rule
     expect(result.blockedByLabel).not.toContain('require-tests-before-deploy');
     expect(result.blockedBy).not.toBe('local-config');
+    // Race engine runs with no interactive channels → expires as 'timeout' (not local-config)
+    expect(result.blockedBy).toBe('timeout');
+    expect(result.approved).toBe(false);
     expect(mockCheckState).toHaveBeenCalledWith(['no_test_passed_since_last_edit']);
   });
 

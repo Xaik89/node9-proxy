@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## v1.7.0 — Steerable Redirect Recovery Menu
+
+### Added
+
+- **Recovery Menu in `node9 tail`:** When a stateful block rule fires with a `recoveryCommand`, the tail approver now renders an interactive STATE GUARD card instead of a plain approval card. Options:
+  - **[1] Allow anyway** — override the policy for this call
+  - **[2] Redirect AI** — sends a structured reason back to Claude: _"Run `<recoveryCommand>` first, then retry your original command."_ This steers the AI to fix the root cause rather than retrying blindly.
+  - **[3] Deny & stop** — hard block; auto-deny on timeout
+
+- **`terminal-redirect` decision source:** When the developer selects [2], the tail posts `{ decision: 'deny', reason: "...", source: 'terminal-redirect' }` to the daemon. The orchestrator recognises this source and uses the redirect reason as the block message sent back to the AI agent instead of the generic "user rejected" message.
+
+- **Fail-open on daemon unreachable is intentional:** When the daemon cannot be reached, stateful block predicates are treated as unknown and the rule is downgraded to review. This is a deliberate trade-off — availability over lockout. A future `failMode: 'open' | 'closed'` field on smart rules is planned to make this configurable per-rule.
+
+---
+
 ## v1.6.0 — Stateful Smart Rules
 
 ### Added
