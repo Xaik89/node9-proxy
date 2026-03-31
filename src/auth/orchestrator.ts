@@ -1,8 +1,5 @@
 // src/auth/orchestrator.ts
 // The multi-channel race engine: coordinates cloud, native, browser, and terminal approval channels.
-import net from 'net';
-import path from 'path';
-import os from 'os';
 import { randomUUID } from 'crypto';
 import { askNativePopup } from '../ui/native';
 import { computeRiskMetadata, type RiskMetadata } from '../context-sniper';
@@ -25,6 +22,8 @@ import {
   resolveViaDaemon,
   notifyTaint,
   checkTaint,
+  notifyActivitySocket,
+  checkStatePredicates,
 } from './daemon';
 import { auditLocalAllow, initNode9SaaS, pollNode9SaaS, resolveNode9SaaS } from './cloud';
 
@@ -52,6 +51,12 @@ export interface AuthResult {
     | 'audit';
   /** Structured decision source from the winning racer — used for cloud audit reporting. */
   decisionSource?: 'terminal' | 'browser' | 'native' | 'cloud' | 'timeout' | 'local';
+  /** Name of the smart rule that fired (for HUD lastRuleHit tracking). */
+  ruleHit?: string;
+  /** Observe mode: this decision would have been blocked in standard mode. */
+  observeWouldBlock?: boolean;
+  /** Recovery command to suggest when a stateful rule hard-blocks (e.g. "npm test"). */
+  recoveryCommand?: string;
 }
 
 // ── Taint helpers ────────────────────────────────────────────────────────────
@@ -123,11 +128,6 @@ function isNetworkTool(toolName: string, args: unknown): boolean {
 }
 
 // ── Flight Recorder — fire-and-forget socket notify ──────────────────────────
-const ACTIVITY_SOCKET_PATH =
-  process.platform === 'win32'
-    ? '\\\\.\\pipe\\node9-activity'
-    : path.join(os.tmpdir(), 'node9-activity.sock');
-
 // Returns a Promise so callers can await socket flush before process.exit().
 // Without await, process.exit(0) kills the socket mid-connect for fast-passing
 // tools (Read, Glob, Grep, etc.), making them invisible in node9 tail.
@@ -138,22 +138,10 @@ function notifyActivity(data: {
   args?: unknown;
   status: string;
   label?: string;
+  ruleHit?: string;
+  observeWouldBlock?: boolean;
 }): Promise<void> {
-  return new Promise<void>((resolve) => {
-    try {
-      const payload = JSON.stringify(data);
-      const sock = net.createConnection(ACTIVITY_SOCKET_PATH);
-      sock.on('connect', () => {
-        // Attach listeners before calling end() so events fired synchronously
-        // on the loopback socket are not missed.
-        sock.on('close', resolve);
-        sock.end(payload);
-      });
-      sock.on('error', resolve); // daemon not running — resolve immediately
-    } catch {
-      resolve();
-    }
-  });
+  return notifyActivitySocket(data);
 }
 
 export async function authorizeHeadless(
@@ -193,6 +181,8 @@ export async function authorizeHeadless(
               ? 'taint'
               : 'block',
         label: result.blockedByLabel,
+        ruleHit: result.ruleHit,
+        observeWouldBlock: result.observeWouldBlock,
       });
     }
     return result;
@@ -241,11 +231,15 @@ async function _authorizeHeadlessCore(
   }
 
   const isManual = meta?.agent === 'Terminal';
+  const isObserveMode = config.settings.mode === 'observe';
 
   let explainableLabel = 'Local Config';
   let policyMatchedField: string | undefined;
   let policyMatchedWord: string | undefined;
   let riskMetadata: RiskMetadata | undefined;
+  // Set when a stateful block's predicates are NOT met and we fall through to the
+  // race engine — passed to registerDaemonEntry so the tail shows the recovery menu.
+  let statefulRecoveryCommand: string | undefined;
 
   // ── TAINT CHECK ───────────────────────────────────────────────────────────
   // Before DLP: if this is a network/upload operation touching a previously
@@ -291,10 +285,26 @@ async function _authorizeHeadlessCore(
         `field "${dlpMatch.fieldPath}" (${dlpMatch.redactedSample})`;
       if (dlpMatch.severity === 'block') {
         // Always hash args on DLP blocks — the secret must never appear in the audit log
-        if (!isManual) appendLocalAudit(toolName, args, 'deny', 'dlp-block', meta, true);
+        if (!isManual)
+          appendLocalAudit(
+            toolName,
+            args,
+            'deny',
+            isObserveMode ? 'observe-mode-dlp-would-block' : 'dlp-block',
+            meta,
+            true
+          );
         // Taint the destination file so future uploads of it are also blocked.
         if (isWriteTool(toolName) && filePath) {
           await notifyTaint(filePath, `DLP:${dlpMatch.patternName}`);
+        }
+        if (isObserveMode) {
+          return {
+            approved: true,
+            checkedBy: 'audit',
+            observeWouldBlock: true,
+            blockedByLabel: '🚨 Node9 DLP (Secret Detected)',
+          };
         }
         return {
           approved: false,
@@ -310,6 +320,32 @@ async function _authorizeHeadlessCore(
         appendLocalAudit(toolName, args, 'allow', 'dlp-review-flagged', meta, hashAuditArgs);
       explainableLabel = '🚨 Node9 DLP (Credential Review)';
     }
+  }
+
+  if (isObserveMode) {
+    if (!isIgnoredTool(toolName)) {
+      const policyResult = await evaluatePolicy(toolName, args, meta?.agent, options?.cwd);
+      const wouldBlock = policyResult.decision === 'block';
+      if (!isManual)
+        appendLocalAudit(
+          toolName,
+          args,
+          'allow',
+          wouldBlock ? 'observe-mode-would-block' : 'observe-mode',
+          meta,
+          hashAuditArgs
+        );
+      return {
+        approved: true,
+        checkedBy: 'audit',
+        ...(wouldBlock && {
+          observeWouldBlock: true,
+          blockedByLabel: policyResult.blockedByLabel,
+          ruleHit: policyResult.ruleName,
+        }),
+      };
+    }
+    return { approved: true, checkedBy: 'audit' };
   }
 
   if (config.settings.mode === 'audit') {
@@ -349,14 +385,30 @@ async function _authorizeHeadlessCore(
 
     // Hard block from smart rules — skip the race engine entirely
     if (policyResult.decision === 'block') {
-      if (!isManual)
-        appendLocalAudit(toolName, args, 'deny', 'smart-rule-block', meta, hashAuditArgs);
-      return {
-        approved: false,
-        reason: policyResult.reason ?? 'Action explicitly blocked by Smart Policy.',
-        blockedBy: 'local-config',
-        blockedByLabel: policyResult.blockedByLabel,
-      };
+      // If block has dependsOnState predicates, check them via the daemon.
+      // If predicates are not all satisfied (or daemon unreachable), downgrade
+      // to review so the user can decide rather than being hard-blocked.
+      if (policyResult.dependsOnStatePredicates?.length) {
+        await checkStatePredicates(policyResult.dependsOnStatePredicates);
+        // Whether or not predicates are met, fall through to the race engine so
+        // the human decides via the approvers (tail [1]/[2]/[3], native popup,
+        // browser dashboard). The /dev/tty approach was wrong: Claude Code holds
+        // the terminal, so the user cannot interact with a tty menu mid-run.
+        if (policyResult.recoveryCommand) {
+          statefulRecoveryCommand = policyResult.recoveryCommand;
+        }
+      } else {
+        if (!isManual)
+          appendLocalAudit(toolName, args, 'deny', 'smart-rule-block', meta, hashAuditArgs);
+        return {
+          approved: false,
+          reason: policyResult.reason ?? 'Action explicitly blocked by Smart Policy.',
+          blockedBy: 'local-config',
+          blockedByLabel: policyResult.blockedByLabel,
+          ruleHit: policyResult.ruleName,
+          ...(policyResult.recoveryCommand && { recoveryCommand: policyResult.recoveryCommand }),
+        };
+      }
     }
 
     explainableLabel = policyResult.blockedByLabel || 'Local Config';
@@ -505,7 +557,8 @@ async function _authorizeHeadlessCore(
           meta,
           riskMetadata,
           options?.activityId,
-          options?.cwd
+          options?.cwd,
+          statefulRecoveryCommand
         );
         daemonEntryId = entry.id;
         daemonAllowCount = entry.allowCount;
@@ -586,16 +639,23 @@ async function _authorizeHeadlessCore(
   if (daemonEntryId && (approvers.browser || approvers.terminal)) {
     racePromises.push(
       (async () => {
-        const { decision: daemonDecision, source: decisionSource } = await waitForDaemonDecision(
-          daemonEntryId!,
-          signal
-        );
+        const {
+          decision: daemonDecision,
+          source: decisionSource,
+          reason: daemonReason,
+        } = await waitForDaemonDecision(daemonEntryId!, signal);
         if (daemonDecision === 'abandoned') throw new Error('Abandoned');
 
         const isApproved = daemonDecision === 'allow';
+        // 'terminal-redirect' = tail choice [2]: AI redirect with a custom reason string
+        const isRedirect = decisionSource === 'terminal-redirect';
         const src: 'terminal' | 'browser' =
-          decisionSource === 'terminal' || decisionSource === 'browser'
-            ? decisionSource
+          decisionSource === 'terminal' ||
+          decisionSource === 'terminal-redirect' ||
+          decisionSource === 'browser'
+            ? decisionSource === 'browser'
+              ? 'browser'
+              : 'terminal'
             : approvers.browser
               ? 'browser'
               : 'terminal';
@@ -604,10 +664,13 @@ async function _authorizeHeadlessCore(
           approved: isApproved,
           reason: isApproved
             ? undefined
-            : `The human user rejected this action via the Node9 ${via}.`,
+            : // Use the redirect reason from the tail when choice [2] was selected;
+              // otherwise fall back to the generic rejection message.
+              (isRedirect && daemonReason) ||
+              `The human user rejected this action via the Node9 ${via}.`,
           checkedBy: isApproved ? 'daemon' : undefined,
           blockedBy: isApproved ? undefined : 'local-decision',
-          blockedByLabel: `User Decision (${via})`,
+          blockedByLabel: isRedirect ? 'Steered Redirect (Terminal)' : `User Decision (${via})`,
           decisionSource: src,
         } as AuthResult;
       })()

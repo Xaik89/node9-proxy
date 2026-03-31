@@ -9,8 +9,32 @@ import { redactSecrets } from '../../audit';
 import { getConfig } from '../../config';
 import { shouldSnapshot } from '../../policy';
 import { createShadowSnapshot } from '../../undo';
-import { notifyTaintPropagate, isDaemonRunning } from '../../auth/daemon';
+import { notifyTaintPropagate, isDaemonRunning, notifyActivitySocket } from '../../auth/daemon';
 import { parseCpMvOp } from '../../utils/cp-mv-parser';
+
+// Patterns for common test runners
+const TEST_COMMAND_RE =
+  /(?:^|\s)(npm\s+(?:run\s+)?test|npx\s+(?:vitest|jest|mocha)|yarn\s+(?:run\s+)?test|pnpm\s+(?:run\s+)?test|vitest|jest|mocha|pytest|py\.test|cargo\s+test|go\s+test|bundle\s+exec\s+rspec|rspec|phpunit|dotnet\s+test)\b/i;
+
+function detectTestResult(
+  command: string,
+  output: string
+): 'pass' | 'fail' | null {
+  if (!TEST_COMMAND_RE.test(command)) return null;
+  const out = output.toLowerCase();
+  // Success indicators (check these first — some failure messages contain "pass")
+  if (
+    /\b(tests?\s+passed|all\s+tests?\s+passed|passing|test\s+suites?.*passed|ok\b|\d+\s+passed)/i.test(out) &&
+    !/\b(fail|error|failed)\b/.test(out)
+  ) {
+    return 'pass';
+  }
+  // Failure indicators
+  if (/\b(tests?\s+failed|failing|failed|error|assertion\s+error|\d+\s+failed)\b/i.test(out)) {
+    return 'fail';
+  }
+  return null;
+}
 
 function sanitize(value: string): string {
   // eslint-disable-next-line no-control-regex
@@ -30,6 +54,7 @@ export function registerLogCommand(program: Command): void {
             tool_name?: string;
             name?: string;
             tool_input?: unknown;
+            tool_response?: { output?: string };
             args?: unknown;
             cwd?: string;
           };
@@ -79,6 +104,31 @@ export function registerLogCommand(program: Command): void {
               // both cases are equivalent: no propagation occurs.
               if (op) {
                 await notifyTaintPropagate(op.src, op.dest, op.clearSource);
+              }
+            }
+          }
+
+          // Test result detection for stateful smart rules (e.g. "block push if no
+          // passing test since last edit"). Only fires when daemon is running and
+          // the completed command looks like a test runner invocation.
+          if ((tool === 'Bash' || tool === 'bash') && isDaemonRunning()) {
+            const bashCommand =
+              typeof rawInput === 'object' &&
+              rawInput !== null &&
+              'command' in rawInput &&
+              typeof (rawInput as Record<string, unknown>).command === 'string'
+                ? ((rawInput as Record<string, unknown>).command as string)
+                : null;
+            const output = payload.tool_response?.output ?? '';
+            if (bashCommand && output) {
+              const testResult = detectTestResult(bashCommand, output);
+              if (testResult) {
+                await notifyActivitySocket({
+                  id: 'test-result',
+                  ts: Date.now(),
+                  tool: tool,
+                  status: testResult === 'pass' ? 'test_pass' : 'test_fail',
+                });
               }
             }
           }

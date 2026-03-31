@@ -12,6 +12,10 @@ import { RiskMetadata } from '../context-sniper';
 import { DAEMON_PORT, DAEMON_HOST } from '../auth/daemon';
 import { SuggestionTracker, type Suggestion } from './suggestion-tracker.js';
 import { TaintStore } from './taint-store.js';
+import { sessionCounters } from './session-counters.js';
+import { sessionHistory } from './session-history.js';
+export { sessionCounters, sessionHistory };
+export type { HudStatus } from './session-counters.js';
 
 export type { Suggestion };
 export { TaintStore };
@@ -44,6 +48,13 @@ export interface PendingEntry {
   toolName: string;
   args: unknown;
   riskMetadata?: RiskMetadata;
+  /** Recovery command to display in the tail/browser recovery menu (e.g. "npm test"). */
+  recoveryCommand?: string;
+  /**
+   * When true, the tail shows the card for context but does NOT enable keypress.
+   * Used for recovery menu entries where the tty menu in check.ts is the sole decision maker.
+   */
+  viewOnly?: boolean;
   agent?: string;
   mcpServer?: string;
   timestamp: number;
@@ -360,6 +371,19 @@ export function abandonPending(): void {
   }
 }
 
+// Write tools tracked for session history (stateful smart rules)
+const WRITE_TOOL_NAMES = new Set([
+  'write',
+  'write_file',
+  'create_file',
+  'edit',
+  'multiedit',
+  'str_replace_based_edit_tool',
+  'replace',
+  'notebook_edit',
+  'notebookedit',
+]);
+
 // ── Flight Recorder Unix socket ───────────────────────────────────────────────
 // startActivitySocket is called by startDaemon() after the HTTP server is up.
 export function startActivitySocket(): void {
@@ -389,7 +413,19 @@ export function startActivitySocket(): void {
           args?: unknown;
           status: string;
           label?: string;
+          ruleHit?: string;
+          observeWouldBlock?: boolean;
         };
+        // Track test results for stateful smart rules
+        if (data.status === 'test_pass') {
+          sessionHistory.recordTestPass(data.ts);
+          return;
+        }
+        if (data.status === 'test_fail') {
+          sessionHistory.recordTestFail(data.ts);
+          return;
+        }
+
         if (data.status === 'pending') {
           broadcast('activity', {
             id: data.id,
@@ -399,6 +435,27 @@ export function startActivitySocket(): void {
             status: 'pending',
           });
         } else {
+          // Update session counters for HUD
+          if (data.status === 'allow') {
+            sessionCounters.incrementAllowed();
+            if (data.observeWouldBlock) sessionCounters.incrementWouldBlock();
+            // Track file edits for stateful smart rules
+            if (WRITE_TOOL_NAMES.has(data.tool.toLowerCase().replace(/[^a-z_]/g, '_'))) {
+              sessionHistory.recordEdit(data.ts);
+            }
+          } else if (data.status === 'block') {
+            sessionCounters.incrementBlocked();
+            sessionCounters.recordBlockedTool(data.tool);
+            if (data.ruleHit) sessionCounters.recordRuleHit(data.ruleHit);
+          } else if (data.status === 'dlp') {
+            sessionCounters.incrementBlocked();
+            sessionCounters.incrementDlpHits();
+            sessionCounters.recordBlockedTool(data.tool);
+          } else if (data.status === 'taint') {
+            sessionCounters.incrementBlocked();
+            sessionCounters.recordBlockedTool(data.tool);
+          }
+
           broadcast('activity-result', {
             id: data.id,
             status: data.status,

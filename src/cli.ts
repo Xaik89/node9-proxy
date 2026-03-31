@@ -13,9 +13,11 @@ import {
   setupClaude,
   setupGemini,
   setupCursor,
+  setupHud,
   teardownClaude,
   teardownGemini,
   teardownCursor,
+  teardownHud,
 } from './setup';
 import { stopDaemon } from './daemon/index';
 import chalk from 'chalk';
@@ -120,13 +122,14 @@ program
 program
   .command('addto')
   .description('Integrate Node9 with an AI agent')
-  .addHelpText('after', '\n  Supported targets:  claude  gemini  cursor')
-  .argument('<target>', 'The agent to protect: claude | gemini | cursor')
+  .addHelpText('after', '\n  Supported targets:  claude  gemini  cursor  hud')
+  .argument('<target>', 'The agent to protect: claude | gemini | cursor | hud')
   .action(async (target: string) => {
     if (target === 'gemini') return await setupGemini();
     if (target === 'claude') return await setupClaude();
     if (target === 'cursor') return await setupCursor();
-    console.error(chalk.red(`Unknown target: "${target}". Supported: claude, gemini, cursor`));
+    if (target === 'hud') return setupHud();
+    console.error(chalk.red(`Unknown target: "${target}". Supported: claude, gemini, cursor, hud`));
     process.exit(1);
   });
 
@@ -134,8 +137,8 @@ program
 program
   .command('setup')
   .description('Alias for "addto" — integrate Node9 with an AI agent')
-  .addHelpText('after', '\n  Supported targets:  claude  gemini  cursor')
-  .argument('[target]', 'The agent to protect: claude | gemini | cursor')
+  .addHelpText('after', '\n  Supported targets:  claude  gemini  cursor  hud')
+  .argument('[target]', 'The agent to protect: claude | gemini | cursor | hud')
   .action(async (target?: string) => {
     if (!target) {
       console.log(chalk.cyan('\n🛡️  Node9 Setup — integrate with your AI agent\n'));
@@ -144,6 +147,9 @@ program
       console.log('    ' + chalk.green('claude') + '   — Claude Code (hook mode)');
       console.log('    ' + chalk.green('gemini') + '   — Gemini CLI (hook mode)');
       console.log('    ' + chalk.green('cursor') + '   — Cursor (hook mode)');
+      process.stdout.write(
+        '    ' + chalk.green('hud') + '     — Claude Code security statusline\n'
+      );
       console.log('');
       return;
     }
@@ -151,7 +157,8 @@ program
     if (t === 'gemini') return await setupGemini();
     if (t === 'claude') return await setupClaude();
     if (t === 'cursor') return await setupCursor();
-    console.error(chalk.red(`Unknown target: "${target}". Supported: claude, gemini, cursor`));
+    if (t === 'hud') return setupHud();
+    console.error(chalk.red(`Unknown target: "${target}". Supported: claude, gemini, cursor, hud`));
     process.exit(1);
   });
 
@@ -168,8 +175,11 @@ program
     if (target === 'claude') fn = teardownClaude;
     else if (target === 'gemini') fn = teardownGemini;
     else if (target === 'cursor') fn = teardownCursor;
+    else if (target === 'hud') fn = teardownHud;
     else {
-      console.error(chalk.red(`Unknown target: "${target}". Supported: claude, gemini, cursor`));
+      console.error(
+        chalk.red(`Unknown target: "${target}". Supported: claude, gemini, cursor, hud`)
+      );
       process.exit(1);
     }
     console.log(chalk.cyan(`\n🛡️  Node9: removing hooks from ${target}...\n`));
@@ -388,6 +398,15 @@ registerMcpGatewayCommand(program);
 // 7. CHECK (PreToolUse hook) + LOG (PostToolUse hook)
 registerCheckCommand(program);
 registerLogCommand(program);
+
+// HUD — statusLine subprocess for Claude Code
+program
+  .command('hud')
+  .description('Render node9 security statusline (spawned by Claude Code statusLine)')
+  .action(async () => {
+    const { main } = await import('./cli/hud.js');
+    await main();
+  });
 
 // 8. PAUSE
 program

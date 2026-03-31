@@ -63,6 +63,13 @@ interface ApprovalRequest {
     matchedWord?: string;
     ruleName?: string;
   };
+  /** When set, shows the [1]/[2]/[3] recovery menu instead of the standard [y/n/a/t] prompt. */
+  recoveryCommand?: string;
+  /**
+   * When true, the card is informational only — the tty menu in the hook process is the
+   * decision maker. Tail shows context + "awaiting tty" message, no keypress.
+   */
+  viewOnly?: boolean;
   timestamp?: number;
   /** How many consecutive allows (including this one) if approved. Used for 💡 insight. */
   allowCount?: number;
@@ -175,12 +182,13 @@ function postDecisionHttp(
   decision: 'allow' | 'deny' | 'trust',
   csrfToken: string,
   port: number,
-  opts?: { persist?: boolean; trustDuration?: string }
+  opts?: { persist?: boolean; trustDuration?: string; reason?: string; source?: string }
 ): Promise<void> {
   return new Promise((resolve, reject) => {
-    const bodyObj: Record<string, unknown> = { decision, source: 'terminal' };
+    const bodyObj: Record<string, unknown> = { decision, source: opts?.source ?? 'terminal' };
     if (opts?.persist) bodyObj.persist = true;
     if (opts?.trustDuration) bodyObj.trustDuration = opts.trustDuration;
+    if (opts?.reason) bodyObj.reason = opts.reason;
     const body = JSON.stringify(bodyObj);
     const req = http.request(
       {
@@ -208,7 +216,14 @@ function postDecisionHttp(
 
 // ── Approval card ─────────────────────────────────────────────────────────────
 
+const DIVIDER = '─'.repeat(60);
+
 function buildCardLines(req: ApprovalRequest, localCount: number = 0): string[] {
+  // Recovery menu: stateful rule with a recoveryCommand uses a different card layout
+  if (req.recoveryCommand) {
+    return buildRecoveryCardLines(req);
+  }
+
   const argsStr = JSON.stringify(req.args ?? {}).replace(/\s+/g, ' ');
   const argsPreview = argsStr.length > 60 ? argsStr.slice(0, 60) + '…' : argsStr;
 
@@ -249,6 +264,43 @@ function buildCardLines(req: ApprovalRequest, localCount: number = 0): string[] 
   );
 
   return lines;
+}
+
+/** Recovery menu card — rendered when a stateful smart rule provides a recoveryCommand. */
+function buildRecoveryCardLines(req: ApprovalRequest): string[] {
+  const argsObj = req.args as Record<string, unknown> | null;
+  const command =
+    typeof argsObj?.command === 'string'
+      ? argsObj.command
+      : JSON.stringify(req.args ?? {}).replace(/\s+/g, ' ').slice(0, 60);
+  const ruleName =
+    req.riskMetadata?.ruleName?.replace(/^Smart Rule:\s*/i, '') ?? 'policy rule';
+  const recoveryCommand = req.recoveryCommand!;
+
+  const interactiveLines = req.viewOnly
+    ? [
+        `  ${GRAY}→ Awaiting decision from interactive terminal...${RESET}`,
+      ]
+    : [
+        `  ${BOLD}${GREEN}[1]${RESET} Allow anyway  ${GRAY}(override policy)${RESET}`,
+        `  ${BOLD}${YELLOW}[2]${RESET} Redirect AI: "Run '${recoveryCommand}' first, then retry"`,
+        `  ${BOLD}${RED}[3]${RESET} Deny & stop  ${GRAY}(hard block)${RESET}`,
+        ``,
+        `  ${GRAY}[Timeout: auto-deny]${RESET}`,
+        `  Select [1-3]: `,
+      ];
+
+  return [
+    ``,
+    `${BOLD}${CYAN}${DIVIDER}${RESET}`,
+    `🛡️  ${BOLD}NODE9 STATE GUARD:${RESET} '${BOLD}${command}${RESET}'`,
+    `${YELLOW}⚠️  Rule: ${ruleName}${RESET}`,
+    `${CYAN}${DIVIDER}${RESET}`,
+    ...(!req.viewOnly ? [`${BOLD}What would you like to do?${RESET}`, ``] : []),
+    ...interactiveLines,
+    `${CYAN}${DIVIDER}${RESET}`,
+    ``,
+  ];
 }
 
 // ── Main export ───────────────────────────────────────────────────────────────
@@ -376,7 +428,7 @@ export async function startTail(options: TailOptions = {}): Promise<void> {
       cancelActiveCard = null;
     };
 
-    const settle = (action: 'allow' | 'deny' | 'always-allow' | 'trust') => {
+    const settle = (action: 'allow' | 'deny' | 'always-allow' | 'trust' | 'redirect') => {
       if (settled) return;
       settled = true;
       cleanup();
@@ -397,7 +449,9 @@ export async function startTail(options: TailOptions = {}): Promise<void> {
             ? chalk.cyan('⏱ TRUST 30m')
             : action === 'allow'
               ? chalk.green('✓ ALLOWED')
-              : chalk.red('✗ DENIED');
+              : action === 'redirect'
+                ? chalk.yellow('↩ REDIRECT AI')
+                : chalk.red('✗ DENIED');
       stampedLines.push(`  ${BOLD}→${RESET} ${decisionStamp} ${GRAY}(terminal)${RESET}`, ``);
       for (const line of stampedLines) process.stdout.write(line + '\n');
       process.stdout.write(SHOW_CURSOR);
@@ -406,19 +460,28 @@ export async function startTail(options: TailOptions = {}): Promise<void> {
       // Update local consecutive-allow counter for this toolName
       if (action === 'allow' || action === 'always-allow' || action === 'trust') {
         localAllowCounts.set(req.toolName, (localAllowCounts.get(req.toolName) ?? 0) + 1);
-      } else if (action === 'deny') {
+      } else if (action === 'deny' || action === 'redirect') {
         localAllowCounts.delete(req.toolName);
       }
 
       // Map action to decision + options for the daemon
       let httpDecision: 'allow' | 'deny' | 'trust';
-      let httpOpts: { persist?: boolean; trustDuration?: string } | undefined;
+      let httpOpts: { persist?: boolean; trustDuration?: string; reason?: string; source?: string } | undefined;
       if (action === 'always-allow') {
         httpDecision = 'allow';
         httpOpts = { persist: true };
       } else if (action === 'trust') {
         httpDecision = 'trust';
         httpOpts = { trustDuration: '30m' };
+      } else if (action === 'redirect') {
+        // Choice [2]: deny with a redirect reason that the race engine surfaces to Claude
+        httpDecision = 'deny';
+        const recoveryCommand = req.recoveryCommand ?? 'the required pre-condition';
+        const redirectReason =
+          `USER INTERVENTION: I am blocking this ${req.toolName} because the required ` +
+          `pre-condition has not been met. Please execute \`${recoveryCommand}\`. ` +
+          `If it passes, you are then authorized to run \`${req.toolName}\`.`;
+        httpOpts = { reason: redirectReason, source: 'terminal-redirect' };
       } else {
         httpDecision = action;
       }
@@ -468,19 +531,41 @@ export async function startTail(options: TailOptions = {}): Promise<void> {
       showNextCard();
     };
 
+    // viewOnly cards are informational — the hook's tty menu is the decision maker.
+    // Don't attach keypress; the card will be dismissed via cancelActiveCard when
+    // the daemon broadcasts 'remove' after check.ts calls resolveViaDaemon.
+    if (req.viewOnly) {
+      process.stdin.resume();
+      onKeypress = () => {}; // absorb keypresses silently while card is shown
+      process.stdin.on('keypress', onKeypress);
+      return;
+    }
+
     process.stdin.resume();
     // Use keypress events (requires emitKeypressEvents called at startup) —
     // more reliable than raw 'data' buffer parsing across Node.js versions.
     onKeypress = (_str: string, key: { name?: string; ctrl?: boolean }) => {
       const name = key?.name ?? '';
-      if (name === 'y' || name === 'return') {
-        settle('allow');
-      } else if (name === 'n' || name === 'd' || (key?.ctrl && name === 'c')) {
-        settle('deny');
-      } else if (name === 'a') {
-        settle('always-allow');
-      } else if (name === 't') {
-        settle('trust');
+      if (req.recoveryCommand) {
+        // Recovery menu: only [1]/[2]/[3] are valid
+        if (name === '1') {
+          settle('allow');
+        } else if (name === '2') {
+          settle('redirect');
+        } else if (name === '3' || (key?.ctrl && name === 'c')) {
+          settle('deny');
+        }
+      } else {
+        // Standard approval card
+        if (name === 'y' || name === 'return') {
+          settle('allow');
+        } else if (name === 'n' || name === 'd' || (key?.ctrl && name === 'c')) {
+          settle('deny');
+        } else if (name === 'a') {
+          settle('always-allow');
+        } else if (name === 't') {
+          settle('trust');
+        }
       }
     };
     process.stdin.on('keypress', onKeypress);

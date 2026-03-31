@@ -6,6 +6,39 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## v1.6.0 — Stateful Smart Rules
+
+### Added
+
+- **Stateful Smart Rules (`dependsOnState`):** Smart rules can now condition a `block` verdict on real session state instead of firing unconditionally. Add a `dependsOnState` array to any block rule with one or more named predicates — the block only fires if **all** predicates are satisfied at evaluation time. If any predicate is false, or the daemon is unreachable, the rule is silently downgraded to a review (fail-open). Currently supported predicate:
+  - `no_test_passed_since_last_edit` — true when a file was edited since the last passing test run.
+
+  ```json
+  {
+    "name": "require-tests-before-deploy",
+    "tool": "Bash",
+    "conditions": [{ "field": "command", "op": "matches", "value": "./deploy.sh" }],
+    "verdict": "block",
+    "reason": "Run tests before deploying",
+    "dependsOnState": ["no_test_passed_since_last_edit"],
+    "recoveryCommand": "npm test"
+  }
+  ```
+
+- **`recoveryCommand` on Smart Rules:** Block rules now accept an optional `recoveryCommand` string. When the rule fires, the command is shown to the developer on `/dev/tty` as `💡 Run: npm test` and sent to the AI as a negotiation hint: _"Run `npm test` first, then retry your original command."_ Works on both stateful and plain block rules.
+
+- **Session History tracking (daemon-side):** The daemon now tracks `lastEditAt`, `lastTestPassAt`, and `lastTestFailAt` timestamps across the session lifetime. File edits are detected from the `allow` activity events for write tools (`Edit`, `Write`, `MultiEdit`, etc.). Test results are detected from the PostToolUse `log` hook — the hook reads `tool_response.output` and classifies the run as `pass` or `fail` based on output patterns from common test runners (`vitest`, `jest`, `pytest`, `cargo test`, `go test`, `rspec`, and more).
+
+- **`/state/check` HTTP endpoint on daemon:** `GET /state/check?predicates=no_test_passed_since_last_edit` returns a JSON map `{ "no_test_passed_since_last_edit": true }`. Called by the orchestrator before applying a stateful block; result is cached-by-call (100 ms timeout, fail-open on error).
+
+- **HUD line 3 — Environment counts:** The status line now renders a third line showing the active Claude Code environment configuration:
+  ```
+  1 CLAUDE.md  |  4 rules  |  3 MCPs  |  2 hooks
+  ```
+  Counts are read from `~/.claude/settings.json`, `~/.claude.json`, `.mcp.json`, and `.claude/rules/` — mirroring the same sources as the claude-hud project. The line is omitted entirely when all counts are zero. The `cwd` field from Claude Code's stdin JSON is used to scope project-level counts.
+
+---
+
 ## [Unreleased] → v1.4.0
 
 ### Added

@@ -6,7 +6,8 @@
 export function buildNegotiationMessage(
   blockedByLabel: string,
   isHumanDecision: boolean,
-  humanReason?: string
+  humanReason?: string,
+  recoveryCommand?: string
 ): string {
   if (isHumanDecision) {
     return `NODE9: The human user rejected this action.
@@ -78,9 +79,11 @@ Do NOT attempt to bypass this rule.`;
   }
 
   // Generic fallback
+  const recovery = recoveryCommand
+    ? `\nREQUIRED ACTION: Run \`${recoveryCommand}\` first, then retry your original command.`
+    : '\n- Pivot to a non-destructive or read-only alternative.';
   return `NODE9: Action blocked by security policy [${blockedByLabel}].
 INSTRUCTIONS:
-- Do NOT retry this exact command or attempt to bypass the rule.
-- Pivot to a non-destructive or read-only alternative.
+- Do NOT retry this exact command or attempt to bypass the rule.${recovery}
 - Inform the user which security rule was triggered and ask how to proceed.`;
 }

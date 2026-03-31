@@ -55,6 +55,10 @@ export const SmartRuleSchema = z.object({
     errorMap: () => ({ message: 'verdict must be one of: allow, review, block' }),
   }),
   reason: z.string().optional(),
+  dependsOnState: z
+    .array(z.enum(['no_test_passed_since_last_edit']))
+    .optional(),
+  recoveryCommand: z.string().optional(),
 });
 
 // ── Top-level Config ─────────────────────────────────────────────────────────
@@ -64,7 +68,7 @@ export const ConfigFileSchema = z
     version: z.string().optional(),
     settings: z
       .object({
-        mode: z.enum(['standard', 'strict', 'audit']).optional(),
+        mode: z.enum(['standard', 'strict', 'audit', 'observe']).optional(),
         autoStartDaemon: z.boolean().optional(),
         enableUndo: z.boolean().optional(),
         enableHookLogDebug: z.boolean().optional(),

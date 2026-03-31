@@ -1,10 +1,57 @@
 // src/auth/daemon.ts
 // Daemon interaction helpers: PID check, entry registration, long-polling, viewer cards.
 import fs from 'fs';
+import net from 'net';
 import path from 'path';
 import os from 'os';
 import { spawnSync } from 'child_process';
 import { type RiskMetadata } from '../context-sniper';
+
+const ACTIVITY_SOCKET_PATH =
+  process.platform === 'win32'
+    ? '\\\\.\\pipe\\node9-activity'
+    : path.join(os.tmpdir(), 'node9-activity.sock');
+
+/**
+ * Write a message to the activity Unix socket (flight recorder + session counters).
+ * Resolves immediately if the daemon is not running.
+ */
+export function notifyActivitySocket(data: Record<string, unknown>): Promise<void> {
+  return new Promise<void>((resolve) => {
+    try {
+      const payload = JSON.stringify(data);
+      const sock = net.createConnection(ACTIVITY_SOCKET_PATH);
+      sock.on('connect', () => {
+        sock.on('close', resolve);
+        sock.end(payload);
+      });
+      sock.on('error', resolve);
+    } catch {
+      resolve();
+    }
+  });
+}
+
+/**
+ * Query daemon state predicates for stateful smart rules.
+ * Returns a map of predicate → boolean, or null if daemon unreachable.
+ */
+export async function checkStatePredicates(
+  predicates: string[]
+): Promise<Record<string, boolean> | null> {
+  if (predicates.length === 0) return {};
+  try {
+    const qs = predicates.map(encodeURIComponent).join(',');
+    const res = await fetch(
+      `http://${DAEMON_HOST}:${DAEMON_PORT}/state/check?predicates=${qs}`,
+      { signal: AbortSignal.timeout(100) }
+    );
+    if (!res.ok) return null;
+    return (await res.json()) as Record<string, boolean>;
+  } catch {
+    return null;
+  }
+}
 
 export const DAEMON_PORT = 7391;
 export const DAEMON_HOST = '127.0.0.1';
@@ -64,7 +111,14 @@ export async function registerDaemonEntry(
   meta?: { agent?: string; mcpServer?: string },
   riskMetadata?: RiskMetadata,
   activityId?: string,
-  cwd?: string
+  cwd?: string,
+  recoveryCommand?: string,
+  /** When true, the daemon skips background authorizeHeadless and holds the entry
+   *  open until the caller resolves it via resolveViaDaemon. Use for recovery menu
+   *  entries where check.ts is the sole decision maker via the tty menu. */
+  skipBackgroundAuth?: boolean,
+  /** When true, the tail shows the card for context only (no interactive keypress). */
+  viewOnly?: boolean
 ): Promise<{ id: string; allowCount: number }> {
   const base = `http://${DAEMON_HOST}:${DAEMON_PORT}`;
   const ctrl = new AbortController();
@@ -84,6 +138,9 @@ export async function registerDaemonEntry(
         activityId,
         ...(riskMetadata && { riskMetadata }),
         ...(cwd && { cwd }),
+        ...(recoveryCommand && { recoveryCommand }),
+        ...(skipBackgroundAuth && { skipBackgroundAuth: true }),
+        ...(viewOnly && { viewOnly: true }),
       }),
       signal: ctrl.signal,
     });
@@ -99,7 +156,7 @@ export async function registerDaemonEntry(
 export async function waitForDaemonDecision(
   id: string,
   signal?: AbortSignal
-): Promise<{ decision: 'allow' | 'deny' | 'abandoned'; source?: string }> {
+): Promise<{ decision: 'allow' | 'deny' | 'abandoned'; source?: string; reason?: string }> {
   const base = `http://${DAEMON_HOST}:${DAEMON_PORT}`;
   const waitCtrl = new AbortController();
   const waitTimer = setTimeout(() => waitCtrl.abort(), 120_000);
@@ -108,10 +165,14 @@ export async function waitForDaemonDecision(
   try {
     const waitRes = await fetch(`${base}/wait/${id}`, { signal: waitCtrl.signal });
     if (!waitRes.ok) return { decision: 'deny' };
-    const { decision, source } = (await waitRes.json()) as { decision: string; source?: string };
+    const { decision, source, reason } = (await waitRes.json()) as {
+      decision: string;
+      source?: string;
+      reason?: string;
+    };
     if (decision === 'allow') return { decision: 'allow', source };
     if (decision === 'abandoned') return { decision: 'abandoned', source };
-    return { decision: 'deny', source };
+    return { decision: 'deny', source, reason };
   } finally {
     clearTimeout(waitTimer);
     if (signal) signal.removeEventListener('abort', onAbort);
