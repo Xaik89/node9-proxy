@@ -1962,3 +1962,453 @@ describe('resolveNode9SaaS — decidedBy field when local racer wins', () => {
     expect(patchBodies[0]).toMatchObject({ decision: 'APPROVED', decidedBy: 'native' });
   });
 });
+
+// ── Observe mode ──────────────────────────────────────────────────────────────
+
+describe('observe mode — always allow, track wouldBlock', () => {
+  it('observe mode allows a tool that would normally be hard-blocked', async () => {
+    mockProjectConfig({
+      settings: { mode: 'observe', approvalTimeoutMs: 0 },
+      policy: {
+        smartRules: [
+          {
+            name: 'block-deploy-script',
+            tool: 'bash',
+            conditions: [{ field: 'command', op: 'matches', value: 'restricted_deploy\\.sh' }],
+            conditionMode: 'all',
+            verdict: 'block',
+            reason: 'deploy script explicitly blocked',
+          },
+        ],
+      },
+    });
+    const result = await authorizeHeadless('bash', {
+      command: './restricted_deploy.sh --env prod',
+    });
+    // Observe mode: must allow even though the rule would block
+    expect(result.approved).toBe(true);
+    // The observeWouldBlock flag marks this as a would-have-been-blocked decision
+    expect(result.observeWouldBlock).toBe(true);
+  });
+
+  it('observe mode allows a DLP-flagged tool call and sets observeWouldBlock', async () => {
+    mockProjectConfig({
+      settings: { mode: 'observe', approvalTimeoutMs: 0 },
+      policy: { dlp: { enabled: true, scanIgnoredTools: false } },
+    });
+    // Fake AWS key split to avoid GitHub secret scanner
+    const FAKE_AWS_KEY = 'AKIA' + 'IOSFODNN7' + 'EXAMPLE';
+    const result = await authorizeHeadless('bash', {
+      command: `echo "${FAKE_AWS_KEY}"`,
+    });
+    expect(result.approved).toBe(true);
+    expect(result.observeWouldBlock).toBe(true);
+  });
+
+  it('observe mode allows a normally-allowed tool and does NOT set observeWouldBlock', async () => {
+    mockProjectConfig({
+      settings: { mode: 'observe', approvalTimeoutMs: 0 },
+      policy: {},
+    });
+    const result = await authorizeHeadless('list_users', {});
+    expect(result.approved).toBe(true);
+    expect(result.observeWouldBlock).toBeFalsy();
+  });
+});
+
+// ── Stateful Smart Rules ──────────────────────────────────────────────────────
+
+describe('stateful smart rules — dependsOnState', () => {
+  // Use a command that does NOT match any built-in default smart rule.
+  // 'git push' is intercepted by the built-in 'review-git-push' (verdict: review)
+  // which fires before project rules in the merged smartRules array.
+  const DEPLOY_CMD = './deploy.sh --env=production';
+  const STATEFUL_RULE = {
+    name: 'require-tests-before-deploy',
+    tool: 'Bash',
+    conditions: [{ field: 'command', op: 'matches', value: './deploy.sh' }],
+    verdict: 'block' as const,
+    reason: 'Run tests before deploying',
+    dependsOnState: ['no_test_passed_since_last_edit'],
+  };
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function stubStateCheck(result: Record<string, boolean> | null) {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockImplementation((url: string) => {
+        if (String(url).includes('/state/check')) {
+          if (result === null) return Promise.reject(new Error('ECONNREFUSED'));
+          // Cast avoids providing the full Response interface in test mocks
+          return Promise.resolve({ ok: true, json: async () => result } as unknown as Response);
+        }
+        // Other fetch calls (cloud SaaS, etc.) — return generic failure
+        return Promise.resolve({
+          ok: false,
+          status: 404,
+          json: async () => ({}),
+        } as unknown as Response);
+      })
+    );
+  }
+
+  it('block rule without dependsOnState always hard-blocks', async () => {
+    mockProjectConfig({
+      settings: { mode: 'standard', approvalTimeoutMs: 100 },
+      policy: {
+        smartRules: [
+          {
+            name: 'block-deploy',
+            tool: 'Bash',
+            conditions: [{ field: 'command', op: 'matches', value: './deploy.sh' }],
+            verdict: 'block',
+            reason: 'No stateful check',
+          },
+        ],
+      },
+    });
+    const result = await authorizeHeadless('Bash', { command: DEPLOY_CMD });
+    expect(result.approved).toBe(false);
+    expect(result.blockedByLabel).toContain('block-deploy');
+    expect(result.blockedBy).toBe('local-config');
+  });
+
+  it('stateful block routes to race engine (not hard-block) when predicate is satisfied', async () => {
+    // DESIGN NOTE: stateful blocks intentionally do NOT hard-block (blockedBy:'local-config').
+    // Instead they fall through to the race engine so a human can override via the approvers
+    // (tail [1]/[2]/[3], native popup, browser). Plain block rules (no dependsOnState) still
+    // hard-block immediately. The distinction: stateful predicates can be wrong; a human must
+    // always have a chance to override without needing to edit config.
+    //
+    // In this test all interactive channels are disabled, so the timeout racer fires.
+    // In production with `node9 tail` running, the STATE GUARD card would appear instead.
+    stubStateCheck({ no_test_passed_since_last_edit: true });
+    mockProjectConfig({
+      settings: { mode: 'standard', approvalTimeoutMs: 500 },
+      policy: { smartRules: [STATEFUL_RULE] },
+    });
+    const result = await authorizeHeadless('Bash', { command: DEPLOY_CMD });
+    expect(result.approved).toBe(false);
+    expect(result.blockedBy).toBe('timeout'); // race engine, NOT 'local-config' (by design)
+    expect(result.blockedBy).not.toBe('local-config'); // plain block rules return 'local-config'
+  });
+
+  it('block rule with dependsOnState is skipped when predicate is false', async () => {
+    stubStateCheck({ no_test_passed_since_last_edit: false });
+    mockProjectConfig({
+      settings: { mode: 'standard', approvalTimeoutMs: 100, approvers: { native: false } },
+      policy: { smartRules: [STATEFUL_RULE] },
+    });
+    // Predicate false → rule does not apply → race engine runs → timeout
+    const result = await authorizeHeadless('Bash', { command: DEPLOY_CMD });
+    expect(result.approved).toBe(false);
+    expect(result.blockedBy).toBe('timeout'); // race engine ran, not hard-blocked
+    expect(result.blockedByLabel).not.toContain('require-tests-before-deploy');
+    expect(result.blockedBy).not.toBe('local-config');
+  });
+
+  it('block rule with dependsOnState is skipped when daemon is unreachable', async () => {
+    stubStateCheck(null); // simulate ECONNREFUSED
+    mockProjectConfig({
+      settings: { mode: 'standard', approvalTimeoutMs: 100, approvers: { native: false } },
+      policy: { smartRules: [STATEFUL_RULE] },
+    });
+    // Fail-open: predicate state unknown → stateful block skipped → race engine runs.
+    // With no interactive approver and approvalTimeoutMs:100, the timeout racer fires.
+    // approved:false + blockedBy:'timeout' = the tool call IS DENIED (hard deny via
+    // timeout, not a stateful hard-block). The tool does NOT proceed.
+    const result = await authorizeHeadless('Bash', { command: DEPLOY_CMD });
+    expect(result.approved).toBe(false); // call is DENIED — timeout is a hard deny
+    expect(result.blockedBy).toBe('timeout'); // denied by timeout racer, not stateful rule
+    expect(result.blockedByLabel).not.toContain('require-tests-before-deploy');
+    expect(result.blockedBy).not.toBe('local-config');
+  });
+
+  it('block rule with dependsOnState is skipped when predicate key is missing from response', async () => {
+    // Daemon returns {} — predicate key absent.
+    // Missing key should be treated as predicate=false (fail-open), not throw.
+    stubStateCheck({}); // key 'no_test_passed_since_last_edit' is absent
+    mockProjectConfig({
+      settings: { mode: 'standard', approvalTimeoutMs: 100, approvers: { native: false } },
+      policy: { smartRules: [STATEFUL_RULE] },
+    });
+    const result = await authorizeHeadless('Bash', { command: DEPLOY_CMD });
+    expect(result.approved).toBe(false);
+    expect(result.blockedBy).toBe('timeout'); // fail-open: rule did not hard-block
+    expect(result.blockedBy).not.toBe('local-config');
+  });
+
+  it('block rule with dependsOnState is skipped when /state/check hangs past 100ms', async () => {
+    // Simulate a hanging /state/check call.
+    // checkStatePredicates uses AbortSignal.timeout(100) — after 100ms the signal
+    // fires and the fetch must reject for the function to return null (fail-open).
+    // The mock must wire the signal so it honours the abort.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockImplementation((url: string, init?: RequestInit) => {
+        if (String(url).includes('/state/check')) {
+          return new Promise<never>((_, reject) => {
+            const signal = init?.signal;
+            if (signal) {
+              const onAbort = () => reject(signal.reason ?? new Error('AbortError'));
+              if (signal.aborted) {
+                onAbort();
+              } else {
+                signal.addEventListener('abort', onAbort, { once: true });
+              }
+            }
+          });
+        }
+        return Promise.resolve({ ok: false, status: 404, json: async () => ({}) });
+      })
+    );
+    mockProjectConfig({
+      settings: { mode: 'standard', approvalTimeoutMs: 500, approvers: { native: false } },
+      policy: { smartRules: [STATEFUL_RULE] },
+    });
+    const result = await authorizeHeadless('Bash', { command: DEPLOY_CMD });
+    expect(result.approved).toBe(false);
+    expect(result.blockedBy).toBe('timeout'); // fail-open: rule did not hard-block
+    expect(result.blockedBy).not.toBe('local-config');
+  });
+
+  it('evaluatePolicy returns dependsOnStatePredicates for a stateful block rule', async () => {
+    mockProjectConfig({
+      settings: { mode: 'standard' },
+      policy: { smartRules: [STATEFUL_RULE] },
+    });
+    const policyResult = await evaluatePolicy('Bash', { command: DEPLOY_CMD });
+    expect(policyResult.decision).toBe('block');
+    expect(policyResult.dependsOnStatePredicates).toEqual(['no_test_passed_since_last_edit']);
+  });
+
+  it('evaluatePolicy does NOT return dependsOnStatePredicates for a plain block rule', async () => {
+    mockProjectConfig({
+      settings: { mode: 'standard' },
+      policy: {
+        smartRules: [
+          {
+            name: 'plain-block',
+            tool: 'Bash',
+            conditions: [{ field: 'command', op: 'matches', value: 'rm -rf' }],
+            verdict: 'block',
+          },
+        ],
+      },
+    });
+    const policyResult = await evaluatePolicy('Bash', { command: 'rm -rf /' });
+    expect(policyResult.decision).toBe('block');
+    expect(policyResult.dependsOnStatePredicates).toBeUndefined();
+  });
+
+  it('unknown predicate name in dependsOnState is filtered out — does not disable other rules', async () => {
+    // Unknown predicate names are stripped by the schema transform (not rejected with
+    // a Zod error). This prevents sanitizeConfig from dropping the entire `policy`
+    // key, which would silently disable ALL smart rules including unrelated ones.
+    // Result: the rule survives with an empty dependsOnState array → treated as a
+    // plain block rule (no state check) → hard-blocks immediately.
+    mockProjectConfig({
+      settings: { mode: 'standard', approvalTimeoutMs: 100 },
+      policy: {
+        smartRules: [
+          {
+            name: 'bad-predicate',
+            tool: 'Bash',
+            conditions: [{ field: 'command', op: 'matches', value: './deploy.sh' }],
+            verdict: 'block',
+            dependsOnState: ['unknown_predicate_name'],
+          },
+        ],
+      },
+    });
+    const policyResult = await evaluatePolicy('Bash', { command: DEPLOY_CMD });
+    // Unknown name is filtered out — rule still exists but has no active predicates
+    expect(policyResult.dependsOnStatePredicates?.length ?? 0).toBe(0);
+    // Rule itself must still be present (not dropped entirely)
+    expect(policyResult.decision).toBe('block');
+  });
+
+  it('registerDaemonEntry sends recoveryCommand in POST body', async () => {
+    // registerDaemonEntry is only invoked when isDaemonRunning()=true (guarded
+    // in the orchestrator). Test the contract directly: recoveryCommand must
+    // appear in the JSON body so the daemon can pass it to the tail card.
+    const { registerDaemonEntry } = await import('../auth/daemon.js');
+    const capturedBodies: Record<string, unknown>[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockImplementation(async (_url: string, init?: RequestInit) => {
+        if (init?.body)
+          capturedBodies.push(JSON.parse(init.body as string) as Record<string, unknown>);
+        return { ok: true, json: async () => ({ id: 'test-id', allowCount: 1 }) };
+      })
+    );
+    await registerDaemonEntry(
+      'Bash',
+      { command: './deploy.sh' },
+      undefined, // meta
+      undefined, // riskMetadata
+      undefined, // activityId
+      undefined, // cwd
+      'npm test' // recoveryCommand
+    );
+    expect(capturedBodies[0]?.recoveryCommand).toBe('npm test');
+  });
+
+  it('recoveryCommand is included in AuthResult for a plain block rule', async () => {
+    mockProjectConfig({
+      settings: { mode: 'standard', approvalTimeoutMs: 100 },
+      policy: {
+        smartRules: [
+          {
+            name: 'block-deploy',
+            tool: 'Bash',
+            conditions: [{ field: 'command', op: 'matches', value: './deploy.sh' }],
+            verdict: 'block',
+            reason: 'Must run tests first',
+            recoveryCommand: 'npm test',
+          },
+        ],
+      },
+    });
+    const result = await authorizeHeadless('Bash', { command: DEPLOY_CMD });
+    expect(result.approved).toBe(false);
+    expect(result.recoveryCommand).toBe('npm test');
+  });
+
+  it('recoveryCommand is undefined when not set on the rule', async () => {
+    mockProjectConfig({
+      settings: { mode: 'standard', approvalTimeoutMs: 100 },
+      policy: {
+        smartRules: [
+          {
+            name: 'block-deploy',
+            tool: 'Bash',
+            conditions: [{ field: 'command', op: 'matches', value: './deploy.sh' }],
+            verdict: 'block',
+          },
+        ],
+      },
+    });
+    const result = await authorizeHeadless('Bash', { command: DEPLOY_CMD });
+    expect(result.approved).toBe(false);
+    expect(result.recoveryCommand).toBeUndefined();
+  });
+
+  it('evaluatePolicy returns recoveryCommand for a block rule', async () => {
+    mockProjectConfig({
+      settings: { mode: 'standard' },
+      policy: {
+        smartRules: [
+          {
+            ...STATEFUL_RULE,
+            recoveryCommand: 'npm test',
+          },
+        ],
+      },
+    });
+    const policyResult = await evaluatePolicy('Bash', { command: DEPLOY_CMD });
+    expect(policyResult.decision).toBe('block');
+    expect(policyResult.recoveryCommand).toBe('npm test');
+  });
+
+  it('stateful block with recoveryCommand falls through to race engine (not auto-blocked)', async () => {
+    // When predicates are met, the orchestrator now routes to the race engine so
+    // the human decides via the approvers (tail/native/browser). The hook process
+    // waits for a daemon decision rather than showing a /dev/tty menu.
+    // In test mode (NODE9_TESTING=1) all interactive racers are disabled, so
+    // the approvalTimeoutMs racer fires → approved: false, blockedBy: 'timeout'.
+    stubStateCheck({ no_test_passed_since_last_edit: true });
+    mockProjectConfig({
+      settings: { mode: 'standard', approvalTimeoutMs: 500 },
+      policy: {
+        smartRules: [
+          {
+            ...STATEFUL_RULE,
+            recoveryCommand: 'npm test',
+          },
+        ],
+      },
+    });
+    const result = await authorizeHeadless('Bash', { command: DEPLOY_CMD });
+    expect(result.approved).toBe(false);
+    // Reaches race engine → blocked by timeout (no interactive channels in test)
+    expect(result.blockedBy).toBe('timeout');
+  });
+
+  it('stateful block without recoveryCommand also falls through to race engine', async () => {
+    stubStateCheck({ no_test_passed_since_last_edit: true });
+    mockProjectConfig({
+      settings: { mode: 'standard', approvalTimeoutMs: 500 },
+      policy: {
+        smartRules: [STATEFUL_RULE],
+      },
+    });
+    const result = await authorizeHeadless('Bash', { command: DEPLOY_CMD });
+    expect(result.approved).toBe(false);
+    expect(result.blockedBy).toBe('timeout');
+  });
+
+  it('plain (non-stateful) block rule with recoveryCommand still hard-blocks immediately', async () => {
+    // Non-stateful block rules do NOT go through the race engine — they auto-block.
+    mockProjectConfig({
+      settings: { mode: 'standard', approvalTimeoutMs: 100 },
+      policy: {
+        smartRules: [
+          {
+            name: 'block-deploy',
+            tool: 'Bash',
+            conditions: [{ field: 'command', op: 'matches', value: './deploy.sh' }],
+            verdict: 'block',
+            reason: 'Must run tests first',
+            recoveryCommand: 'npm test',
+          },
+        ],
+      },
+    });
+    const result = await authorizeHeadless('Bash', { command: DEPLOY_CMD });
+    expect(result.approved).toBe(false);
+    expect(result.blockedBy).toBe('local-config');
+    expect(result.recoveryCommand).toBe('npm test');
+  });
+
+  it('dependsOnState uses AND semantics — all predicates must be === true', async () => {
+    // The schema currently has one valid predicate. AND semantics are tested by
+    // verifying that a daemon response where the predicate key is absent (undefined)
+    // is treated as false — i.e. every(p => result[p] === true) uses strict equality.
+    // This ensures a partial response does not accidentally satisfy the predicate.
+
+    // Predicate key present and true → predicates met → race engine fires
+    stubStateCheck({ no_test_passed_since_last_edit: true });
+    mockProjectConfig({
+      settings: { mode: 'standard', approvalTimeoutMs: 100, approvers: { native: false } },
+      policy: { smartRules: [STATEFUL_RULE] },
+    });
+    const predicateMet = await authorizeHeadless('Bash', { command: DEPLOY_CMD });
+    expect(predicateMet.blockedBy).toBe('timeout'); // race engine, not hard-block
+
+    // Predicate key present but false → AND fails → fail-open (race engine, no recovery card)
+    _resetConfigCache();
+    stubStateCheck({ no_test_passed_since_last_edit: false });
+    mockProjectConfig({
+      settings: { mode: 'standard', approvalTimeoutMs: 100, approvers: { native: false } },
+      policy: { smartRules: [STATEFUL_RULE] },
+    });
+    const predicateFalse = await authorizeHeadless('Bash', { command: DEPLOY_CMD });
+    expect(predicateFalse.blockedBy).toBe('timeout');
+    expect(predicateFalse.blockedBy).not.toBe('local-config');
+
+    // Predicate key absent (undefined !== true) → AND fails → same fail-open behaviour
+    _resetConfigCache();
+    stubStateCheck({}); // key missing entirely
+    mockProjectConfig({
+      settings: { mode: 'standard', approvalTimeoutMs: 100, approvers: { native: false } },
+      policy: { smartRules: [STATEFUL_RULE] },
+    });
+    const predicateAbsent = await authorizeHeadless('Bash', { command: DEPLOY_CMD });
+    expect(predicateAbsent.blockedBy).toBe('timeout');
+    expect(predicateAbsent.blockedBy).not.toBe('local-config');
+  });
+});

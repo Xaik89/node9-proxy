@@ -254,6 +254,10 @@ export async function evaluatePolicy(
   matchedWord?: string;
   tier?: 1 | 2 | 3 | 4 | 5 | 6 | 7;
   ruleName?: string;
+  /** State predicates from the matched smart rule (only when decision is 'block'). */
+  dependsOnStatePredicates?: string[];
+  /** Recovery command to suggest when this rule hard-blocks (from SmartRule.recoveryCommand). */
+  recoveryCommand?: string;
 }> {
   const config = getConfig();
 
@@ -274,6 +278,14 @@ export async function evaluatePolicy(
         reason: matchedRule.reason,
         tier: 2,
         ruleName: matchedRule.name ?? matchedRule.tool,
+        ...(matchedRule.verdict === 'block' &&
+          matchedRule.dependsOnState?.length && {
+            dependsOnStatePredicates: matchedRule.dependsOnState,
+          }),
+        ...(matchedRule.verdict === 'block' &&
+          matchedRule.recoveryCommand && {
+            recoveryCommand: matchedRule.recoveryCommand,
+          }),
       };
     }
   }

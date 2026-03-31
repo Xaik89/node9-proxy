@@ -553,3 +553,63 @@ export async function setupCursor(): Promise<void> {
     printDaemonTip();
   }
 }
+
+// ── HUD (Claude Code statusLine) ─────────────────────────────────────────────
+
+export function setupHud(): void {
+  const homeDir = os.homedir();
+  const hooksPath = path.join(homeDir, '.claude', 'settings.json');
+
+  const settings = readJson<ClaudeSettings>(hooksPath) ?? {};
+
+  const hudCommand = fullPathCommand('hud');
+  // Claude Code expects statusLine as { command: string }, not a bare string.
+  const statusLineObj = { type: 'command', command: hudCommand };
+  const existing = settings.statusLine as { type?: string; command?: string } | string | undefined;
+  const existingCommand = typeof existing === 'object' ? existing?.command : existing;
+
+  if (existingCommand === hudCommand) {
+    console.log(chalk.blue('ℹ️  node9 HUD is already configured in ~/.claude/settings.json'));
+    console.log(chalk.gray('   Restart Claude Code to activate.'));
+    return;
+  }
+
+  if (existing && existingCommand !== hudCommand) {
+    console.log(
+      chalk.yellow(
+        `  ⚠️  statusLine is already set to: "${existingCommand}"\n` +
+          `     Overwriting with node9 HUD.`
+      )
+    );
+  }
+
+  settings.statusLine = statusLineObj as unknown as string;
+  writeJson(hooksPath, settings);
+
+  console.log(chalk.green.bold('✅ node9 HUD added to Claude Code statusline'));
+  console.log(chalk.gray('   Settings: ~/.claude/settings.json'));
+  console.log(chalk.gray('   Restart Claude Code to activate.'));
+}
+
+export function teardownHud(): void {
+  const homeDir = os.homedir();
+  const hooksPath = path.join(homeDir, '.claude', 'settings.json');
+
+  const settings = readJson<ClaudeSettings>(hooksPath);
+  if (!settings) {
+    console.log(chalk.blue('  ℹ️  ~/.claude/settings.json not found — nothing to remove'));
+    return;
+  }
+
+  const existing = settings.statusLine as { command?: string } | string | undefined;
+  const existingCommand = typeof existing === 'object' ? existing?.command : existing;
+  if (!existingCommand || !String(existingCommand).includes('node9')) {
+    console.log(chalk.blue('  ℹ️  node9 HUD not found in ~/.claude/settings.json'));
+    return;
+  }
+
+  delete settings.statusLine;
+  writeJson(hooksPath, settings);
+  console.log(chalk.green('  ✅ node9 HUD removed from ~/.claude/settings.json'));
+  console.log(chalk.gray('   Restart Claude Code for changes to take effect.'));
+}

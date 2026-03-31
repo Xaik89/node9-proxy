@@ -95,7 +95,12 @@ export function registerCheckCommand(program: Command): void {
           // ── THE NEGOTIATION LOOP (TALKING BACK TO THE AI) ───────────────
           const sendBlock = (
             msg: string,
-            result?: { blockedBy?: string; changeHint?: string; blockedByLabel?: string }
+            result?: {
+              blockedBy?: string;
+              changeHint?: string;
+              blockedByLabel?: string;
+              recoveryCommand?: string;
+            }
           ) => {
             // 1. Determine the context (User vs Policy)
             const blockedByContext =
@@ -129,6 +134,8 @@ export function registerCheckCommand(program: Command): void {
               }
               writeTty(chalk.gray(`   Triggered by: ${blockedByContext}`));
               if (result?.changeHint) writeTty(chalk.cyan(`   To change:  ${result.changeHint}`));
+              if (result?.recoveryCommand)
+                writeTty(chalk.green(`   💡 Run:      ${result.recoveryCommand}`));
               writeTty('');
             } catch {
               // /dev/tty unavailable (CI, non-interactive) — skip visual output
@@ -145,7 +152,8 @@ export function registerCheckCommand(program: Command): void {
             const aiFeedbackMessage = buildNegotiationMessage(
               blockedByContext,
               isHumanDecision,
-              msg
+              msg,
+              result?.recoveryCommand
             );
 
             // 5. Send the structured JSON back to the LLM agent

@@ -55,6 +55,18 @@ export const SmartRuleSchema = z.object({
     errorMap: () => ({ message: 'verdict must be one of: allow, review, block' }),
   }),
   reason: z.string().optional(),
+  // Unknown predicate names are filtered out rather than failing the whole rule.
+  // Failing the whole z.array() would cause sanitizeConfig to drop the entire
+  // `policy` top-level key, silently disabling ALL smart rules in the config.
+  dependsOnState: z
+    .array(z.string())
+    .transform((arr) =>
+      arr.filter(
+        (p): p is 'no_test_passed_since_last_edit' => p === 'no_test_passed_since_last_edit'
+      )
+    )
+    .optional(),
+  recoveryCommand: z.string().optional(),
 });
 
 // ── Top-level Config ─────────────────────────────────────────────────────────
@@ -64,7 +76,7 @@ export const ConfigFileSchema = z
     version: z.string().optional(),
     settings: z
       .object({
-        mode: z.enum(['standard', 'strict', 'audit']).optional(),
+        mode: z.enum(['standard', 'strict', 'audit', 'observe']).optional(),
         autoStartDaemon: z.boolean().optional(),
         enableUndo: z.boolean().optional(),
         enableHookLogDebug: z.boolean().optional(),

@@ -409,13 +409,66 @@ Smart Rules match on **raw tool arguments** using structured conditions:
 
 **Smart Rule fields:**
 
-| Field           | Description                                                                          |
-| :-------------- | :----------------------------------------------------------------------------------- |
-| `tool`          | Tool name or glob (`"bash"`, `"mcp__postgres__*"`, `"*"`)                            |
-| `conditions`    | Array of conditions evaluated against the raw args object                            |
-| `conditionMode` | `"all"` (AND, default) or `"any"` (OR)                                               |
-| `verdict`       | `"review"` (approval prompt) \| `"block"` (hard deny) \| `"allow"` (skip all checks) |
-| `reason`        | Human-readable explanation shown in the approval prompt and audit log                |
+| Field             | Description                                                                                                                                                                                                                              |
+| :---------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tool`            | Tool name or glob (`"bash"`, `"mcp__postgres__*"`, `"*"`)                                                                                                                                                                                |
+| `conditions`      | Array of conditions evaluated against the raw args object                                                                                                                                                                                |
+| `conditionMode`   | `"all"` (AND, default) or `"any"` (OR)                                                                                                                                                                                                   |
+| `verdict`         | `"review"` (approval prompt) \| `"block"` (hard deny) \| `"allow"` (skip all checks)                                                                                                                                                     |
+| `reason`          | Human-readable explanation shown in the approval prompt and audit log                                                                                                                                                                    |
+| `dependsOnState`  | _(optional)_ Array of state predicates — block only fires when **all** are true. If any predicate is false or the daemon is unreachable the rule is downgraded to review (fail-open). See [Stateful Rules](#stateful-smart-rules) below. |
+| `recoveryCommand` | _(optional)_ Shell command to suggest when the rule blocks — shown on terminal as `💡 Run: npm test` and sent to the AI as a negotiation hint.                                                                                           |
+
+### Stateful Smart Rules
+
+Stateful rules let you block actions based on **what the AI has done earlier in the session**, not just what it's doing now. The canonical use case: block deployment unless a test has passed since the last file edit.
+
+```json
+{
+  "policy": {
+    "smartRules": [
+      {
+        "name": "require-tests-before-deploy",
+        "tool": "Bash",
+        "conditions": [
+          {
+            "field": "command",
+            "op": "matches",
+            "value": "./deploy.sh|kubectl apply|npm run deploy"
+          }
+        ],
+        "verdict": "block",
+        "reason": "Run tests before deploying",
+        "dependsOnState": ["no_test_passed_since_last_edit"],
+        "recoveryCommand": "npm test"
+      }
+    ]
+  }
+}
+```
+
+**How it works:**
+
+1. The AI attempts a deploy command.
+2. Node9 checks the daemon: _"Has a test passed since the last file edit?"_
+3. **If no** → routes to the race engine. Terminal shows the STATE GUARD card with `[1] Allow / [2] Redirect AI to run tests / [3] Deny`. The AI receives a negotiation hint to run `npm test` first if the human redirects.
+4. **If yes** → the rule is skipped, normal approval flow continues.
+5. **Daemon unreachable** → fail-open, rule is skipped.
+
+> **⚠️ Security note — fail-open behaviour:** When the daemon is unreachable, stateful block rules are silently downgraded to review. This is intentional (availability over lockout), but it means a network disruption can temporarily weaken these rules. A per-rule `failMode: 'closed'` option is planned. If you need a hard guarantee, use a plain block rule (no `dependsOnState`) instead.
+
+**State is tracked automatically** — no config required beyond the rule itself:
+
+- File edits are detected from `Edit`, `Write`, `MultiEdit` tool calls.
+- Test results are detected from the PostToolUse hook reading command output. Supported runners: `vitest`, `jest`, `mocha`, `pytest`, `cargo test`, `go test`, `rspec`, `phpunit`, `dotnet test`.
+
+**Available predicates:**
+
+| Predicate                        | True when                                                     |
+| :------------------------------- | :------------------------------------------------------------ |
+| `no_test_passed_since_last_edit` | A file was edited and no passing test has been recorded since |
+
+> **Requires the node9 daemon** (`node9 daemon start`). Without the daemon the predicate is always unknown → fail-open.
 
 **Condition operators:**
 

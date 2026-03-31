@@ -53,6 +53,9 @@ import {
   insightCounts,
   loadInsightCounts,
   saveInsightCounts,
+  sessionCounters,
+  sessionHistory,
+  type HudStatus,
 } from './state';
 import { patchConfig, GLOBAL_CONFIG_PATH, type ConfigPatch } from '../config/patch.js';
 import { SmartRuleSchema } from '../config-schema.js';
@@ -136,6 +139,8 @@ export function startDaemon(): void {
             toolName: e.toolName,
             args: e.args,
             riskMetadata: e.riskMetadata,
+            ...(e.recoveryCommand && { recoveryCommand: e.recoveryCommand }),
+            ...(e.viewOnly && { viewOnly: true }),
             slackDelegated: e.slackDelegated,
             timestamp: e.timestamp,
             agent: e.agent,
@@ -199,6 +204,9 @@ export function startDaemon(): void {
           agent,
           mcpServer,
           riskMetadata,
+          recoveryCommand,
+          skipBackgroundAuth = false,
+          viewOnly = false,
           fromCLI = false,
           activityId,
           cwd,
@@ -212,6 +220,8 @@ export function startDaemon(): void {
           toolName,
           args,
           riskMetadata: riskMetadata ?? undefined,
+          ...(typeof recoveryCommand === 'string' && recoveryCommand && { recoveryCommand }),
+          ...(viewOnly && { viewOnly: true }),
           agent: typeof agent === 'string' ? agent : undefined,
           mcpServer: typeof mcpServer === 'string' ? mcpServer : undefined,
           slackDelegated: !!slackDelegated,
@@ -264,6 +274,8 @@ export function startDaemon(): void {
             toolName,
             args,
             riskMetadata: entry.riskMetadata,
+            ...(entry.recoveryCommand && { recoveryCommand: entry.recoveryCommand }),
+            ...(entry.viewOnly && { viewOnly: true }),
             slackDelegated: entry.slackDelegated,
             agent: entry.agent,
             mcpServer: entry.mcpServer,
@@ -289,7 +301,9 @@ export function startDaemon(): void {
         // Skip when slackDelegated: the hook process already owns the cloud race for this
         // request — running a second initNode9SaaS here would create a duplicate pending
         // cloud request that never gets resolved.
-        if (slackDelegated) return;
+        // Skip when skipBackgroundAuth: check.ts owns the recovery menu decision and will
+        // resolve the entry via /resolve/ after the tty menu completes.
+        if (slackDelegated || skipBackgroundAuth) return;
         authorizeHeadless(
           toolName,
           args,
@@ -474,7 +488,7 @@ export function startDaemon(): void {
 
         // source is validated against an allowlist AFTER appendAuditLog so the
         // raw user-supplied value never reaches any log string — no log injection.
-        const VALID_SOURCES = new Set(['terminal', 'browser', 'native']);
+        const VALID_SOURCES = new Set(['terminal', 'browser', 'native', 'terminal-redirect']);
         if (source && VALID_SOURCES.has(source)) entry.decisionSource = source;
         if (entry.waiter) {
           entry.waiter(resolvedDecision, reason);
@@ -503,6 +517,43 @@ export function startDaemon(): void {
         res.writeHead(500, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ error: 'internal' }));
       }
+    }
+
+    if (req.method === 'GET' && pathname === '/status') {
+      try {
+        const s = getGlobalSettings();
+        const counters = sessionCounters.get();
+        const mode = (s.mode ?? 'standard') as HudStatus['mode'];
+        const status: HudStatus = {
+          mode,
+          session: {
+            allowed: counters.allowed,
+            blocked: counters.blocked,
+            dlpHits: counters.dlpHits,
+            wouldBlock: counters.wouldBlock,
+          },
+          taintedCount: taintStore.list().length,
+          lastRuleHit: counters.lastRuleHit,
+          lastBlockedTool: counters.lastBlockedTool,
+        };
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify(status));
+      } catch (err) {
+        console.error(chalk.red('[node9 daemon] GET /status failed:'), err);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: 'internal' }));
+      }
+    }
+
+    if (req.method === 'GET' && pathname === '/state/check') {
+      const predicatesParam = reqUrl.searchParams.get('predicates') ?? '';
+      const predicates = predicatesParam.split(',').filter(Boolean);
+      const results: Record<string, boolean> = {};
+      for (const p of predicates) {
+        results[p] = sessionHistory.checkPredicate(p);
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify(results));
     }
 
     if (req.method === 'POST' && pathname === '/settings') {

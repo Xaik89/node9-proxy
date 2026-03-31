@@ -30,6 +30,14 @@ export interface SmartRule {
   conditionMode?: 'all' | 'any';
   verdict: 'allow' | 'review' | 'block';
   reason?: string;
+  /** State predicates that must ALL be true for a 'block' verdict to apply.
+   *  If any predicate is false (or the daemon is unreachable), the block is
+   *  downgraded to a review. Ignored for 'allow' and 'review' verdicts. */
+  dependsOnState?: string[];
+  /** Shell command to suggest as a recovery action when this rule hard-blocks.
+   *  Shown to the developer on /dev/tty and passed to the AI as a hint.
+   *  Example: "npm test" */
+  recoveryCommand?: string;
 }
 
 export interface EnvironmentConfig {
@@ -49,6 +57,9 @@ export interface Config {
     auditHashArgs?: boolean;
     approvers: { native: boolean; browser: boolean; cloud: boolean; terminal: boolean };
     environment?: string;
+    hud?: {
+      showEnvironmentCounts?: boolean;
+    };
   };
   policy: {
     sandboxPaths: string[];
@@ -496,6 +507,7 @@ export function getConfig(cwd?: string): Config {
     if (s.approvalTimeoutSeconds !== undefined && s.approvalTimeoutMs === undefined)
       mergedSettings.approvalTimeoutMs = s.approvalTimeoutSeconds * 1000;
     if (s.environment !== undefined) mergedSettings.environment = s.environment;
+    if (s.hud !== undefined) mergedSettings.hud = { ...mergedSettings.hud, ...s.hud };
 
     if (p.sandboxPaths) mergedPolicy.sandboxPaths.push(...p.sandboxPaths);
     if (p.ignoredTools) mergedPolicy.ignoredTools.push(...p.ignoredTools);
@@ -504,7 +516,16 @@ export function getConfig(cwd?: string): Config {
 
     if (p.toolInspection)
       mergedPolicy.toolInspection = { ...mergedPolicy.toolInspection, ...p.toolInspection };
-    if (p.smartRules) mergedPolicy.smartRules.push(...p.smartRules);
+    // Project rules are inserted between default block rules and default review/allow rules.
+    // This gives project rules priority over built-in review rules (e.g. a stateful block
+    // rule fires before the default review-git-push) while preserving the Layer 1 invariant:
+    // built-in block rules (rm-rf-home, force-push) always fire first and cannot be
+    // bypassed by a project allow rule.
+    if (p.smartRules) {
+      const defaultBlocks = mergedPolicy.smartRules.filter((r) => r.verdict === 'block');
+      const defaultNonBlocks = mergedPolicy.smartRules.filter((r) => r.verdict !== 'block');
+      mergedPolicy.smartRules = [...defaultBlocks, ...p.smartRules, ...defaultNonBlocks];
+    }
     if (p.snapshot) {
       const s = p.snapshot as Partial<Config['policy']['snapshot']>;
       if (s.tools) mergedPolicy.snapshot.tools.push(...s.tools);
