@@ -6,7 +6,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { DEFAULT_CONFIG } from '../../core';
-import { setupClaude, setupGemini, setupCursor, detectAgents } from '../../setup';
+import { setupClaude, setupGemini, setupCursor, setupHud, detectAgents } from '../../setup';
 
 export function registerInitCommand(program: Command): void {
   program
@@ -70,6 +70,15 @@ export function registerInitCommand(program: Command): void {
         if (agent === 'claude') await setupClaude();
         else if (agent === 'gemini') await setupGemini();
         else if (agent === 'cursor') await setupCursor();
+        console.log('');
+      }
+
+      // Wire HUD automatically when Claude Code is detected — it writes to the
+      // same settings.json that setupClaude already touched, so no extra prompt.
+      if (detected.claude) {
+        setupHud();
+        console.log(chalk.green('✅ node9 HUD added to Claude Code statusline'));
+        console.log(chalk.gray('   Restart Claude Code to activate the security statusline.'));
         console.log('');
       }
 

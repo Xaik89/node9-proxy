@@ -507,19 +507,60 @@ Use `node9 explain <tool> <args>` to dry-run any tool call and see exactly which
 }
 ```
 
-| Key                  | Default   | Description                                                                     |
-| :------------------- | :-------- | :------------------------------------------------------------------------------ |
-| `mode`               | `"audit"` | `audit` (log-only) \| `standard` (approve/block) \| `strict` (deny by default)  |
-| `enableUndo`         | `true`    | Take git snapshots before every AI file edit                                    |
-| `flightRecorder`     | `true`    | Record tool call activity to the flight recorder ring buffer for the browser UI |
-| `approvalTimeoutMs`  | `30000`   | Auto-deny after N ms if no human responds (`0` = wait forever)                  |
-| `approvers.native`   | `true`    | OS-native popup                                                                 |
-| `approvers.browser`  | `true`    | Browser dashboard (`node9 daemon`)                                              |
-| `approvers.cloud`    | `false`   | Slack / SaaS approval — requires `node9 login`; opt-in only                     |
-| `approvers.terminal` | `true`    | `[Y/n]` prompt in terminal                                                      |
+| Key                  | Default   | Description                                                                                   |
+| :------------------- | :-------- | :-------------------------------------------------------------------------------------------- |
+| `mode`               | `"audit"` | `audit` \| `observe` \| `standard` \| `strict` — see [Security Modes](#-security-modes) below |
+| `enableUndo`         | `true`    | Take git snapshots before every AI file edit                                                  |
+| `flightRecorder`     | `true`    | Record tool call activity to the flight recorder ring buffer for the browser UI               |
+| `approvalTimeoutMs`  | `30000`   | Auto-deny after N ms if no human responds (`0` = wait forever)                                |
+| `approvers.native`   | `true`    | OS-native popup                                                                               |
+| `approvers.browser`  | `true`    | Browser dashboard (`node9 daemon`)                                                            |
+| `approvers.cloud`    | `false`   | Slack / SaaS approval — requires `node9 login`; opt-in only                                   |
+| `approvers.terminal` | `true`    | `[Y/n]` prompt in terminal                                                                    |
 
-> **Tip — choosing a mode:**
-> Start with the default `audit` to observe what your agent does without blocking anything. Once you understand its behaviour, switch to `standard` (blocks dangerous commands with human approval) or `strict` (denies anything not explicitly allowed) in your `~/.node9/config.json` or project `node9.config.json`.
+## 🔒 Security Modes
+
+| Mode       | Blocks? | Runs rules? | Use when                                                                     |
+| :--------- | :------ | :---------- | :--------------------------------------------------------------------------- |
+| `audit`    | Never   | No          | You want a log of every tool call but never want node9 to interfere          |
+| `observe`  | Never   | Yes         | New install — see what _would_ have been blocked before enabling enforcement |
+| `standard` | Yes     | Yes         | Normal use — dangerous commands need human approval                          |
+| `strict`   | Yes     | Yes         | High-security — anything not explicitly allowed is denied                    |
+
+**`audit` vs `observe`:** Both never block. The difference is that `audit` skips the policy pipeline entirely (zero overhead, pure logging), while `observe` runs smart rules and DLP in full — recording each `would-block` decision without acting on it. The HUD shows `⚠ N would-block` in observe mode so you can see what enforcement would look like in practice.
+
+**Recommended path:** start on `observe` for a few days to build confidence, then switch to `standard`.
+
+---
+
+## 🛡️ Security Statusline (HUD)
+
+When Claude Code is detected, `node9 init` automatically adds a **security statusline** to Claude Code's terminal UI. You can also add it manually:
+
+```bash
+node9 setup hud        # add to ~/.claude/settings.json
+node9 setup hud --remove
+```
+
+The HUD renders up to three lines below Claude Code's prompt:
+
+```
+🛡 node9  |  standard  |  ✅ 14 allowed  🛑 1 blocked  ⚡ require-tests-before-deploy
+claude-opus-4-5  │ ctx ████████░░ 82%  │ 5h ██████░░░░ 61% (43m left)
+2 CLAUDE.md  |  5 rules  |  3 MCPs  |  2 hooks
+```
+
+| Segment            | Source                      | Notes                                                    |
+| :----------------- | :-------------------------- | :------------------------------------------------------- |
+| `standard`         | daemon: current mode        | changes colour in `strict` (red) and `observe` (magenta) |
+| `✅ N allowed`     | daemon: session counters    | resets when the daemon restarts                          |
+| `🛑 N blocked`     | daemon: session counters    | shown in red when > 0                                    |
+| `⚠ N would-block`  | daemon: session counters    | shown instead of blocked/allowed in `observe` mode       |
+| `⚡ rule-name`     | daemon: last smart rule hit | most recent rule that fired                              |
+| Context bar        | Claude Code stdin           | token usage and rate limit windows                       |
+| Environment counts | local config files          | CLAUDE.md / rules / MCPs / hooks active in this project  |
+
+When the daemon is not running the HUD shows `🛡 node9 | offline` instead of an error.
 
 ---
 
@@ -529,7 +570,8 @@ Use `node9 explain <tool> <args>` to dry-run any tool call and see exactly which
 | :----------------------------------- | :------------------------------------------------------------------------------------ |
 | `node9 setup`                        | Interactive menu — detects installed agents and wires hooks for you                   |
 | `node9 addto <agent>`                | Wire hooks for a specific agent (`claude`, `gemini`, `cursor`)                        |
-| `node9 init`                         | Create default `~/.node9/config.json`                                                 |
+| `node9 setup hud`                    | Add the node9 security statusline to Claude Code (also done automatically by `init`)  |
+| `node9 init`                         | Create default config, wire detected agents, and set up the HUD                       |
 | `node9 status`                       | Show current protection status and active rules                                       |
 | `node9 doctor`                       | Health check — verifies binaries, config, credentials, and all agent hooks            |
 | `node9 shield <cmd>`                 | Manage shields (`enable`, `disable`, `list`, `status`)                                |
