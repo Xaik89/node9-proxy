@@ -11,9 +11,19 @@ from node9 import protect
 # In CI, GITHUB_WORKSPACE is the repo root; fall back to local "workspace/" for dev
 WORKSPACE_DIR = os.environ.get("GITHUB_WORKSPACE") or os.path.abspath("workspace")
 
-@protect("bash")
+def _safe_path(filename: str) -> str:
+    """Resolve path and verify it stays within WORKSPACE_DIR. Raises ValueError if not."""
+    resolved = os.path.realpath(os.path.join(WORKSPACE_DIR, filename))
+    workspace_root = os.path.realpath(WORKSPACE_DIR) + os.sep
+    if not resolved.startswith(workspace_root):
+        raise ValueError(f"Path traversal rejected: {filename!r} escapes workspace")
+    return resolved
+
+
 def run_bash(command: str):
-    """Executes a bash command (tests, ls, etc) in the workspace."""
+    """Executes a bash command (tests, ls, etc) in the workspace — unprotected.
+    Intermediate review commands (npm test, cat, grep…) don't need governance;
+    only the final governance push does (see governance_push below)."""
     try:
         result = subprocess.check_output(
             ["bash", "-c", command],
@@ -24,13 +34,20 @@ def run_bash(command: str):
     except subprocess.CalledProcessError as e:
         return f"Error: {e.output.decode()}"
 
-def _safe_path(filename: str) -> str:
-    """Resolve path and verify it stays within WORKSPACE_DIR. Raises ValueError if not."""
-    resolved = os.path.realpath(os.path.join(WORKSPACE_DIR, filename))
-    workspace_root = os.path.realpath(WORKSPACE_DIR) + os.sep
-    if not resolved.startswith(workspace_root):
-        raise ValueError(f"Path traversal rejected: {filename!r} escapes workspace")
-    return resolved
+
+@protect("bash")
+def governance_push(command: str):
+    """The single governance gate — node9 intercepts this and waits for dashboard approval.
+    Takes `command` so the SaaS policy filter (.command ~ git\\s+push) matches correctly."""
+    try:
+        result = subprocess.check_output(
+            ["bash", "-c", command],
+            stderr=subprocess.STDOUT,
+            cwd=WORKSPACE_DIR,
+        )
+        return result.decode()
+    except subprocess.CalledProcessError as e:
+        return f"Error: {e.output.decode()}"
 
 
 @protect("filesystem")
@@ -40,6 +57,7 @@ def write_code(filename: str, content: str):
     with open(path, "w") as f:
         f.write(content)
     return f"Successfully updated {filename}"
+
 
 def _run_unprotected(command: str) -> str:
     """Run a bash command without node9 interception (for git setup, staging, etc.)."""

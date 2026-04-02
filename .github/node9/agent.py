@@ -409,7 +409,7 @@ def execute_review_fix() -> None:
     # 6. THE GOVERNANCE GATE (Protected Push)
     try:
         print("🛡️ Node9: Waiting for dashboard approval...", flush=True)
-        tools.run_bash(f"git push origin {fix_branch}")
+        tools.governance_push(f"git push origin {fix_branch}")
         print("✅ Push approved and completed.")
     except ActionDeniedException:
         print("\n🛑 Action Denied: Review discarded. PR can be closed manually.", flush=True)
