@@ -1,9 +1,27 @@
 // src/cli/commands/undo.ts
 // Registered as `node9 undo` by cli.ts.
+import path from 'path';
 import type { Command } from 'commander';
 import chalk from 'chalk';
 import { applyUndo, getSnapshotHistory, computeUndoDiff } from '../../undo.js';
+import type { SnapshotEntry } from '../../undo.js';
 import { runUndoNavigator } from '../../tui/undo-navigator.js';
+
+/**
+ * Walks up from startDir until it finds a directory that appears as a snapshot
+ * cwd. This lets `node9 undo` work from any subdirectory of a project, the same
+ * way `git` finds .git by traversing up.
+ */
+function findMatchingCwd(startDir: string, history: SnapshotEntry[]): string | null {
+  const cwds = new Set(history.map((e) => e.cwd));
+  let dir = startDir;
+  while (true) {
+    if (cwds.has(dir)) return dir;
+    const parent = path.dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+}
 
 function formatAge(timestamp: number): string {
   const age = Math.round((Date.now() - timestamp) / 1000);
@@ -25,7 +43,8 @@ export function registerUndoCommand(program: Command): void {
     .option('--all', 'Include snapshots from all directories, not just the current one')
     .action(async (options: { steps?: string; list?: boolean; all?: boolean }) => {
       const allHistory = getSnapshotHistory();
-      const history = options.all ? allHistory : allHistory.filter((s) => s.cwd === process.cwd());
+      const matchedCwd = options.all ? null : findMatchingCwd(process.cwd(), allHistory);
+      const history = options.all ? allHistory : allHistory.filter((s) => s.cwd === matchedCwd);
 
       if (history.length === 0) {
         if (!options.all && allHistory.length > 0) {

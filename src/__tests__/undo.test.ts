@@ -272,13 +272,14 @@ describe('createShadowSnapshot', () => {
     expect(String(latestWrite![1])).toBe('commit333');
   });
 
-  it('caps the stack at MAX_SNAPSHOTS (10)', async () => {
+  it('caps at MAX_SNAPSHOTS (10) per project, evicting oldest entry for that cwd', async () => {
     withShadowRepo(true);
+    // 10 existing entries all for /mock/project (same cwd as process.cwd mock)
     const existing = Array.from({ length: 10 }, (_, i) => ({
       hash: `hash${i}`,
       tool: 'edit',
       argsSummary: `file${i}.ts`,
-      cwd: '/p',
+      cwd: '/mock/project',
       timestamp: i * 1000,
     }));
     vi.mocked(fs.readFileSync).mockImplementation((p) => {
@@ -295,8 +296,95 @@ describe('createShadowSnapshot', () => {
     const writeCall = writeSpy.mock.calls.find(byStackPath);
     const written = JSON.parse(String(writeCall![1]));
     expect(written).toHaveLength(10);
-    expect(written[0].hash).toBe('hash1'); // oldest dropped
+    expect(written[0].hash).toBe('hash1'); // oldest of /mock/project dropped
     expect(written[9].hash).toBe('commitX'); // newest added
+  });
+
+  it('per-project cap does not evict entries from other projects', async () => {
+    withShadowRepo(true);
+    // 10 entries for /other/project + 1 existing for /mock/project
+    const existing = [
+      ...Array.from({ length: 10 }, (_, i) => ({
+        hash: `other${i}`,
+        tool: 'edit',
+        argsSummary: `file${i}.ts`,
+        cwd: '/other/project',
+        timestamp: i * 1000,
+      })),
+      {
+        hash: 'mine0',
+        tool: 'edit',
+        argsSummary: 'mine.ts',
+        cwd: '/mock/project',
+        timestamp: 9000,
+      },
+    ];
+    vi.mocked(fs.readFileSync).mockImplementation((p) => {
+      const s = String(p);
+      if (s.endsWith('project-path.txt')) return '/mock/project';
+      if (s.endsWith('snapshots.json')) return JSON.stringify(existing);
+      return '';
+    });
+    vi.mocked(fs.existsSync).mockImplementation((p) => String(p).endsWith('snapshots.json'));
+    mockGitSuccess('treeY', 'commitY');
+
+    await createShadowSnapshot('edit', { file_path: 'new.ts' });
+
+    const writeCall = writeSpy.mock.calls.find(byStackPath);
+    const written = JSON.parse(String(writeCall![1]));
+    // /other/project entries must be untouched (10 still present)
+    const otherEntries = written.filter((e: { cwd: string }) => e.cwd === '/other/project');
+    expect(otherEntries).toHaveLength(10);
+    // /mock/project now has 2 entries (was 1, added 1 — under cap)
+    const myEntries = written.filter((e: { cwd: string }) => e.cwd === '/mock/project');
+    expect(myEntries).toHaveLength(2);
+  });
+
+  it('derives cwd from absolute file_path by finding project root (.git marker)', async () => {
+    // Shadow repo must validate as healthy for the derived cwd (/abs/myproj)
+    vi.mocked(fs.readdirSync).mockReturnValue([]);
+    vi.mocked(fs.existsSync).mockImplementation((p) => {
+      const s = String(p);
+      if (s === '/abs/myproj/.git') return true; // project root marker
+      if (s.endsWith('snapshots.json')) return false;
+      return false;
+    });
+    vi.mocked(fs.readFileSync).mockImplementation((p) => {
+      const s = String(p);
+      // Shadow repo project-path.txt must match the derived cwd
+      if (s.endsWith('project-path.txt')) return '/abs/myproj';
+      return '';
+    });
+    mockGitSuccess('treeR', 'commitR');
+
+    await createShadowSnapshot('edit', { file_path: '/abs/myproj/src/foo.ts' });
+
+    const writeCall = writeSpy.mock.calls.find(byStackPath);
+    const written = JSON.parse(String(writeCall![1]));
+    // Snapshot must be keyed to the project root, not process.cwd()
+    expect(written[0].cwd).toBe('/abs/myproj');
+  });
+
+  it('falls back to process.cwd() when file_path is relative', async () => {
+    withShadowRepo(true);
+    mockGitSuccess('treeF', 'commitF');
+
+    await createShadowSnapshot('edit', { file_path: 'src/relative.ts' });
+
+    const writeCall = writeSpy.mock.calls.find(byStackPath);
+    const written = JSON.parse(String(writeCall![1]));
+    expect(written[0].cwd).toBe('/mock/project');
+  });
+
+  it('falls back to process.cwd() when args have no file_path', async () => {
+    withShadowRepo(true);
+    mockGitSuccess('treeG', 'commitG');
+
+    await createShadowSnapshot('bash', { command: 'npm test' });
+
+    const writeCall = writeSpy.mock.calls.find(byStackPath);
+    const written = JSON.parse(String(writeCall![1]));
+    expect(written[0].cwd).toBe('/mock/project');
   });
 
   it('extracts argsSummary from command field when no file_path', async () => {

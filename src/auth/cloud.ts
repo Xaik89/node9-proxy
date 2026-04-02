@@ -2,6 +2,7 @@
 // Node9 SaaS cloud channel: handshake, polling, resolution, and local-allow audit reporting.
 import fs from 'fs';
 import os from 'os';
+import path from 'path';
 import { type RiskMetadata } from '../context-sniper';
 import { HOOK_DEBUG_LOG } from '../audit';
 
@@ -65,6 +66,17 @@ export async function initNode9SaaS(
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 10000);
 
+  // Read CI context written by the agent before the git push gate
+  let ciContext: Record<string, unknown> | undefined;
+  if (process.env.CI) {
+    try {
+      const ciContextPath = path.join(os.homedir(), '.node9', 'ci-context.json');
+      ciContext = JSON.parse(fs.readFileSync(ciContextPath, 'utf8')) as Record<string, unknown>;
+    } catch {
+      // not present — not a CI push gate
+    }
+  }
+
   try {
     const response = await fetch(creds.apiUrl, {
       method: 'POST',
@@ -80,6 +92,7 @@ export async function initNode9SaaS(
           platform: os.platform(),
         },
         ...(riskMetadata && { riskMetadata }),
+        ...(ciContext && { ciContext }),
       }),
       signal: controller.signal,
     });
@@ -127,13 +140,22 @@ export async function pollNode9SaaS(
 
       if (!statusRes.ok) continue;
 
-      const { status, reason } = (await statusRes.json()) as { status: string; reason?: string };
+      const statusBody = (await statusRes.json()) as {
+        status: string;
+        reason?: string;
+        feedbackText?: string;
+      };
+      const { status } = statusBody;
 
       if (status === 'APPROVED') {
-        return { approved: true, reason };
+        return { approved: true, reason: statusBody.reason };
       }
       if (status === 'DENIED' || status === 'AUTO_BLOCKED' || status === 'TIMED_OUT') {
-        return { approved: false, reason };
+        return { approved: false, reason: statusBody.reason };
+      }
+      if (status === 'FIX') {
+        const feedbackText = statusBody.feedbackText ?? statusBody.reason ?? 'Run again with feedback.';
+        return { approved: false, reason: feedbackText };
       }
     } catch {
       /* transient network error */
