@@ -289,7 +289,14 @@ def execute_review_fix() -> None:
             f"Review the following git diff for {original_branch} → {base_branch} "
             f"and fix any issues you find.\n\n"
             f"Git diff:\n```\n{diff_output[:8000]}\n```\n\n"
-            "Instructions:\n1. Read files\n2. Fix bugs\n3. Run tests\n4. Respond with summary."
+            "Instructions:\n"
+            "1. Read the relevant files\n"
+            "2. Fix any bugs or issues you find\n"
+            f"3. ALWAYS run tests with: run_bash('{os.environ.get('NODE9_TEST_CMD', 'npm test').split('|')[0].strip()}')\n"
+            "4. Respond with a summary using EXACTLY this format (one line each):\n"
+            "   FOUND: <what you found>\n"
+            "   FIXED: <what you fixed>\n"
+            "   If nothing found, still write: FOUND: No issues found"
         )
     else:
         pr_comments = ""
@@ -507,8 +514,10 @@ def execute_review_fix() -> None:
         tools.governance_push(f"git push origin {fix_branch}")
         print("✅ Push approved and completed.")
     except ActionDeniedException:
-        print("\n🛑 Action Denied: Review discarded. PR can be closed manually.", flush=True)
-        sys.exit(1)
+        print("\n🛑 Review discarded by human. No changes merged.", flush=True)
+        # Exit 0 — discard is a valid human decision, not a workflow failure.
+        # Exiting 1 would make the node9 check fail on the original PR and block merging.
+        sys.exit(0)
 
 if __name__ == "__main__":
     execute_review_fix()
