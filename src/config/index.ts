@@ -171,7 +171,9 @@ export const DEFAULT_CONFIG: Config = {
           {
             field: 'command',
             op: 'matches',
-            value: 'rm\\b.*(-[rRfF]*[rR][rRfF]*|--recursive)',
+            // Require the recursive flag to be preceded by whitespace so that
+            // filenames containing "-r" (e.g. "ai-review.yml") don't false-positive.
+            value: 'rm\\b.*\\s(-[rRfF]*[rR][rRfF]*|--recursive)(\\s|$)',
           },
           {
             field: 'command',
