@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import subprocess
 import urllib.request
 import urllib.error
 
@@ -91,6 +92,10 @@ def _write_ci_context(
     issues_found: list,
     issues_fixed: list,
 ) -> None:
+    # GITHUB_TOKEN is included so the SaaS backend can call the GitHub API for
+    # APPROVE_MERGE, DISCARD, and RUN_AGAIN within the token's 1-hour window.
+    # The CI runner is ephemeral; the token is sent over HTTPS and used only
+    # during the approval window. It is never logged or surfaced to the agent.
     os.makedirs(os.path.dirname(CI_CONTEXT_PATH), exist_ok=True)
     with open(CI_CONTEXT_PATH, "w") as f:
         json.dump(
@@ -129,10 +134,13 @@ def execute_review_fix() -> None:
     diff_output = tools._run_unprotected(f"git diff origin/{base_branch}...HEAD")
 
     if iteration == 1:
+        diff_truncated = len(diff_output) > 8000
+        if diff_truncated:
+            print(f"⚠️  Diff is {len(diff_output)} chars — truncated to 8000 for context window. Agent will read full files as needed.")
         user_message = (
             f"Review the following git diff for {original_branch} → {base_branch} "
             f"and fix any issues you find.\n\n"
-            f"Git diff:\n```\n{diff_output[:8000]}\n```\n\n"
+            f"Git diff{' (truncated — read files directly for full context)' if diff_truncated else ''}:\n```\n{diff_output[:8000]}\n```\n\n"
             "Instructions:\n"
             "1. Read the changed files to understand context\n"
             "2. Fix bugs, security issues, or code quality problems\n"
@@ -201,22 +209,28 @@ def execute_review_fix() -> None:
             system=(
                 "You are a CI code reviewer and fixer. "
                 "Review the diff, fix issues, run tests to verify your fixes, "
-                "then respond with plain text summarising what you changed. "
+                "then respond with a plain text summary in this format:\n"
+                "FOUND: <one-line description of each issue found>\n"
+                "FIXED: <one-line description of each fix applied>\n"
                 "Do not modify test files unless the tests themselves are wrong."
             ),
             messages=messages,
         )
 
         if response.stop_reason != "tool_use":
-            # Agent is done — extract summary
+            # Agent is done — extract FOUND/FIXED from structured summary
             for block in response.content:
                 if hasattr(block, "text") and block.text:
-                    summary = block.text
-                    # Parse issues from summary heuristically
-                    for line in summary.splitlines():
-                        line = line.strip("- •*").strip()
-                        if line and len(line) > 10:
-                            issues_fixed.append(line[:200])
+                    for line in block.text.splitlines():
+                        clean = line.strip()
+                        if clean.upper().startswith("FOUND:"):
+                            item = clean[6:].strip()
+                            if item:
+                                issues_found.append(item[:200])
+                        elif clean.upper().startswith("FIXED:"):
+                            item = clean[6:].strip()
+                            if item:
+                                issues_fixed.append(item[:200])
                     break
             break
 
@@ -238,14 +252,15 @@ def execute_review_fix() -> None:
                 if fname and fname not in files_changed:
                     files_changed.append(fname)
 
-            # Parse test counts from output
+            # Parse test counts from output (pytest / jest style)
             if name == "run_bash" and isinstance(result, str):
-                m = re.search(r"(\d+)\s+passed", result)
-                if m:
-                    tests_passed = int(m.group(1))
-                m = re.search(r"(\d+)\s+(?:passed|tests? ran|test)", result)
-                if m:
-                    tests_total = max(tests_total, int(m.group(1)))
+                m_passed = re.search(r"(\d+)\s+passed", result)
+                m_failed = re.search(r"(\d+)\s+failed", result)
+                if m_passed:
+                    p = int(m_passed.group(1))
+                    f = int(m_failed.group(1)) if m_failed else 0
+                    tests_passed = p
+                    tests_total = p + f
 
             tool_results.append({
                 "type": "tool_result",
@@ -263,8 +278,13 @@ def execute_review_fix() -> None:
     # The @protect on run_bash will intercept the git push — that's the HITL gate
     tools._run_unprotected(f"git checkout -b {fix_branch} 2>/dev/null || git checkout {fix_branch}")
     tools._run_unprotected("git add -A")
+    # Use subprocess list to avoid shell injection via attacker-controlled branch name
     commit_msg = f"node9: automated fixes for {original_branch} (iteration {iteration})"
-    tools._run_unprotected(f'git commit -m "{commit_msg}" --allow-empty')
+    subprocess.run(
+        ["git", "commit", "-m", commit_msg, "--allow-empty"],
+        cwd=tools.WORKSPACE_DIR,
+        check=True,
+    )
 
     # THIS is the governance gate — node9 intercepts, sends dashboard notification,
     # blocks until human approves, discards, or requests another iteration
