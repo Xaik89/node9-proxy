@@ -283,20 +283,23 @@ def execute_review_fix() -> None:
 
     diff_output = tools._run_unprotected(f"git diff origin/{base_branch}...HEAD")
 
+    test_cmd = os.environ.get("NODE9_TEST_CMD", "npm test 2>&1 | tail -50")
     if iteration == 1:
-        diff_truncated = len(diff_output) > 8000
         user_content = (
-            f"Review the following git diff for {original_branch} → {base_branch} "
-            f"and fix any issues you find.\n\n"
-            f"Git diff:\n```\n{diff_output[:8000]}\n```\n\n"
-            "Instructions:\n"
-            "1. Read the relevant files\n"
-            "2. Fix any bugs or issues you find\n"
-            f"3. ALWAYS run tests with: run_bash('{os.environ.get('NODE9_TEST_CMD', 'npm test').split('|')[0].strip()}')\n"
-            "4. Respond with a summary using EXACTLY this format (one line each):\n"
-            "   FOUND: <what you found>\n"
-            "   FIXED: <what you fixed>\n"
-            "   If nothing found, still write: FOUND: No issues found"
+            f"Review this git diff for `{original_branch}` → `{base_branch}`.\n\n"
+            f"```diff\n{diff_output[:8000]}\n```\n\n"
+            "## Your job (in order):\n\n"
+            "**Step 1 — Read:** Read the changed files to understand what was modified.\n\n"
+            f"**Step 2 — Run tests:** run_bash('{test_cmd}')\n\n"
+            "**Step 3 — Fix (optional):** Fix ONLY clear bugs visible in the diff above "
+            "(syntax errors, wrong logic, broken imports). "
+            "Do NOT attempt to fix pre-existing test failures or refactor unrelated code. "
+            "If a test was already failing before this diff, skip it.\n\n"
+            "**Step 4 — Stop and report.** After at most ONE round of fixes, "
+            "stop and write your summary. Do not loop on test failures.\n\n"
+            "## Required output format (plain text, one line each):\n"
+            "FOUND: <what issues you found in the diff, or 'No issues found'>\n"
+            "FIXED: <what you fixed, or 'Nothing fixed'>"
         )
     else:
         pr_comments = ""
@@ -331,7 +334,7 @@ def execute_review_fix() -> None:
 
     _write_ci_context(0, 0, [], [], [])
 
-    for i in range(20):
+    for i in range(8):  # 8 loops max — review + one fix round + test verification
         # Roll the cache checkpoint to the latest message before every API call.
         # This keeps input tokens low as history grows and avoids 429 rate limits.
         _apply_rolling_cache(messages)
@@ -377,11 +380,16 @@ def execute_review_fix() -> None:
                 {
                     "type": "text",
                     "text": (
-                        "You are a CI code reviewer and fixer. "
-                        "Review the diff, fix issues, run tests to verify your fixes, "
-                        "then respond with a plain text summary in this format:\n"
-                        "FOUND: <one-line description>\n"
-                        "FIXED: <one-line description>"
+                        "You are a CI code reviewer. Your goal is to review a diff, "
+                        "run tests once, make ONE round of targeted fixes if needed, then STOP.\n"
+                        "Rules:\n"
+                        "- Run tests exactly once (or twice if you made fixes)\n"
+                        "- Only fix bugs clearly introduced by this diff\n"
+                        "- Never loop trying to fix the same test failure repeatedly\n"
+                        "- If a test was already failing before this diff, skip it\n"
+                        "- End your response with plain text lines:\n"
+                        "  FOUND: <one-line summary or 'No issues found'>\n"
+                        "  FIXED: <one-line summary or 'Nothing fixed'>"
                     ),
                     "cache_control": {"type": "ephemeral"} 
                 }
@@ -461,8 +469,8 @@ def execute_review_fix() -> None:
         messages.append({"role": "assistant", "content": response.content})
         messages.append({"role": "user", "content": tool_results})
 
-        print(f"  (Loop {i+1}/20) Waiting 12s...", flush=True)
-        time.sleep(12) 
+        print(f"  (Loop {i+1}/8) Waiting 5s...", flush=True)
+        time.sleep(5)
 
     # 1. Prepare the local branch
     tools._run_unprotected(f"git checkout -b {fix_branch} 2>/dev/null || git checkout {fix_branch}")
