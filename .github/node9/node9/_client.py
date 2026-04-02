@@ -99,7 +99,7 @@ def _evaluate_cloud(tool_name: str, args: dict[str, Any]) -> None:
     api_key = os.environ.get("NODE9_API_KEY", "")
     # NODE9_API_URL should point to the intercept endpoint, e.g.:
     # https://api.node9.ai/api/v1/intercept
-    api_url = os.environ.get("NODE9_API_URL", "https://api.node9.ai/api/v1/intercept")
+    api_url = os.environ.get("NODE9_API_URL", "https://dev-api.node9.ai/api/v1/intercept")
 
     payload: dict = {
         "toolName": tool_name,
@@ -129,6 +129,15 @@ def _evaluate_cloud(tool_name: str, args: dict[str, Any]) -> None:
     try:
         with urllib.request.urlopen(req, timeout=_CHECK_TIMEOUT) as resp:
             result = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"[Node9] SaaS returned HTTP {e.code} {e.reason} — body: {body}"
+        ) from e
     except urllib.error.URLError as e:
         raise RuntimeError(f"[Node9] Failed to reach node9 SaaS: {e}") from e
 
