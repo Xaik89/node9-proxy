@@ -344,8 +344,7 @@ describe('createShadowSnapshot', () => {
     // Use platform-appropriate absolute paths: path.isAbsolute('/foo') is false on Windows
     // (Windows requires a drive letter like C:\foo), so hardcoded Unix paths cause the test
     // to skip findProjectRoot and fall back to process.cwd() on the Windows CI runner.
-    const projectRoot =
-      process.platform === 'win32' ? 'C:\\abs\\myproj' : '/abs/myproj';
+    const projectRoot = process.platform === 'win32' ? 'C:\\abs\\myproj' : '/abs/myproj';
     const filePath = path.join(projectRoot, 'src', 'foo.ts');
     const gitDir = path.join(projectRoot, '.git');
 
