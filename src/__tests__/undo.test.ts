@@ -341,28 +341,36 @@ describe('createShadowSnapshot', () => {
   });
 
   it('derives cwd from absolute file_path by finding project root (.git marker)', async () => {
-    // Shadow repo must validate as healthy for the derived cwd (/abs/myproj)
+    // Use platform-appropriate absolute paths: path.isAbsolute('/foo') is false on Windows
+    // (Windows requires a drive letter like C:\foo), so hardcoded Unix paths cause the test
+    // to skip findProjectRoot and fall back to process.cwd() on the Windows CI runner.
+    const projectRoot =
+      process.platform === 'win32' ? 'C:\\abs\\myproj' : '/abs/myproj';
+    const filePath = path.join(projectRoot, 'src', 'foo.ts');
+    const gitDir = path.join(projectRoot, '.git');
+
+    // Shadow repo must validate as healthy for the derived cwd (projectRoot)
     vi.mocked(fs.readdirSync).mockReturnValue([]);
     vi.mocked(fs.existsSync).mockImplementation((p) => {
       const s = String(p);
-      if (s === '/abs/myproj/.git') return true; // project root marker
+      if (s === gitDir) return true; // project root marker
       if (s.endsWith('snapshots.json')) return false;
       return false;
     });
     vi.mocked(fs.readFileSync).mockImplementation((p) => {
       const s = String(p);
       // Shadow repo project-path.txt must match the derived cwd
-      if (s.endsWith('project-path.txt')) return '/abs/myproj';
+      if (s.endsWith('project-path.txt')) return projectRoot;
       return '';
     });
     mockGitSuccess('treeR', 'commitR');
 
-    await createShadowSnapshot('edit', { file_path: '/abs/myproj/src/foo.ts' });
+    await createShadowSnapshot('edit', { file_path: filePath });
 
     const writeCall = writeSpy.mock.calls.find(byStackPath);
     const written = JSON.parse(String(writeCall![1]));
     // Snapshot must be keyed to the project root, not process.cwd()
-    expect(written[0].cwd).toBe('/abs/myproj');
+    expect(written[0].cwd).toBe(projectRoot);
   });
 
   it('falls back to process.cwd() when file_path is relative', async () => {
