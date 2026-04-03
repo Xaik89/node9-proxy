@@ -254,14 +254,30 @@ def _write_ci_context(
         }, f)
 
 
-def _write_github_summary(issues_found, issues_fixed, pr_url="", review_comment=""):
+def _write_github_summary(
+    issues_found, issues_fixed, pr_url="", review_comment="",
+    before_test_output="", after_test_output="",
+):
     summary_file = os.environ.get("GITHUB_STEP_SUMMARY")
     if not summary_file:
         return
+
+    before_passed, before_total = _parse_test_counts(before_test_output)
+    after_passed, after_total = _parse_test_counts(after_test_output)
+    after_failed = after_total - after_passed
+    test_icon = "✅" if (after_total > 0 and after_failed == 0) else ("❌" if after_failed > 0 else "⚪")
+
     with open(summary_file, "a") as f:
         f.write("### 🤖 node9 AI Code Review\n\n")
         if pr_url:
             f.write(f"**[View Draft PR on GitHub]({pr_url})**\n\n")
+
+        # Test results
+        if before_total > 0 or after_total > 0:
+            before_str = f"{before_passed}/{before_total}" if before_total > 0 else "?"
+            after_str = f"{after_passed}/{after_total}" if after_total > 0 else "not run"
+            f.write(f"{test_icon} **Tests:** {before_str} → {after_str} passing\n\n")
+
         if issues_found:
             f.write("#### Issues Found\n")
             for issue in issues_found:
@@ -276,8 +292,8 @@ def _write_github_summary(issues_found, issues_fixed, pr_url="", review_comment=
             f.write("#### Code Review\n")
             f.write(review_comment[:2000] + "\n\n")
         if not issues_found and not issues_fixed:
-            f.write("No issues found in this diff.\n\n")
-        f.write("> **Action Required:** Go to the [node9 Dashboard](https://app.node9.ai) to Approve, Discard, or Run Again.\n")
+            f.write("_No issues found in this diff._\n\n")
+        f.write("> Review the Draft PR on GitHub and merge when ready.\n")
 
 
 # ---------------------------------------------------------------------------
@@ -876,7 +892,12 @@ def execute_review_fix() -> None:
             _post_pr_comment(pr_number, repo, github_token, review_comment)
 
     # Write summaries
-    _write_github_summary(issues_found, issues_fixed, pr_url=pr_url, review_comment=review_comment)
+    _write_github_summary(
+        issues_found, issues_fixed,
+        pr_url=pr_url, review_comment=review_comment,
+        before_test_output=before_test_output,
+        after_test_output=after_test_output,
+    )
     after_passed, after_total = _parse_test_counts(after_test_output)
     _write_ci_context(
         after_passed, after_total,
