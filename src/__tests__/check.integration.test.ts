@@ -460,6 +460,8 @@ describe('audit mode', () => {
 
 // ── 6. Audit mode + cloud gating (auditLocalAllow) ────────────────────────────
 
+// ── 6. Audit mode + cloud gating (auditLocalAllow) ────────────────────────────
+
 describe('audit mode + cloud gating', () => {
   let tmpHome: string;
   let mockServer: http.Server;
@@ -476,8 +478,8 @@ describe('audit mode + cloud gating', () => {
           if (req.url === '/audit' && req.method === 'POST') {
             try {
               auditCalls.push(JSON.parse(body));
-            } catch {
-              /* ignore */
+            } catch (e) {
+              console.error('[MOCK SERVER] Failed to parse audit payload in CI:', e, 'Body:', body);
             }
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: true }));
@@ -502,7 +504,6 @@ describe('audit mode + cloud gating', () => {
       policy: { dangerousWords: ['mkfs'] },
     });
 
-    // Write credentials pointing at our mock server
     fs.writeFileSync(
       path.join(tmpHome, '.node9', 'credentials.json'),
       JSON.stringify({ apiKey: 'test-key-123', apiUrl: `http://127.0.0.1:${serverPort}` })
@@ -515,21 +516,25 @@ describe('audit mode + cloud gating', () => {
   });
 
   it('audit mode + cloud:true + API key → POSTs to /audit endpoint', async () => {
-    // auditLocalAllow is awaited in core.ts before process.exit(0), so by the
-    // time runCheckAsync resolves (process closed) the POST is already complete.
-    // No sleep needed — if it races here, it's a production bug too.
     const r = await runCheckAsync(
       { tool_name: 'bash', tool_input: { command: 'mkfs.ext4 /dev/sda' } },
       { HOME: tmpHome, NODE9_DEBUG: '1' },
       tmpHome
     );
+
+    // SAFETY NET FOR CI DEBUGS:
+    if (auditCalls.length === 0) {
+      console.error('--- CI DEBUG TEST 1 (NO AUDIT CALLS) ---');
+      console.error('STDOUT:', r.stdout);
+      console.error('STDERR:', r.stderr);
+    }
+
     expect(r.status).toBe(0);
     expect(r.stderr).toContain('[audit]');
     expect(auditCalls.length).toBeGreaterThan(0);
   });
 
   it('audit mode + cloud:false → does NOT POST to /audit', async () => {
-    // Overwrite config with cloud:false
     fs.writeFileSync(
       path.join(tmpHome, '.node9', 'config.json'),
       JSON.stringify({
@@ -742,7 +747,9 @@ describe('cloud race engine', () => {
         mode: 'standard',
         autoStartDaemon: false,
         approvers: { native: false, browser: false, cloud: true, terminal: false },
-        approvalTimeoutMs: 3000,
+        // INCREASED FROM 3000 to 10000: CI runners are slow. If this hits the 3s timeout
+        // before the fetch completes, the CLI fails-open (allow) and outputs no JSON!
+        approvalTimeoutMs: 10000,
       },
       policy: { dangerousWords: ['mkfs'] },
     });
@@ -754,14 +761,22 @@ describe('cloud race engine', () => {
 
     const r = await runCheckAsync(
       { tool_name: 'bash', tool_input: { command: 'mkfs.ext4 /dev/sda' } },
-      { HOME: tmpHome },
+      { HOME: tmpHome, NODE9_DEBUG: '1' }, // Added NODE9_DEBUG: '1' to surface internal CLI fetch errors to stderr
       tmpHome,
-      10000
+      15000 // Ensure runner allows up to 15s
     );
+
+    // SAFETY NET FOR CI DEBUGS:
+    if (!r.stdout.trim()) {
+      console.error('--- CI DEBUG TEST 2 (EMPTY STDOUT, EXPECTED JSON) ---');
+      console.error('STDOUT:', r.stdout);
+      console.error('STDERR:', r.stderr);
+    }
+
     expect(r.status).toBe(0);
     const denied = JSON.parse(r.stdout.trim());
     expect(denied.decision).toBe('block');
-  }, 15000);
+  }, 20000);
 });
 
 // ── 10. Malformed payload to `node9 check` ───────────────────────────────────

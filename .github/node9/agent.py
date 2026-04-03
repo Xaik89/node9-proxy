@@ -242,20 +242,33 @@ def _phase1_baseline(base_branch, original_branch, iteration, test_cmd):
     print(f"  Diff: {diff_lines} lines across {len(_diff_file_list(filtered))} files")
     
     print("  Running baseline tests...")
-    before_output = tools._run_unprotected(test_cmd)
+    cwd = tools.WORKSPACE_DIR if hasattr(tools, 'WORKSPACE_DIR') else os.getcwd()
+    proc = subprocess.run(test_cmd, shell=True, capture_output=True, text=True, cwd=cwd)
+    before_output = proc.stdout + "\n" + proc.stderr
+    
     print(f"\n--- DEBUG: RAW TEST OUTPUT ---\n{before_output}\n---------------------------\n")
 
     passed, total = _parse_test_counts(before_output)
-    print(f"  Baseline: {passed}/{total} passing")
     
-    skip = (iteration == 1) and (total > 0) and (passed == total) and (diff_lines < 100)
-    return filtered, before_output, diff_lines, skip
+    # Reliably determine if tests passed via the test runner exit code instead of regex parsing alone
+    tests_passed = (proc.returncode == 0)
+    
+    print(f"  Baseline: {passed}/{total} passing (exit code: {proc.returncode})")
+    
+    skip = (iteration == 1) and tests_passed and (diff_lines < 100)
+    return filtered, before_output, diff_lines, skip, tests_passed
 
 
-def _phase2_engineering(filtered_diff, before_out, original_branch, base_branch, test_cmd):
+def _phase2_engineering(filtered_diff, before_out, original_branch, base_branch, test_cmd, tests_passed=False):
     files_changed, issues_found, issues_fixed = [], [], []
     after_test_output = before_out
     file_list = ", ".join(_diff_file_list(filtered_diff))
+
+    # Less aggressive prompt context if test runners are already green
+    status_msg = (
+        "The tests currently PASS. Only modify code if there is a critical security or logic bug."
+        if tests_passed else "Fix ONLY bugs introduced by this diff."
+    )
 
     user_content = (
         f"Review this git diff for `{original_branch}` → `{base_branch}`.\n\n"
@@ -265,7 +278,7 @@ def _phase2_engineering(filtered_diff, before_out, original_branch, base_branch,
         "1. **Read these files immediately** using `read_code` to understand the logic.\n"
         "2. **DO NOT use grep or find** to search for code. Use `read_code` on the files above.\n"
         f"3. Run tests: `run_bash('{test_cmd}')`.\n"
-        "4. Fix ONLY bugs introduced by this diff.\n"
+        f"4. {status_msg}\n"
         "5. Report FOUND: <issues> and FIXED: <fixes>."
     )
 
@@ -353,12 +366,12 @@ def execute_review_fix() -> None:
     print(f"🤖 node9 CI Review: {original_branch} → {base_branch}")
 
     # 1. Baseline
-    filtered_diff, before_out, diff_lines, skip_eng = _phase1_baseline(base_branch, original_branch, iteration, test_cmd)
+    filtered_diff, before_out, diff_lines, skip_eng, tests_passed = _phase1_baseline(base_branch, original_branch, iteration, test_cmd)
     
     # 2. Engineering
     files_changed, issues_found, issues_fixed, after_out = [], [], [], before_out
     if not skip_eng:
-        files_changed, issues_found, issues_fixed, after_out = _phase2_engineering(filtered_diff, before_out, original_branch, base_branch, test_cmd)
+        files_changed, issues_found, issues_fixed, after_out = _phase2_engineering(filtered_diff, before_out, original_branch, base_branch, test_cmd, tests_passed)
 
     # 3. Review
     agent_diff = tools._run_unprotected("git diff HEAD") if files_changed else ""
@@ -371,10 +384,27 @@ def execute_review_fix() -> None:
         issues_fixed += f_fixed
         if f_out: after_out = f_out
 
+    # --- SAFETY CHECK: Prevent the agent from pushing broken code ---
+    if files_changed and tests_passed:
+        print("  Verifying tests after AI changes...")
+        cwd = tools.WORKSPACE_DIR if hasattr(tools, 'WORKSPACE_DIR') else os.getcwd()
+        verify_proc = subprocess.run(test_cmd, shell=True, capture_output=True, text=True, cwd=cwd)
+        
+        if verify_proc.returncode != 0:
+            print("  ❌ AI changes broke the tests! Reverting to prevent CI failure.")
+            tools._run_unprotected("git reset --hard HEAD")
+            tools._run_unprotected("git clean -fd")
+            files_changed = []
+            issues_fixed = ["Attempted fixes were reverted because they broke the test suite."]
+            after_out = before_out
+
     # 5. Delivery
     tools._run_unprotected(f"git checkout -B {fix_branch}")
-    tools._run_unprotected("git add -A")
-    subprocess.run(["git", "commit", "-m", "node9 review", "--allow-empty"], cwd=tools.WORKSPACE_DIR)
+    
+    if files_changed:
+        tools._run_unprotected("git add -A")
+        
+    subprocess.run(["git", "commit", "-m", "node9 review", "--allow-empty"], cwd=tools.WORKSPACE_DIR if hasattr(tools, 'WORKSPACE_DIR') else os.getcwd())
     tools._run_unprotected(f"git push origin {fix_branch} --force")
 
     pr_num, pr_url = _open_or_find_draft_pr(fix_branch, base_branch, repo, github_token, "AI Review Complete")
