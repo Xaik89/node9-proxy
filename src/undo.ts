@@ -21,6 +21,10 @@ export interface SnapshotEntry {
   hash: string;
   tool: string;
   argsSummary: string;
+  /** Files changed in this snapshot (absent in snapshots created before v1.9.0). */
+  files?: string[];
+  /** Unified diff captured at creation time — always available, never recomputed. */
+  diff?: string | null;
   cwd: string;
   timestamp: number;
 }
@@ -39,19 +43,43 @@ function writeStack(stack: SnapshotEntry[]): void {
   fs.writeFileSync(SNAPSHOT_STACK_PATH, JSON.stringify(stack, null, 2));
 }
 
+function extractFilePath(args: unknown): string | null {
+  if (!args || typeof args !== 'object') return null;
+  const a = args as Record<string, unknown>;
+  const fp = a.file_path ?? a.path ?? a.filename;
+  return typeof fp === 'string' ? fp : null;
+}
+
 function buildArgsSummary(tool: string, args: unknown): string {
+  const filePath = extractFilePath(args);
+  if (filePath) return filePath;
   if (!args || typeof args !== 'object') return '';
   const a = args as Record<string, unknown>;
-  const filePath = a.file_path ?? a.path ?? a.filename;
-  if (typeof filePath === 'string') return filePath;
   const cmd = a.command ?? a.cmd;
   if (typeof cmd === 'string') return cmd.slice(0, 80);
   const sql = a.sql ?? a.query;
   if (typeof sql === 'string') return sql.slice(0, 80);
-  return tool;
+  return '';
 }
 
 // ── Shadow Repo Helpers ───────────────────────────────────────────────────────
+
+/**
+ * Walks up the directory tree from a file path looking for .git or package.json
+ * to identify the project root. Falls back to process.cwd() if no marker is found
+ * (e.g. in tests or on a bare filesystem with no project markers).
+ */
+function findProjectRoot(filePath: string): string {
+  let dir = path.dirname(filePath);
+  while (true) {
+    if (fs.existsSync(path.join(dir, '.git')) || fs.existsSync(path.join(dir, 'package.json'))) {
+      return dir;
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) return process.cwd(); // reached fs root, fall back
+    dir = parent;
+  }
+}
 
 /**
  * Normalizes a path for hashing: resolves symlinks, converts to forward slashes,
@@ -160,9 +188,11 @@ function ensureShadowRepo(shadowDir: string, cwd: string): boolean {
   } catch {}
 
   const init = spawnSync('git', ['init', '--bare', shadowDir], { timeout: 5_000 });
-  if (init.status !== 0) {
-    if (process.env.NODE9_DEBUG === '1')
-      console.error('[Node9] git init --bare failed:', init.stderr?.toString());
+
+  // Better check:
+  if (init.status !== 0 || init.error) {
+    const reason = init.error ? init.error.message : init.stderr?.toString();
+    if (process.env.NODE9_DEBUG === '1') console.error('[Node9] git init --bare failed:', reason);
     return false;
   }
 
@@ -214,7 +244,11 @@ export async function createShadowSnapshot(
 ): Promise<string | null> {
   let indexFile: string | null = null;
   try {
-    const cwd = process.cwd();
+    // Derive the project root from the edited file path when available so
+    // snapshots are keyed correctly regardless of where Claude Code was launched.
+    const rawFilePath = extractFilePath(args);
+    const absFilePath = rawFilePath && path.isAbsolute(rawFilePath) ? rawFilePath : null;
+    const cwd = absFilePath ? findProjectRoot(absFilePath) : process.cwd();
     const shadowDir = getShadowRepoDir(cwd);
 
     if (!ensureShadowRepo(shadowDir, cwd)) return null;
@@ -243,18 +277,64 @@ export async function createShadowSnapshot(
     const commitHash = commitRes.stdout?.toString().trim();
     if (!commitHash || commitRes.status !== 0) return null;
 
+    // ── Capture diff + file list at creation time ─────────────────────────────
+    // Find the most recent snapshot for this project (same cwd) to diff against.
     const stack = readStack();
+    const prevEntry = [...stack].reverse().find((e) => e.cwd === cwd);
+
+    let capturedFiles: string[] = [];
+    let capturedDiff: string | null = null;
+
+    if (prevEntry) {
+      // Incremental diff: what changed from the previous snapshot to this one
+      const filesRes = spawnSync('git', ['diff', '--name-only', prevEntry.hash, commitHash], {
+        env: shadowEnv,
+        timeout: GIT_TIMEOUT,
+      });
+      if (filesRes.status === 0) {
+        capturedFiles = filesRes.stdout?.toString().trim().split('\n').filter(Boolean) ?? [];
+      }
+      const diffRes = spawnSync('git', ['diff', prevEntry.hash, commitHash], {
+        env: shadowEnv,
+        timeout: GIT_TIMEOUT,
+      });
+      if (diffRes.status === 0) {
+        capturedDiff = diffRes.stdout?.toString() || null;
+      }
+    } else {
+      // First snapshot for this project — list all files
+      const filesRes = spawnSync('git', ['ls-tree', '-r', '--name-only', commitHash], {
+        env: shadowEnv,
+        timeout: GIT_TIMEOUT,
+      });
+      if (filesRes.status === 0) {
+        capturedFiles = filesRes.stdout?.toString().trim().split('\n').filter(Boolean) ?? [];
+      }
+      // No meaningful diff for the first snapshot (no prior state to compare against)
+      capturedDiff = null;
+    }
+
     stack.push({
       hash: commitHash,
       tool,
       argsSummary: buildArgsSummary(tool, args),
+      files: capturedFiles,
+      diff: capturedDiff,
       cwd,
       timestamp: Date.now(),
     });
-    // Check GC BEFORE splice so total-snapshots-ever is used, not capped length.
-    // After splice, stack.length ≤ MAX_SNAPSHOTS (10), so % 20 would never fire.
     const shouldGc = stack.length % 5 === 0;
-    if (stack.length > MAX_SNAPSHOTS) stack.splice(0, stack.length - MAX_SNAPSHOTS);
+    // Per-project cap: evict the oldest entry for this cwd only, so one busy
+    // project can never push out another project's undo history.
+    let cwdCount = 0;
+    let oldestCwdIdx = -1;
+    for (let i = 0; i < stack.length; i++) {
+      if (stack[i].cwd === cwd) {
+        if (oldestCwdIdx === -1) oldestCwdIdx = i;
+        cwdCount++;
+      }
+    }
+    if (cwdCount > MAX_SNAPSHOTS) stack.splice(oldestCwdIdx, 1);
     writeStack(stack);
 
     // Backward compat: keep undo_latest.txt
@@ -349,7 +429,13 @@ export function applyUndo(hash: string, cwd?: string): boolean {
       env,
       timeout: GIT_TIMEOUT,
     });
-    if (restore.status !== 0) return false;
+    if (restore.status !== 0 || restore.error) {
+      if (process.env.NODE9_DEBUG === '1') {
+        const msg = restore.error ? restore.error.message : restore.stderr?.toString();
+        console.error('[Node9] git restore failed:', msg);
+      }
+      return false;
+    }
 
     const lsTree = spawnSync('git', ['ls-tree', '-r', '--name-only', hash], {
       cwd: dir,
@@ -361,7 +447,8 @@ export function applyUndo(hash: string, cwd?: string): boolean {
     if (lsTree.status !== 0) {
       // Always warn — this is an unexpected git failure, not normal flow.
       // A silent false return is impossible to diagnose in production.
-      process.stderr.write(`[Node9] applyUndo: git ls-tree failed for hash ${hash}\n`);
+      const errorMsg = lsTree.stderr?.toString() || 'Unknown git error';
+      process.stderr.write(`[Node9] applyUndo: git ls-tree failed for hash ${hash}: ${errorMsg}\n`);
       return false;
     }
     const snapshotFiles = new Set(

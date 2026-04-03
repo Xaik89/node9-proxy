@@ -378,7 +378,7 @@ async function _authorizeHeadlessCore(
     const policyResult = await evaluatePolicy(toolName, args, meta?.agent);
     if (policyResult.decision === 'allow') {
       if (approvers.cloud && creds?.apiKey)
-        auditLocalAllow(toolName, args, 'local-policy', creds, meta);
+        await auditLocalAllow(toolName, args, 'local-policy', creds, meta);
       if (!isManual) appendLocalAudit(toolName, args, 'allow', 'local-policy', meta, hashAuditArgs);
       return { approved: true, checkedBy: 'local-policy' };
     }
@@ -420,9 +420,21 @@ async function _authorizeHeadlessCore(
         if (predicatesMet && policyResult.recoveryCommand) {
           statefulRecoveryCommand = policyResult.recoveryCommand;
         }
+      } else if (isDaemonRunning() && !isTestEnv) {
+        // Local development: daemon is running and not in a test/CI environment,
+        // so a human is at the keyboard. Downgrade hard-block to review — the user
+        // gets a popup and can approve or deny. Hard blocks stay hard in CI.
+        // Audit the block attempt to SaaS before falling through to the race engine.
+        if (!isManual)
+          appendLocalAudit(toolName, args, 'deny', 'smart-rule-block', meta, hashAuditArgs);
+        if (approvers.cloud && creds?.apiKey)
+          auditLocalAllow(toolName, args, 'smart-rule-block', creds, meta);
+        // Fall through to the race engine with the block label visible to the user.
       } else {
         if (!isManual)
           appendLocalAudit(toolName, args, 'deny', 'smart-rule-block', meta, hashAuditArgs);
+        if (approvers.cloud && creds?.apiKey)
+          auditLocalAllow(toolName, args, 'smart-rule-block', creds, meta);
         return {
           approved: false,
           reason: policyResult.reason ?? 'Action explicitly blocked by Smart Policy.',

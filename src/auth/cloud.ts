@@ -2,6 +2,7 @@
 // Node9 SaaS cloud channel: handshake, polling, resolution, and local-allow audit reporting.
 import fs from 'fs';
 import os from 'os';
+import path from 'path';
 import { type RiskMetadata } from '../context-sniper';
 import { HOOK_DEBUG_LOG } from '../audit';
 
@@ -65,6 +66,38 @@ export async function initNode9SaaS(
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 10000);
 
+  if (!creds.apiKey) throw new Error('Node9 API Key is missing');
+
+  // Read CI context written by the agent before the git push gate
+  let ciContext: Record<string, unknown> | undefined;
+  if (process.env.CI) {
+    try {
+      const ciContextPath = path.join(os.homedir(), '.node9', 'ci-context.json');
+      const stats = fs.statSync(ciContextPath);
+      if (stats.size > 10_000) throw new Error('ci-context.json exceeds 10 KB');
+      const raw = fs.readFileSync(ciContextPath, 'utf8');
+      const parsed = JSON.parse(raw) as unknown;
+      if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+        throw new Error('ci-context.json is not a plain object');
+      }
+      // Allowlist: only forward known safe keys — never tokens or credentials
+      const p = parsed as Record<string, unknown>;
+      ciContext = {
+        tests_after: p['tests_after'],
+        files_changed: p['files_changed'],
+        issues_found: p['issues_found'],
+        issues_fixed: p['issues_fixed'],
+        github_repository: p['github_repository'],
+        github_head_ref: p['github_head_ref'],
+        iteration: p['iteration'],
+        draft_pr_number: p['draft_pr_number'],
+        draft_pr_url: p['draft_pr_url'],
+      };
+    } catch {
+      // not present — not a CI push gate
+    }
+  }
+
   try {
     const response = await fetch(creds.apiUrl, {
       method: 'POST',
@@ -80,6 +113,7 @@ export async function initNode9SaaS(
           platform: os.platform(),
         },
         ...(riskMetadata && { riskMetadata }),
+        ...(ciContext && { ciContext }),
       }),
       signal: controller.signal,
     });
@@ -127,13 +161,23 @@ export async function pollNode9SaaS(
 
       if (!statusRes.ok) continue;
 
-      const { status, reason } = (await statusRes.json()) as { status: string; reason?: string };
+      const statusBody = (await statusRes.json()) as {
+        status: string;
+        reason?: string;
+        feedbackText?: string;
+      };
+      const { status } = statusBody;
 
       if (status === 'APPROVED') {
-        return { approved: true, reason };
+        return { approved: true, reason: statusBody.reason };
       }
       if (status === 'DENIED' || status === 'AUTO_BLOCKED' || status === 'TIMED_OUT') {
-        return { approved: false, reason };
+        return { approved: false, reason: statusBody.reason };
+      }
+      if (status === 'FIX') {
+        const feedbackText =
+          statusBody.feedbackText ?? statusBody.reason ?? 'Run again with feedback.';
+        return { approved: false, reason: feedbackText };
       }
     } catch {
       /* transient network error */
