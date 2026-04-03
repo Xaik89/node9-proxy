@@ -378,7 +378,7 @@ async function _authorizeHeadlessCore(
     const policyResult = await evaluatePolicy(toolName, args, meta?.agent);
     if (policyResult.decision === 'allow') {
       if (approvers.cloud && creds?.apiKey)
-        auditLocalAllow(toolName, args, 'local-policy', creds, meta);
+        await auditLocalAllow(toolName, args, 'local-policy', creds, meta);
       if (!isManual) appendLocalAudit(toolName, args, 'allow', 'local-policy', meta, hashAuditArgs);
       return { approved: true, checkedBy: 'local-policy' };
     }

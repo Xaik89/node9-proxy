@@ -66,13 +66,16 @@ export async function initNode9SaaS(
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 10000);
 
+  if (!creds.apiKey) throw new Error('Node9 API Key is missing');
+
   // Read CI context written by the agent before the git push gate
   let ciContext: Record<string, unknown> | undefined;
   if (process.env.CI) {
     try {
       const ciContextPath = path.join(os.homedir(), '.node9', 'ci-context.json');
+      const stats = fs.statSync(ciContextPath);
+      if (stats.size > 10_000) throw new Error('ci-context.json exceeds 10 KB');
       const raw = fs.readFileSync(ciContextPath, 'utf8');
-      if (raw.length > 10_000) throw new Error('ci-context.json exceeds 10 KB');
       const parsed = JSON.parse(raw) as unknown;
       if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
         throw new Error('ci-context.json is not a plain object');

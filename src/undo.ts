@@ -188,9 +188,11 @@ function ensureShadowRepo(shadowDir: string, cwd: string): boolean {
   } catch {}
 
   const init = spawnSync('git', ['init', '--bare', shadowDir], { timeout: 5_000 });
-  if (init.status !== 0) {
-    if (process.env.NODE9_DEBUG === '1')
-      console.error('[Node9] git init --bare failed:', init.stderr?.toString());
+
+  // Better check:
+  if (init.status !== 0 || init.error) {
+    const reason = init.error ? init.error.message : init.stderr?.toString();
+    if (process.env.NODE9_DEBUG === '1') console.error('[Node9] git init --bare failed:', reason);
     return false;
   }
 
@@ -427,7 +429,13 @@ export function applyUndo(hash: string, cwd?: string): boolean {
       env,
       timeout: GIT_TIMEOUT,
     });
-    if (restore.status !== 0) return false;
+    if (restore.status !== 0 || restore.error) {
+      if (process.env.NODE9_DEBUG === '1') {
+        const msg = restore.error ? restore.error.message : restore.stderr?.toString();
+        console.error('[Node9] git restore failed:', msg);
+      }
+      return false;
+    }
 
     const lsTree = spawnSync('git', ['ls-tree', '-r', '--name-only', hash], {
       cwd: dir,
@@ -439,7 +447,8 @@ export function applyUndo(hash: string, cwd?: string): boolean {
     if (lsTree.status !== 0) {
       // Always warn — this is an unexpected git failure, not normal flow.
       // A silent false return is impossible to diagnose in production.
-      process.stderr.write(`[Node9] applyUndo: git ls-tree failed for hash ${hash}\n`);
+      const errorMsg = lsTree.stderr?.toString() || 'Unknown git error';
+      process.stderr.write(`[Node9] applyUndo: git ls-tree failed for hash ${hash}: ${errorMsg}\n`);
       return false;
     }
     const snapshotFiles = new Set(

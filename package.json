@@ -61,9 +61,9 @@
     "test:e2e": "NODE9_TESTING=1 bash scripts/e2e.sh",
     "preuninstall": "node9 uninstall || echo 'node9 uninstall failed — remove hooks manually from ~/.claude/settings.json'",
     "prepublishOnly": "npm run validate",
-    "test": "vitest --run",
-    "test:coverage": "vitest --run --coverage",
-    "test:watch": "vitest",
+    "test": "NODE9_TESTING=1 vitest --run",
+    "test:coverage": "NODE9_TESTING=1 vitest --run --coverage",
+    "test:watch": "NODE9_TESTING=1 vitest",
     "test:ui": "vitest --ui",
     "dev:tail": "node -e \"try{const d=JSON.parse(require('fs').readFileSync(require('os').homedir()+'/.node9/daemon.pid','utf8'));const pid=d.pid;if(Number.isInteger(pid)&&pid>0&&pid<4194304)process.kill(pid)}catch(e){if(e.code!=='ESRCH'&&e.code!=='ENOENT')process.stderr.write(e.message+'\\n')}\" && npm run build && node dist/cli.js tail"
   },
