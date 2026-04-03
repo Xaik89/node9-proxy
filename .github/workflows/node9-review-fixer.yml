@@ -45,8 +45,15 @@ jobs:
         with:
           python-version: '3.11'
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
       - name: Install dependencies
-        run: pip install anthropic node9 python-dotenv
+        run: |
+          pip install anthropic node9 python-dotenv
+          npm ci --prefer-offline
 
       - name: Run node9 review
         env:
@@ -59,7 +66,7 @@ jobs:
           GITHUB_BASE_REF: ${{ github.event.client_payload.base_ref || github.base_ref || 'main' }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           CI: 'true'
-          NODE9_TEST_CMD: 'npm test 2>&1 | tail -50' # override if your test command differs
+          NODE9_TEST_CMD: 'npm test 2>&1'
           ITERATION: ${{ github.event.client_payload.iteration || '1' }}
           FEEDBACK: ${{ github.event.client_payload.feedback || '' }}
           DRAFT_PR_NUMBER: ${{ github.event.client_payload.draft_pr_number || '' }}

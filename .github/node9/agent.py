@@ -861,6 +861,12 @@ def execute_review_fix() -> None:
     else:
         print("\n✅ Phase 4: Code Review Fix — skipped (no issues)", flush=True)
 
+    # Surface failing tests as an explicit issue so they're never invisible
+    _after_passed, _after_total = _parse_test_counts(after_test_output)
+    _after_failed = _after_total - _after_passed
+    if _after_total > 0 and _after_failed > 0:
+        issues_found.insert(0, f"{_after_failed} test(s) still failing after agent run ({_after_passed}/{_after_total} passing)")
+
     # ── Phase 5: Scribe ──────────────────────────────────────────────────────
     print("\n📝 Phase 5: Scribe", flush=True)
     pr_body = _phase6_scribe(
