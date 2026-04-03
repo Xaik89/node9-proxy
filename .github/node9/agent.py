@@ -78,7 +78,6 @@ def _build_pr_body(
 ) -> str:
     lines = ["## 🤖 node9 AI Code Review\n"]
 
-    # Test results
     if tests_total > 0:
         icon = "✅" if tests_passed == tests_total else "❌"
         lines.append(f"### {icon} Tests: {tests_passed}/{tests_total} passed\n")
@@ -89,21 +88,18 @@ def _build_pr_body(
     else:
         lines.append("### ⚪ Tests: not run\n")
 
-    # Issues found
     if issues_found:
         lines.append("### 🔍 Issues Found\n")
         for issue in issues_found:
             lines.append(f"- {issue}\n")
         lines.append("")
 
-    # Fixes applied
     if issues_fixed:
         lines.append("### 🔧 Fixes Applied\n")
         for fix in issues_fixed:
             lines.append(f"- {fix}\n")
         lines.append("")
 
-    # Files changed
     if files_changed:
         lines.append("### 📁 Files Changed\n")
         for f in files_changed:
@@ -144,7 +140,6 @@ def _open_or_find_draft_pr(
         print(f"  ✅ Draft PR created: #{result.get('number')}", flush=True)
         return result.get("number")
 
-    # 422 = already exists; try to find it. Anything else = real error.
     if status not in (422, 200):
         print(f"  ⚠️  PR create returned HTTP {status}: {result}", flush=True)
 
@@ -157,7 +152,6 @@ def _open_or_find_draft_pr(
     if status == 200 and result:
         pr_num = result[0].get("number")
         print(f"  ♻️  Found existing Draft PR: #{pr_num} — updating body...", flush=True)
-        # Update the PR body with fresh review details
         _github_request(
             "PATCH",
             f"https://api.github.com/repos/{repo}/pulls/{pr_num}",
@@ -191,17 +185,14 @@ def _get_pr_review_comments(pr_number: int, repo: str, github_token: str) -> str
 # ---------------------------------------------------------------------------
 
 def _truncate_output(text: str, max_chars: int = 8000) -> str:
-    """Middle-out truncation: keep the first and last half so both the error
-    header and the test summary survive. Tail-only truncation drops the error."""
     if len(text) <= max_chars:
         return text
     half = max_chars // 2
     removed = len(text) - max_chars
-    return text[:half] + f"\n\n... [{removed} chars truncated] ...\n\n" + text[-half:]
+    return text[:half] + f"\n\n...[{removed} chars truncated] ...\n\n" + text[-half:]
 
 
 def _apply_rolling_cache(messages: list) -> None:
-    """Keep exactly one cache breakpoint, always on the last user message."""
     for msg in messages:
         if msg["role"] == "user" and isinstance(msg["content"], list):
             for block in msg["content"]:
@@ -216,7 +207,6 @@ def _apply_rolling_cache(messages: list) -> None:
 
 
 def _create_with_retry(client, **kwargs):
-    """Wrap client.messages.create with exponential backoff on 429."""
     for attempt in range(5):
         try:
             return client.messages.create(**kwargs)
@@ -228,9 +218,7 @@ def _create_with_retry(client, **kwargs):
 
 
 def _generate_final_summary(client, base_branch):
-    """Makes one final Haiku call to summarize the ACTUAL changes made by the agent."""
     print("📝 Generating final PR summary from diff...", flush=True)
-    
     final_diff = tools._run_unprotected(f"git diff origin/{base_branch}...HEAD")
     
     if not final_diff.strip():
@@ -238,7 +226,7 @@ def _generate_final_summary(client, base_branch):
 
     response = _create_with_retry(
         client,
-        model="claude-3-5-haiku-20241022",
+        model="claude-sonnet-4-6", # Replaced deprecated Haiku with reliable Sonnet
         max_tokens=1000,
         system=(
             "You are a technical writer. Look at this git diff and summarize the fixes. "
@@ -309,7 +297,7 @@ def execute_review_fix() -> None:
     print(f"🤖 node9 CI Review — iteration {iteration} on {original_branch} → {base_branch}", flush=True)
 
     diff_output = tools._run_unprotected(f"git diff origin/{base_branch}...HEAD")
-    test_cmd = os.environ.get("NODE9_TEST_CMD", "npm test")  # Removed 'tail -50', handled by Python now
+    test_cmd = os.environ.get("NODE9_TEST_CMD", "npm test")  # Removed 'tail -50', handled natively now
 
     files_changed: list =[]
     tests_passed = 0
@@ -327,11 +315,11 @@ def execute_review_fix() -> None:
             tests_passed = int(m_p.group(1))
             tests_total = tests_passed + (int(m_f.group(1)) if m_f else 0)
 
-        # EARLY EXIT GATE: Ask Haiku if there's any work to do
+        # EARLY EXIT GATE: Ask Sonnet if there's any work to do
         print("⚡ Checking if fixes are needed...", flush=True)
         quick_check = _create_with_retry(
             client,
-            model="claude-3-5-haiku-20241022",
+            model="claude-sonnet-4-6", # Using reliable Sonnet model
             max_tokens=100,
             system="Analyze the diff and test results. Are there any critical bugs, security issues, or failing tests? Reply ONLY with YES or NO.",
             messages=[{"role": "user", "content": f"Diff:\n{diff_output[:5000]}\nTests:\n{_truncate_output(baseline_tests)}"}]
