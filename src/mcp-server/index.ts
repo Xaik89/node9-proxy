@@ -76,6 +76,37 @@ const TOOLS = [
     },
   },
   {
+    name: 'node9_approver_list',
+    description:
+      'List all node9 approver channels and their current enabled/disabled state. ' +
+      'Approvers are the channels through which node9 asks a human to approve risky tool calls. ' +
+      'Channels: native (OS popup), browser (web UI), cloud (team policy server), terminal (stdin).',
+    inputSchema: { type: 'object', properties: {}, required: [] },
+  },
+  {
+    name: 'node9_approver_set',
+    description:
+      'Enable or disable a specific node9 approver channel in the global config (~/.node9/config.json). ' +
+      'Use this to turn individual channels on or off without touching other settings. ' +
+      'Channels: native, browser, cloud, terminal. ' +
+      'WARNING: disabling all approvers means node9 cannot prompt for human approval — use with care.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        channel: {
+          type: 'string',
+          enum: ['native', 'browser', 'cloud', 'terminal'],
+          description: 'Approver channel to configure.',
+        },
+        enabled: {
+          type: 'boolean',
+          description: 'true to enable the channel, false to disable it.',
+        },
+      },
+      required: ['channel', 'enabled'],
+    },
+  },
+  {
     name: 'node9_undo_list',
     description:
       'List the node9 snapshot history. Each entry shows the git hash, tool that triggered it, ' +
@@ -203,6 +234,79 @@ function handleShieldEnable(args: Record<string, unknown>): string {
   return `Shield "${name}" enabled — ${shield.smartRules.length} smart rule${shield.smartRules.length === 1 ? '' : 's'} now active.`;
 }
 
+// ── Approver config helpers ───────────────────────────────────────────────────
+
+const GLOBAL_CONFIG_PATH = path.join(os.homedir(), '.node9', 'config.json');
+const APPROVER_CHANNELS = ['native', 'browser', 'cloud', 'terminal'] as const;
+type ApproverChannel = (typeof APPROVER_CHANNELS)[number];
+
+function readGlobalConfigRaw(): Record<string, unknown> {
+  try {
+    if (fs.existsSync(GLOBAL_CONFIG_PATH)) {
+      return JSON.parse(fs.readFileSync(GLOBAL_CONFIG_PATH, 'utf-8')) as Record<string, unknown>;
+    }
+  } catch {
+    // corrupt or missing — start fresh
+  }
+  return {};
+}
+
+function writeGlobalConfigRaw(data: Record<string, unknown>): void {
+  const dir = path.dirname(GLOBAL_CONFIG_PATH);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(GLOBAL_CONFIG_PATH, JSON.stringify(data, null, 2) + '\n');
+}
+
+function handleApproverList(): string {
+  const config = getConfig();
+  const approvers = config.settings.approvers;
+  const lines: string[] = ['Approver channels:\n'];
+  for (const ch of APPROVER_CHANNELS) {
+    const on = approvers[ch];
+    lines.push(`  ${on ? '[enabled] ' : '[disabled]'} ${ch}`);
+  }
+
+  const enabledCount = APPROVER_CHANNELS.filter((ch) => approvers[ch]).length;
+  if (enabledCount === 0) {
+    lines.push('\nWARNING: all approver channels are disabled — node9 cannot prompt for approval.');
+  }
+
+  return lines.join('\n');
+}
+
+function handleApproverSet(args: Record<string, unknown>): string {
+  const channel = args.channel as string | undefined;
+  const enabled = args.enabled;
+
+  if (!channel || !APPROVER_CHANNELS.includes(channel as ApproverChannel)) {
+    throw new Error(
+      `Invalid channel: "${channel}". Must be one of: ${APPROVER_CHANNELS.join(', ')}.`
+    );
+  }
+  if (typeof enabled !== 'boolean') {
+    throw new Error('enabled must be a boolean (true or false).');
+  }
+
+  const raw = readGlobalConfigRaw();
+  const settings = (raw.settings ?? {}) as Record<string, unknown>;
+  const approvers = (settings.approvers ?? {}) as Record<string, unknown>;
+  approvers[channel] = enabled;
+  settings.approvers = approvers;
+  raw.settings = settings;
+  writeGlobalConfigRaw(raw);
+
+  // Warn if all channels are now disabled
+  const currentApprovers = getConfig().settings.approvers;
+  const anyEnabled = APPROVER_CHANNELS.some((ch) =>
+    ch === channel ? enabled : currentApprovers[ch]
+  );
+  const suffix = anyEnabled
+    ? ''
+    : '\nWARNING: all approver channels are now disabled — node9 cannot prompt for approval.';
+
+  return `Approver channel "${channel}" ${enabled ? 'enabled' : 'disabled'} in ~/.node9/config.json.${suffix}`;
+}
+
 function handleUndoList(): string {
   const history = getSnapshotHistory();
   if (history.length === 0) {
@@ -294,6 +398,10 @@ export function runMcpServer(): void {
           text = handleShieldList();
         } else if (toolName === 'node9_shield_enable') {
           text = handleShieldEnable(toolArgs);
+        } else if (toolName === 'node9_approver_list') {
+          text = handleApproverList();
+        } else if (toolName === 'node9_approver_set') {
+          text = handleApproverSet(toolArgs);
         } else if (toolName === 'node9_undo_list') {
           text = handleUndoList();
         } else if (toolName === 'node9_undo_revert') {
