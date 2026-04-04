@@ -40,6 +40,7 @@ class SessionCounters {
   }
 
   addCost(amount: number): void {
+    if (!isFinite(amount) || amount < 0) return;
     this._estimatedCost += amount;
   }
 
