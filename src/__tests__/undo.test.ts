@@ -295,7 +295,7 @@ describe('createShadowSnapshot', () => {
       return '';
     });
     vi.mocked(fs.existsSync).mockImplementation((p) => String(p).endsWith('snapshots.json'));
-    mockGitSuccess('treeX', 'commitX');
+    mockGitSuccess('treeX', 'commitX', { diffFiles: 'new.ts\n' });
 
     await createShadowSnapshot('edit', { file_path: 'new.ts' });
 
@@ -332,7 +332,7 @@ describe('createShadowSnapshot', () => {
       return '';
     });
     vi.mocked(fs.existsSync).mockImplementation((p) => String(p).endsWith('snapshots.json'));
-    mockGitSuccess('treeY', 'commitY');
+    mockGitSuccess('treeY', 'commitY', { diffFiles: 'new.ts\n' });
 
     await createShadowSnapshot('edit', { file_path: 'new.ts' });
 
