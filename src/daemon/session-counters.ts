@@ -10,6 +10,7 @@ export interface HudStatus {
     blocked: number;
     dlpHits: number;
     wouldBlock: number;
+    estimatedCost: number;
   };
   taintedCount: number;
   lastRuleHit: string | null;
@@ -21,6 +22,7 @@ class SessionCounters {
   private _blocked = 0;
   private _dlpHits = 0;
   private _wouldBlock = 0;
+  private _estimatedCost = 0;
   private _lastRuleHit: string | null = null;
   private _lastBlockedTool: string | null = null;
 
@@ -37,6 +39,11 @@ class SessionCounters {
     this._wouldBlock++;
   }
 
+  addCost(amount: number): void {
+    if (!isFinite(amount) || amount < 0) return;
+    this._estimatedCost += amount;
+  }
+
   recordRuleHit(label: string): void {
     this._lastRuleHit = label;
   }
@@ -49,6 +56,7 @@ class SessionCounters {
     blocked: number;
     dlpHits: number;
     wouldBlock: number;
+    estimatedCost: number;
     lastRuleHit: string | null;
     lastBlockedTool: string | null;
   } {
@@ -57,6 +65,7 @@ class SessionCounters {
       blocked: this._blocked,
       dlpHits: this._dlpHits,
       wouldBlock: this._wouldBlock,
+      estimatedCost: this._estimatedCost,
       lastRuleHit: this._lastRuleHit,
       lastBlockedTool: this._lastBlockedTool,
     };
@@ -67,6 +76,7 @@ class SessionCounters {
     this._blocked = 0;
     this._dlpHits = 0;
     this._wouldBlock = 0;
+    this._estimatedCost = 0;
     this._lastRuleHit = null;
     this._lastBlockedTool = null;
   }

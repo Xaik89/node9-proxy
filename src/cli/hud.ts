@@ -324,6 +324,14 @@ function renderSecurityLine(status: HudStatus): string {
     }
   }
 
+  // Session cost estimate
+  if (status.session.estimatedCost > 0) {
+    const cost = status.session.estimatedCost;
+    const costStr =
+      cost >= 0.01 ? `$${cost.toFixed(2)}` : cost >= 0.001 ? `$${cost.toFixed(3)}` : '<$0.001';
+    parts.push(color(DIM, `~${costStr}`));
+  }
+
   // Taint count
   if (status.taintedCount > 0) {
     parts.push(color(YELLOW, `💧 ${status.taintedCount} tainted`));

@@ -531,6 +531,7 @@ export function startDaemon(): void {
             blocked: counters.blocked,
             dlpHits: counters.dlpHits,
             wouldBlock: counters.wouldBlock,
+            estimatedCost: counters.estimatedCost,
           },
           taintedCount: taintStore.list().length,
           lastRuleHit: counters.lastRuleHit,
@@ -680,6 +681,7 @@ export function startDaemon(): void {
 
     if (req.method === 'POST' && pathname === '/events/clear') {
       activityRing.length = 0;
+      sessionCounters.reset();
       res.writeHead(200, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({ ok: true }));
     }

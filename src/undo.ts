@@ -327,6 +327,12 @@ export async function createShadowSnapshot(
       if (filesRes.status === 0) {
         capturedFiles = filesRes.stdout?.toString().trim().split('\n').filter(Boolean) ?? [];
       }
+
+      // Nothing changed since the last snapshot — skip to avoid empty duplicates
+      if (capturedFiles.length === 0) {
+        return prevEntry.hash;
+      }
+
       const diffRes = spawnSync('git', ['diff', prevEntry.hash, commitHash], {
         env: shadowEnv,
         timeout: GIT_TIMEOUT,
