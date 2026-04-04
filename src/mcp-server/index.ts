@@ -15,7 +15,13 @@ import path from 'path';
 import { getSnapshotHistory, applyUndo } from '../undo';
 import { getConfig, checkPause } from '../core';
 import { isDaemonRunning } from '../auth/daemon';
-import { listShields, readActiveShields, writeActiveShields, resolveShieldName, getShield } from '../shields';
+import {
+  listShields,
+  readActiveShields,
+  writeActiveShields,
+  resolveShieldName,
+  getShield,
+} from '../shields';
 
 // ── JSON-RPC helpers ──────────────────────────────────────────────────────────
 
@@ -130,8 +136,12 @@ function handleStatus(): string {
 
   const projectConfig = path.join(process.cwd(), 'node9.config.json');
   const globalConfig = path.join(os.homedir(), '.node9', 'config.json');
-  lines.push(`Project config (node9.config.json): ${fs.existsSync(projectConfig) ? 'present' : 'not found'}`);
-  lines.push(`Global config (~/.node9/config.json): ${fs.existsSync(globalConfig) ? 'present' : 'not found'}`);
+  lines.push(
+    `Project config (node9.config.json): ${fs.existsSync(projectConfig) ? 'present' : 'not found'}`
+  );
+  lines.push(
+    `Global config (~/.node9/config.json): ${fs.existsSync(globalConfig) ? 'present' : 'not found'}`
+  );
 
   return lines.join('\n');
 }
@@ -180,7 +190,9 @@ function handleShieldEnable(args: Record<string, unknown>): string {
   }
   const name = resolveShieldName(service);
   if (!name) {
-    throw new Error(`Unknown shield: "${service}". Run node9_shield_list to see available shields.`);
+    throw new Error(
+      `Unknown shield: "${service}". Run node9_shield_list to see available shields.`
+    );
   }
   const active = readActiveShields();
   if (active.includes(name)) {
