@@ -7,7 +7,10 @@ import path from 'path';
 import os from 'os';
 import https from 'https';
 import { DEFAULT_CONFIG } from '../../core';
-import { setupClaude, setupGemini, setupCursor, detectAgents } from '../../setup';
+import { setupClaude, setupGemini, setupCursor, setupCodex, detectAgents } from '../../setup';
+import { readActiveShields, writeActiveShields } from '../../shields';
+
+const DEFAULT_SHIELDS = ['bash-safe', 'filesystem', 'postgres'];
 
 function fireTelemetryPing(agents: string[]): void {
   try {
@@ -63,7 +66,13 @@ export function registerInitCommand(program: Command): void {
           message: 'Enable recommended safety shields? (blocks rm -rf, SQL drops, pipe-to-shell)',
           default: true,
         });
-        if (enableShields) chosenMode = 'standard';
+        if (enableShields) {
+          chosenMode = 'standard';
+          // Activate default shields — merge with any already-active shields
+          const current = readActiveShields();
+          const merged = Array.from(new Set([...current, ...DEFAULT_SHIELDS]));
+          writeActiveShields(merged);
+        }
         console.log('');
       }
 
@@ -114,9 +123,9 @@ export function registerInitCommand(program: Command): void {
 
       if (found.length === 0) {
         console.log(
-          chalk.gray('No AI agents detected. Install Claude Code, Gemini CLI, or Cursor')
+          chalk.gray('No AI agents detected. Install Claude Code, Gemini CLI, Cursor, or Codex')
         );
-        console.log(chalk.gray('then run: node9 addto <claude|gemini|cursor>'));
+        console.log(chalk.gray('then run: node9 addto <claude|gemini|cursor|codex>'));
         return;
       }
 
@@ -131,6 +140,7 @@ export function registerInitCommand(program: Command): void {
         if (agent === 'claude') await setupClaude();
         else if (agent === 'gemini') await setupGemini();
         else if (agent === 'cursor') await setupCursor();
+        else if (agent === 'codex') await setupCodex();
         console.log('');
       }
 
