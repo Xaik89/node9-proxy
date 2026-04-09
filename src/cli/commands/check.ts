@@ -83,7 +83,9 @@ export function registerCheckCommand(program: Command): void {
               const resolvedScript = fs.realpathSync(scriptPath);
               const expectedCli = fs.realpathSync(path.resolve(__dirname, '../../cli.js'));
               if (resolvedScript !== expectedCli)
-                throw new Error('node9: daemon spawn aborted — argv[1] does not resolve to the node9 CLI');
+                throw new Error(
+                  'node9: daemon spawn aborted — argv[1] does not resolve to the node9 CLI'
+                );
               // Strip env vars that can inject code into the spawned Node.js process.
               const safeEnv = { ...process.env };
               for (const key of [
