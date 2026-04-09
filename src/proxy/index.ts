@@ -21,20 +21,24 @@ export async function runProxy(targetCommand: string) {
   const args = commandParts.slice(1);
 
   let executable = cmd;
+  let useShell = false;
   try {
     const { stdout } = await execa('which', [cmd]);
     if (stdout) executable = stdout.trim();
-  } catch {}
+  } catch {
+    // Command not found as a standalone binary — may be a shell builtin or alias.
+    // Fall back to shell mode so the system shell can resolve it.
+    useShell = true;
+  }
 
   // stderr only — stdout must stay clean for stdio protocols (JSON-RPC, MCP)
   console.error(chalk.green(`🚀 Node9 Proxy Active: Monitoring [${targetCommand}]`));
 
   // Spawn the MCP Server / Shell command
-  const child = spawn(executable, args, {
-    stdio: ['pipe', 'pipe', 'inherit'], // We control STDIN and STDOUT
-    shell: false,
-    env: { ...process.env, FORCE_COLOR: '1' },
-  });
+  const spawnEnv = { ...process.env, FORCE_COLOR: '1' };
+  const child = useShell
+    ? spawn(targetCommand, { stdio: ['pipe', 'pipe', 'inherit'], shell: true, env: spawnEnv })
+    : spawn(executable, args, { stdio: ['pipe', 'pipe', 'inherit'], shell: false, env: spawnEnv });
 
   // ── INTERCEPT INPUT (Agent -> Server) ──
   // This is where 'tools/call' requests come from
