@@ -17,6 +17,10 @@
 
 **AIs are literal.** Ask an agent to "fix disk space" and it might run `docker system prune -af --volumes`.
 
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/7b22e0fb-35ff-4088-8ee9-cc23216f362f" width="100%">
+</p>
+
 With Node9:
 
 1. **AI attempts:** `Bash("docker system prune -af --volumes")`
