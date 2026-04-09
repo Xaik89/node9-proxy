@@ -82,7 +82,13 @@ export function registerCheckCommand(program: Command): void {
                 throw new Error('node9: cannot resolve CLI script path for daemon spawn');
               // Strip env vars that can inject code into the spawned Node.js process.
               const safeEnv = { ...process.env };
-              for (const key of ['NODE_OPTIONS', 'LD_PRELOAD', 'LD_LIBRARY_PATH', 'DYLD_INSERT_LIBRARIES', 'NODE_PATH']) {
+              for (const key of [
+                'NODE_OPTIONS',
+                'LD_PRELOAD',
+                'LD_LIBRARY_PATH',
+                'DYLD_INSERT_LIBRARIES',
+                'NODE_PATH',
+              ]) {
                 delete safeEnv[key];
               }
               const d = spawn(process.execPath, [scriptPath, 'daemon'], {

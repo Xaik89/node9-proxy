@@ -456,7 +456,10 @@ export async function main(): Promise<void> {
           /* file doesn't exist yet */
         }
         if (size < MAX_LOG_SIZE) {
-          fs.appendFileSync(logPath, JSON.stringify({ ts: new Date().toISOString(), stdin }) + '\n');
+          fs.appendFileSync(
+            logPath,
+            JSON.stringify({ ts: new Date().toISOString(), stdin }) + '\n'
+          );
         }
       } catch {
         /* ignore */
