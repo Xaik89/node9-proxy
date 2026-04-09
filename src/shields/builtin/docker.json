@@ -34,11 +34,18 @@
     {
       "name": "shield:docker:block-rm-force",
       "tool": "*",
+      "conditionMode": "all",
       "conditions": [
         {
           "field": "command",
           "op": "matches",
-          "value": "docker\\s+rm\\s+.*-f|docker\\s+rm\\s+.*--force",
+          "value": "docker\\s+rm\\b",
+          "flags": "i"
+        },
+        {
+          "field": "command",
+          "op": "matches",
+          "value": "(^|\\s)(-f|--force)(\\s|$)",
           "flags": "i"
         }
       ],
@@ -74,13 +81,34 @@
       "reason": "Stopping or killing containers requires human approval (Docker shield)"
     },
     {
-      "name": "shield:docker:review-rmi-force",
+      "name": "shield:docker:review-image-rm",
       "tool": "*",
       "conditions": [
         {
           "field": "command",
           "op": "matches",
-          "value": "docker\\s+rmi\\s+.*(-f|--force)|docker\\s+image\\s+rm\\s+",
+          "value": "docker\\s+image\\s+rm\\b",
+          "flags": "i"
+        }
+      ],
+      "verdict": "review",
+      "reason": "Image removal requires human approval (Docker shield)"
+    },
+    {
+      "name": "shield:docker:review-rmi-force",
+      "tool": "*",
+      "conditionMode": "all",
+      "conditions": [
+        {
+          "field": "command",
+          "op": "matches",
+          "value": "docker\\s+rmi\\b",
+          "flags": "i"
+        },
+        {
+          "field": "command",
+          "op": "matches",
+          "value": "(^|\\s)(-f|--force)(\\s|$)",
           "flags": "i"
         }
       ],
