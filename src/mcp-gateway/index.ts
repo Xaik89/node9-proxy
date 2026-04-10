@@ -21,6 +21,7 @@ import { execa } from 'execa';
 import { authorizeHeadless } from '../auth/orchestrator';
 import { buildNegotiationMessage } from '../policy/negotiation';
 import { checkProvenance } from '../utils/provenance.js';
+import { hashToolDefinitions, getServerKey, checkPin, updatePin } from '../mcp-pin';
 
 function sanitize(value: string): string {
   // eslint-disable-next-line no-control-regex
@@ -164,6 +165,12 @@ export async function runMcpGateway(upstreamCommand: string): Promise<void> {
   let deferredExitCode: number | null = null;
   let deferredStdinEnd = false;
 
+  // ── Tool pinning state ────────────────────────────────────────────────────
+  // Track tools/list request IDs so we can intercept the upstream's response
+  // and verify tool definitions against the pinned hash.
+  const pendingToolsListIds = new Set<string | number | null>();
+  const serverKey = getServerKey(upstreamCommand);
+
   // ── INTERCEPT INPUT (Agent → Gateway → Upstream) ──────────────────────────
   const agentIn = readline.createInterface({ input: process.stdin, terminal: false });
 
@@ -195,6 +202,11 @@ export async function runMcpGateway(upstreamCommand: string): Promise<void> {
       // Non-JSON line — forward as-is (handles raw shell or malformed input)
       child.stdin.write(line + '\n');
       return;
+    }
+
+    // Track tools/list request IDs so we can verify the response against pinned hashes
+    if (message.method === 'tools/list' && message.id !== undefined && message.id !== null) {
+      pendingToolsListIds.add(message.id);
     }
 
     // Only intercept tool call requests — all other messages pass through unchanged
@@ -287,7 +299,85 @@ export async function runMcpGateway(upstreamCommand: string): Promise<void> {
   });
 
   // ── FORWARD OUTPUT (Upstream → Agent) ─────────────────────────────────────
-  child.stdout.pipe(process.stdout);
+  // Replaced pipe with readline to intercept tools/list responses for pin checking.
+  // All non-tools/list messages pass through unchanged (transparent proxy).
+  const upstreamOut = readline.createInterface({ input: child.stdout, terminal: false });
+  upstreamOut.on('line', (line) => {
+    // Try to parse as JSON to check for tools/list response
+    type UpstreamMessage = {
+      id?: string | number | null;
+      result?: { tools?: unknown[] };
+      error?: unknown;
+    };
+    let parsed: UpstreamMessage | undefined;
+    try {
+      parsed = JSON.parse(line) as UpstreamMessage;
+    } catch {
+      // Not JSON — forward as-is (transparent proxy contract)
+    }
+
+    if (!parsed) {
+      process.stdout.write(line + '\n');
+      return;
+    }
+
+    // Check if this is a response to a tracked tools/list request
+    if (parsed.id !== undefined && pendingToolsListIds.has(parsed.id!)) {
+      pendingToolsListIds.delete(parsed.id!);
+
+      // Only check pins on successful responses that contain tools
+      if (parsed.result && Array.isArray(parsed.result.tools)) {
+        const tools = parsed.result.tools;
+        const currentHash = hashToolDefinitions(tools);
+        const pinStatus = checkPin(serverKey, currentHash);
+
+        if (pinStatus === 'new') {
+          // First connection — pin the tool definitions
+          const toolNames = tools
+            .map((t: unknown) => ((t as Record<string, unknown>).name as string) ?? 'unknown')
+            .sort();
+          updatePin(serverKey, upstreamCommand, currentHash, toolNames);
+          console.error(
+            chalk.green(
+              `🔒 Node9: Pinned ${toolNames.length} tool definition(s) for this MCP server`
+            )
+          );
+          // Forward the response — first use is trusted
+          process.stdout.write(line + '\n');
+        } else if (pinStatus === 'match') {
+          // Pin matches — forward unchanged
+          process.stdout.write(line + '\n');
+        } else {
+          // MISMATCH — possible rug pull attack. Block the response.
+          console.error(
+            chalk.red('\n🚨 Node9: MCP tool definitions have changed since last verified!')
+          );
+          console.error(
+            chalk.red('   This could indicate a supply chain attack (tool poisoning / rug pull).')
+          );
+          console.error(chalk.yellow(`   Run: node9 mcp pin update ${serverKey}\n`));
+          const errorResponse = {
+            jsonrpc: '2.0',
+            id: parsed.id,
+            error: {
+              code: RPC_SERVER_ERROR,
+              message:
+                'Node9 Security: MCP server tool definitions have changed since they were last pinned. ' +
+                'This could indicate a supply chain attack (tool poisoning / rug pull). ' +
+                'The human operator must review and approve the changes. ' +
+                `Run: node9 mcp pin update ${serverKey}`,
+              data: { reason: 'tool-pin-mismatch', serverKey },
+            },
+          };
+          process.stdout.write(JSON.stringify(errorResponse) + '\n');
+        }
+        return;
+      }
+    }
+
+    // All other messages — forward unchanged
+    process.stdout.write(line + '\n');
+  });
 
   // ── LIFECYCLE ──────────────────────────────────────────────────────────────
   // Agent disconnected → close the child's stdin so it knows input is done,
