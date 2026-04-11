@@ -3,7 +3,7 @@
 ### The "Sudo" Command for AI Agents.
 
 [![NPM Version](https://img.shields.io/npm/v/@node9/proxy.svg)](https://www.npmjs.com/package/@node9/proxy)
-[![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Open in HF Spaces](https://huggingface.co/datasets/huggingface/badges/resolve/main/open-in-hf-spaces-sm.svg)](https://huggingface.co/spaces/Node9ai/node9-security-demo)
 [![Documentation](https://img.shields.io/badge/docs-node9.ai%2Fdocs-blue)](https://node9.ai/docs)
 
@@ -83,6 +83,24 @@ Wrap any MCP server transparently. The AI sees the same server — Node9 interce
 ```
 
 Or use `node9 setup` — it wraps existing MCP servers automatically.
+
+### MCP Tool Pinning — rug pull defense
+
+MCP servers can change their tool definitions between sessions. A compromised or malicious server could silently add, remove, or modify tools after initial trust — a **rug pull** attack.
+
+Node9 defends against this by **pinning** tool definitions on first use:
+
+1. **First connection** — the gateway records a SHA-256 hash of all tool definitions
+2. **Subsequent connections** — the hash is compared; if tools changed, the session is **quarantined** and all tool calls are blocked until a human reviews and approves the change
+3. **Corrupt pin state** — fails closed (blocks), never silently re-trusts
+
+```bash
+node9 mcp pin list                # show all pinned servers and hashes
+node9 mcp pin update <serverKey>  # remove pin, re-pin on next connection
+node9 mcp pin reset               # clear all pins (re-pin on next connection)
+```
+
+This is automatic — no configuration needed. The gateway pins on first `tools/list` and enforces on every subsequent session.
 
 ---
 

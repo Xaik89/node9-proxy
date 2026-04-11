@@ -41,34 +41,23 @@ jobs:
           git config user.email "bot@node9.ai"
           git fetch origin ${{ github.base_ref || 'main' }}
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: 'npm'
 
-      - name: Install dependencies
-        run: |
-          pip install -r .github/node9/requirements.txt
-          npm ci --prefer-offline
+      - name: Install project dependencies
+        run: npm ci --prefer-offline
 
-      - name: Run node9 review
-        env:
-          PYTHONUNBUFFERED: '1'
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          NODE9_API_KEY: ${{ secrets.NODE9_API_KEY }}
-          NODE9_API_URL: ${{ secrets.NODE9_API_URL || vars.NODE9_API_URL }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_HEAD_REF: ${{ github.event.client_payload.head_ref || github.head_ref || github.ref_name }}
-          GITHUB_BASE_REF: ${{ github.event.client_payload.base_ref || github.base_ref || 'main' }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          CI: 'true'
-          NODE9_TESTING: '1'
-          NODE9_TEST_CMD: 'npm run build 2>&1 && npm test 2>&1'
-          ITERATION: ${{ github.event.client_payload.iteration || '1' }}
-          FEEDBACK: ${{ github.event.client_payload.feedback || '' }}
-          DRAFT_PR_NUMBER: ${{ github.event.client_payload.draft_pr_number || '' }}
-        run: python .github/node9/agent.py
+      - uses: node9-ai/node9-pr-agent@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          node9_api_key: ${{ secrets.NODE9_API_KEY }}
+          node9_api_url: ${{ secrets.NODE9_API_URL || vars.NODE9_API_URL }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          test_cmd: 'npm run build 2>&1 && npm test 2>&1'
+          head_ref: ${{ github.event.client_payload.head_ref || github.head_ref || github.ref_name }}
+          base_ref: ${{ github.event.client_payload.base_ref || github.base_ref || 'main' }}
+          iteration: ${{ github.event.client_payload.iteration || '1' }}
+          feedback: ${{ github.event.client_payload.feedback || '' }}
+          draft_pr_number: ${{ github.event.client_payload.draft_pr_number || '' }}

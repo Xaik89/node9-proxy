@@ -41,6 +41,7 @@ import { registerWatchCommand } from './cli/commands/watch';
 import { registerMcpGatewayCommand } from './cli/commands/mcp-gateway';
 import { registerMcpServerCommand } from './cli/commands/mcp-server';
 import { registerTrustCommand } from './cli/commands/trust';
+import { registerMcpPinCommand } from './cli/commands/mcp-pin';
 
 const { version } = JSON.parse(
   fs.readFileSync(path.join(__dirname, '../package.json'), 'utf-8')
@@ -393,9 +394,10 @@ program
 // node9 watch
 registerWatchCommand(program);
 
-// node9 mcp-gateway
+// node9 mcp-gateway + mcp pin
 registerMcpGatewayCommand(program);
 registerMcpServerCommand(program);
+registerMcpPinCommand(program);
 
 // 7. CHECK (PreToolUse hook) + LOG (PostToolUse hook)
 registerCheckCommand(program);
