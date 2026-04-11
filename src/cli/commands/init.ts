@@ -161,10 +161,15 @@ export function registerInitCommand(program: Command): void {
       }
 
       // ── Summary ────────────────────────────────────────────────────────────
-      console.log(chalk.green.bold('🛡️  Node9 is ready!'));
+      const agentList = found.join(', ');
+      console.log(chalk.green.bold(`🛡️  Node9 is protecting ${agentList}!`));
       console.log('');
-      console.log(chalk.white('  Start watching:  ') + chalk.cyan('node9 tail'));
-      console.log(chalk.white('  Browser view:    ') + chalk.cyan('node9 daemon --openui'));
-      console.log(chalk.white('  Cloud dashboard: ') + chalk.cyan('node9.ai'));
+      console.log(chalk.white('  Watch live:  ') + chalk.cyan('node9 tail'));
+      console.log(chalk.white('  Local UI:    ') + chalk.cyan('node9 daemon --openui'));
+      console.log('');
+      console.log(chalk.gray('  ─────────────────────────────────────────────────'));
+      console.log(chalk.white('  Want team dashboard + full audit trail?'));
+      console.log(chalk.white('  Sign up free → ') + chalk.cyan.bold('https://node9.ai/signup'));
+      console.log(chalk.gray('  ─────────────────────────────────────────────────'));
     });
 }
