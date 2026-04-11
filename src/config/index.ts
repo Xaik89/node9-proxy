@@ -219,7 +219,7 @@ export const DEFAULT_CONFIG: Config = {
           {
             field: 'command',
             op: 'matches',
-            value: '^\\s*git\\b.*\\bpush\\b.*(--force|--force-with-lease|-f\\b)',
+            value: '\\bgit\\b.*\\bpush\\b.*(--force|--force-with-lease|-f\\b)',
             flags: 'i',
           },
         ],
@@ -234,7 +234,7 @@ export const DEFAULT_CONFIG: Config = {
           {
             field: 'command',
             op: 'matches',
-            value: '^\\s*git\\b.*\\bpush\\b(?!.*(-f\\b|--force|--force-with-lease))',
+            value: '\\bgit\\b.*\\bpush\\b(?!.*(-f\\b|--force|--force-with-lease))',
             flags: 'i',
           },
         ],
@@ -250,7 +250,7 @@ export const DEFAULT_CONFIG: Config = {
             field: 'command',
             op: 'matches',
             value:
-              '^\\s*git\\b.*(reset\\s+--hard|clean\\s+-[fdxX]|\\brebase\\b|tag\\s+-d|branch\\s+-[dD])',
+              '\\bgit\\b.*(reset\\s+--hard|clean\\s+-[fdxX]|\\brebase\\b|tag\\s+-d|branch\\s+-[dD])',
             flags: 'i',
           },
         ],
@@ -262,7 +262,7 @@ export const DEFAULT_CONFIG: Config = {
       {
         name: 'review-sudo',
         tool: 'bash',
-        conditions: [{ field: 'command', op: 'matches', value: '^\\s*sudo\\s', flags: 'i' }],
+        conditions: [{ field: 'command', op: 'matches', value: '\\bsudo\\s', flags: 'i' }],
         conditionMode: 'all',
         verdict: 'review',
         reason: 'Command requires elevated privileges',
