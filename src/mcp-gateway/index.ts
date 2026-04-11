@@ -21,6 +21,7 @@ import { execa } from 'execa';
 import { authorizeHeadless } from '../auth/orchestrator';
 import { buildNegotiationMessage } from '../policy/negotiation';
 import { checkProvenance } from '../utils/provenance.js';
+import { hashToolDefinitions, getServerKey, checkPin, updatePin } from '../mcp-pin';
 
 function sanitize(value: string): string {
   // eslint-disable-next-line no-control-regex
@@ -164,6 +165,22 @@ export async function runMcpGateway(upstreamCommand: string): Promise<void> {
   let deferredExitCode: number | null = null;
   let deferredStdinEnd = false;
 
+  // ── Tool pinning state ────────────────────────────────────────────────────
+  // Track tools/list request IDs so we can intercept the upstream's response
+  // and verify tool definitions against the pinned hash.
+  const pendingToolsListIds = new Set<string | number | null>();
+  const serverKey = getServerKey(upstreamCommand);
+
+  // Session quarantine: tracks whether pin validation has passed for this session.
+  // 'pending'    — no tools/list response checked yet; tools/call blocked
+  // 'validated'  — pin check passed (new or match); tools/call allowed
+  // 'quarantined' — pin mismatch or corrupt pin file; tools/call permanently blocked
+  let pinState: 'pending' | 'validated' | 'quarantined' = 'pending';
+
+  // Queue for tool call lines that arrive while pin validation is pending.
+  // These are replayed (in order) once pin validation completes.
+  const pendingToolCalls: string[] = [];
+
   // ── INTERCEPT INPUT (Agent → Gateway → Upstream) ──────────────────────────
   const agentIn = readline.createInterface({ input: process.stdin, terminal: false });
 
@@ -197,14 +214,66 @@ export async function runMcpGateway(upstreamCommand: string): Promise<void> {
       return;
     }
 
+    // Track tools/list request IDs so we can verify the response against pinned hashes.
+    if (message.method === 'tools/list' && message.id !== undefined && message.id !== null) {
+      pendingToolsListIds.add(message.id);
+    }
+
     // Only intercept tool call requests — all other messages pass through unchanged
     if (
       message.method === 'tools/call' ||
       message.method === 'call_tool' ||
       message.method === 'use_tool'
     ) {
-      // Pause the stream so we don't process the next request while waiting for approval
-      agentIn.pause();
+      // ── Session quarantine gate ──────────────────────────────────────────
+      // Block tool calls if pin validation hasn't passed or if the session
+      // is quarantined due to a mismatch / corrupt pin file.
+      if (pinState === 'quarantined') {
+        // Notifications (no id) must not receive a response per JSON-RPC spec.
+        if (message.id === undefined || message.id === null) return;
+        const errorResponse = {
+          jsonrpc: '2.0',
+          id: message.id,
+          error: {
+            code: RPC_SERVER_ERROR,
+            message:
+              'Node9 Security: This MCP session is quarantined due to a tool definition mismatch or corrupt pin state. ' +
+              'The human operator must review and approve changes before tool calls are allowed. ' +
+              `Run: node9 mcp pin update ${serverKey}`,
+            data: { reason: 'pin-quarantine', serverKey, pinState },
+          },
+        };
+        process.stdout.write(JSON.stringify(errorResponse) + '\n');
+        return;
+      }
+      if (pinState === 'pending') {
+        if (pendingToolsListIds.size > 0) {
+          // A tools/list is in flight — queue and replay after pin validation.
+          pendingToolCalls.push(line);
+          return;
+        }
+        // No tools/list in flight — client skipped verification entirely.
+        // Notifications (no id) are silently dropped per JSON-RPC spec.
+        if (message.id === undefined || message.id === null) return;
+        const errorResponse = {
+          jsonrpc: '2.0',
+          id: message.id,
+          error: {
+            code: RPC_SERVER_ERROR,
+            message:
+              'Node9 Security: Tool calls are blocked until MCP tool definitions have been verified. ' +
+              'The client must issue a tools/list request before calling tools.',
+            data: { reason: 'pin-quarantine', serverKey, pinState },
+          },
+        };
+        process.stdout.write(JSON.stringify(errorResponse) + '\n');
+        return;
+      }
+
+      // Pause the stream so we don't process the next request while waiting for approval.
+      // Guard against ERR_USE_AFTER_CLOSE: when drainPendingToolCalls replays queued calls
+      // after stdin has already closed, agentIn is closed and pause() would throw.
+      if (!deferredStdinEnd) agentIn.pause();
       authPending = true;
 
       try {
@@ -286,8 +355,141 @@ export async function runMcpGateway(upstreamCommand: string): Promise<void> {
     child.stdin.write(line + '\n');
   });
 
+  // ── Queue drain ────────────────────────────────────────────────────────────
+  // Replay tool call lines that were queued while pin validation was pending.
+  // Called from the upstream output handler after pin state is resolved.
+  function drainPendingToolCalls(): void {
+    if (pendingToolCalls.length === 0) {
+      // No queued calls. If stdin already closed, end child stdin now.
+      if (deferredStdinEnd && !authPending) child.stdin.end();
+      return;
+    }
+    const lines = pendingToolCalls.splice(0);
+    for (const queuedLine of lines) {
+      // Re-emit the line so the agentIn handler processes it again.
+      // pinState is now resolved, so the quarantine gate will either
+      // allow (validated) or block (quarantined) each queued call.
+      agentIn.emit('line', queuedLine);
+    }
+    // If all queued calls were blocked (quarantined) and no auth is pending,
+    // end child stdin since the deferred close was never resolved.
+    if (deferredStdinEnd && !authPending) child.stdin.end();
+  }
+
   // ── FORWARD OUTPUT (Upstream → Agent) ─────────────────────────────────────
-  child.stdout.pipe(process.stdout);
+  // Replaced pipe with readline to intercept tools/list responses for pin checking.
+  // All non-tools/list messages pass through unchanged (transparent proxy).
+  const upstreamOut = readline.createInterface({ input: child.stdout, terminal: false });
+  upstreamOut.on('line', (line) => {
+    // Try to parse as JSON to check for tools/list response
+    type UpstreamMessage = {
+      id?: string | number | null;
+      result?: { tools?: unknown[] };
+      error?: unknown;
+    };
+    let parsed: UpstreamMessage | undefined;
+    try {
+      parsed = JSON.parse(line) as UpstreamMessage;
+    } catch {
+      // Not JSON — forward as-is (transparent proxy contract)
+    }
+
+    if (!parsed) {
+      process.stdout.write(line + '\n');
+      return;
+    }
+
+    // Check if this is a response to a tracked tools/list request
+    if (parsed.id !== undefined && pendingToolsListIds.has(parsed.id!)) {
+      pendingToolsListIds.delete(parsed.id!);
+
+      // Only check pins on successful responses that contain tools
+      if (parsed.result && Array.isArray(parsed.result.tools)) {
+        const tools = parsed.result.tools;
+        const currentHash = hashToolDefinitions(tools);
+        const pinStatus = checkPin(serverKey, currentHash);
+
+        if (pinStatus === 'new') {
+          // First connection — pin the tool definitions
+          const toolNames = tools
+            .map((t: unknown) => ((t as Record<string, unknown>).name as string) ?? 'unknown')
+            .sort();
+          updatePin(serverKey, upstreamCommand, currentHash, toolNames);
+          pinState = 'validated';
+
+          console.error(
+            chalk.green(
+              `🔒 Node9: Pinned ${toolNames.length} tool definition(s) for this MCP server`
+            )
+          );
+          // Forward the response — first use is trusted
+          process.stdout.write(line + '\n');
+          drainPendingToolCalls();
+        } else if (pinStatus === 'match') {
+          // Pin matches — forward unchanged
+          pinState = 'validated';
+          process.stdout.write(line + '\n');
+          drainPendingToolCalls();
+        } else if (pinStatus === 'corrupt') {
+          // Pin file is corrupt — fail closed, quarantine the session
+          pinState = 'quarantined';
+          console.error(
+            chalk.red('\n🚨 Node9: MCP pin file is corrupt or unreadable — session quarantined!')
+          );
+          console.error(chalk.red('   Tool calls are blocked until the pin file is repaired.'));
+          console.error(
+            chalk.yellow(`   Run: node9 mcp pin reset  (to clear and re-pin on next connect)\n`)
+          );
+          const errorResponse = {
+            jsonrpc: '2.0',
+            id: parsed.id,
+            error: {
+              code: RPC_SERVER_ERROR,
+              message:
+                'Node9 Security: MCP pin file is corrupt or unreadable. ' +
+                'Tool definitions cannot be verified. Session quarantined. ' +
+                'The human operator must repair or reset the pin file. ' +
+                'Run: node9 mcp pin reset',
+              data: { reason: 'pin-file-corrupt', serverKey },
+            },
+          };
+          process.stdout.write(JSON.stringify(errorResponse) + '\n');
+          drainPendingToolCalls();
+        } else {
+          // MISMATCH — possible rug pull attack. Block the response, quarantine session.
+          pinState = 'quarantined';
+          console.error(
+            chalk.red('\n🚨 Node9: MCP tool definitions have changed since last verified!')
+          );
+          console.error(
+            chalk.red('   This could indicate a supply chain attack (tool poisoning / rug pull).')
+          );
+          console.error(chalk.red('   Session quarantined — all tool calls blocked.'));
+          console.error(chalk.yellow(`   Run: node9 mcp pin update ${serverKey}\n`));
+          const errorResponse = {
+            jsonrpc: '2.0',
+            id: parsed.id,
+            error: {
+              code: RPC_SERVER_ERROR,
+              message:
+                'Node9 Security: MCP server tool definitions have changed since they were last pinned. ' +
+                'This could indicate a supply chain attack (tool poisoning / rug pull). ' +
+                'Session quarantined — all tool calls are blocked. ' +
+                'The human operator must review and approve the changes. ' +
+                `Run: node9 mcp pin update ${serverKey}`,
+              data: { reason: 'tool-pin-mismatch', serverKey },
+            },
+          };
+          process.stdout.write(JSON.stringify(errorResponse) + '\n');
+          drainPendingToolCalls();
+        }
+        return;
+      }
+    }
+
+    // All other messages — forward unchanged
+    process.stdout.write(line + '\n');
+  });
 
   // ── LIFECYCLE ──────────────────────────────────────────────────────────────
   // Agent disconnected → close the child's stdin so it knows input is done,
@@ -295,7 +497,7 @@ export async function runMcpGateway(upstreamCommand: string): Promise<void> {
   // (child.kill() would race with in-flight responses still being piped.)
   // Defer if auth is in flight — we must write the forwarded message first.
   process.stdin.on('close', () => {
-    if (authPending) {
+    if (authPending || pendingToolCalls.length > 0) {
       deferredStdinEnd = true;
     } else {
       child.stdin.end();
