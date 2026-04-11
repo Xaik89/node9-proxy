@@ -112,10 +112,12 @@ describe('pin file operations', () => {
     tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'node9-pin-test-'));
     origHome = process.env.HOME!;
     process.env.HOME = tmpHome;
+    process.env.USERPROFILE = tmpHome; // Windows: os.homedir() reads USERPROFILE, not HOME
   });
 
   afterEach(() => {
     process.env.HOME = origHome;
+    process.env.USERPROFILE = origHome; // restore Windows env var too
     fs.rmSync(tmpHome, { recursive: true, force: true });
   });
 
@@ -173,7 +175,7 @@ describe('pin file operations', () => {
     expect(entry.pinnedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/); // ISO date
   });
 
-  it('pin file is created with mode 0o600', () => {
+  it('pin file is created with mode 0o600', { skip: process.platform === 'win32' }, () => {
     updatePin('key1', 'cmd1', 'a'.repeat(64), ['t1']);
     const pinPath = path.join(tmpHome, '.node9', 'mcp-pins.json');
     const stat = fs.statSync(pinPath);

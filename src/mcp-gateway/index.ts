@@ -270,8 +270,10 @@ export async function runMcpGateway(upstreamCommand: string): Promise<void> {
         return;
       }
 
-      // Pause the stream so we don't process the next request while waiting for approval
-      agentIn.pause();
+      // Pause the stream so we don't process the next request while waiting for approval.
+      // Guard against ERR_USE_AFTER_CLOSE: when drainPendingToolCalls replays queued calls
+      // after stdin has already closed, agentIn is closed and pause() would throw.
+      if (!deferredStdinEnd) agentIn.pause();
       authPending = true;
 
       try {
