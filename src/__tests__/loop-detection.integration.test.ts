@@ -79,7 +79,7 @@ beforeAll(() => {
   }
 });
 
-describe('loop detection — default config (threshold=3, window=120s)', () => {
+describe('loop detection — default config (threshold=5, window=120s)', () => {
   let tmpHome: string;
 
   beforeEach(() => {
@@ -91,21 +91,29 @@ describe('loop detection — default config (threshold=3, window=120s)', () => {
 
   const payload = { tool_name: 'bash', tool_input: { command: 'echo stuck' } };
 
-  it('allows first two identical calls (below threshold)', () => {
+  it('allows first four identical calls (below threshold)', () => {
     const r1 = runCheck(payload, { HOME: tmpHome }, tmpHome);
     expect(r1.status).toBe(0);
 
     const r2 = runCheck(payload, { HOME: tmpHome }, tmpHome);
     expect(r2.status).toBe(0);
-  });
-
-  it('blocks the third identical call with loop reason', () => {
-    runCheck(payload, { HOME: tmpHome }, tmpHome);
-    runCheck(payload, { HOME: tmpHome }, tmpHome);
 
     const r3 = runCheck(payload, { HOME: tmpHome }, tmpHome);
-    expect(r3.status).toBe(2);
-    const parsed = JSON.parse(r3.stdout.trim());
+    expect(r3.status).toBe(0);
+
+    const r4 = runCheck(payload, { HOME: tmpHome }, tmpHome);
+    expect(r4.status).toBe(0);
+  });
+
+  it('blocks the fifth identical call with a gentle loop message', () => {
+    runCheck(payload, { HOME: tmpHome }, tmpHome);
+    runCheck(payload, { HOME: tmpHome }, tmpHome);
+    runCheck(payload, { HOME: tmpHome }, tmpHome);
+    runCheck(payload, { HOME: tmpHome }, tmpHome);
+
+    const r5 = runCheck(payload, { HOME: tmpHome }, tmpHome);
+    expect(r5.status).toBe(2);
+    const parsed = JSON.parse(r5.stdout.trim());
     expect(parsed.decision).toBe('block');
     expect(parsed.reason).toContain('Loop Detected');
   });

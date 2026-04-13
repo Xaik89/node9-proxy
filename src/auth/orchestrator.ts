@@ -388,9 +388,9 @@ async function _authorizeHeadlessCore(
       const loopResult = recordAndCheck(toolName, args, ld.threshold, ld.windowSeconds * 1000);
       if (loopResult.looping) {
         const reason =
-          `🔄 Loop detected: "${toolName}" called ${loopResult.count} times ` +
-          `with identical arguments in ${ld.windowSeconds}s. ` +
-          `The agent may be stuck — try a different approach.`;
+          `It looks like you've called "${toolName}" ${loopResult.count} times with identical arguments ` +
+          `in the last ${ld.windowSeconds}s. Are you stuck? Step back and reconsider your approach — ` +
+          `what are you actually trying to accomplish, and is there a different way to get there?`;
         if (!isManual)
           appendLocalAudit(toolName, args, 'deny', 'loop-detected', meta, hashAuditArgs);
         return {

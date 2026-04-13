@@ -309,7 +309,7 @@ export const DEFAULT_CONFIG: Config = {
       },
     ],
     dlp: { enabled: true, scanIgnoredTools: true },
-    loopDetection: { enabled: true, threshold: 3, windowSeconds: 120 },
+    loopDetection: { enabled: true, threshold: 5, windowSeconds: 120 },
   },
   environments: {},
 };
