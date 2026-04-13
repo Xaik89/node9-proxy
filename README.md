@@ -3,7 +3,7 @@
 ### The "Sudo" Command for AI Agents.
 
 [![NPM Version](https://img.shields.io/npm/v/@node9/proxy.svg)](https://www.npmjs.com/package/@node9/proxy)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Open in HF Spaces](https://huggingface.co/datasets/huggingface/badges/resolve/main/open-in-hf-spaces-sm.svg)](https://huggingface.co/spaces/Node9ai/node9-security-demo)
 [![Documentation](https://img.shields.io/badge/docs-node9.ai%2Fdocs-blue)](https://node9.ai/docs)
 
@@ -15,18 +15,18 @@
 
 ## The "Aha!" Moment
 
-**AIs are literal.** Ask an agent to "fix disk space" and it might run `docker system prune -af --volumes`.
+**AIs move fast.** Ask an agent to "ship the fix" and it might push straight to git without asking you.
 
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/7b22e0fb-35ff-4088-8ee9-cc23216f362f" width="100%">
+  <img src="https://github.com/user-attachments/assets/4aa6e45b-9aba-4953-9ce3-548226622588" width="100%">
 </p>
 
 With Node9:
 
-1. **AI attempts:** `Bash("docker system prune -af --volumes")`
+1. **AI attempts:** `Bash("git push origin main")`
 2. **Node9 intercepts:** OS-native popup appears instantly
 3. **You block it** — one click
-4. **AI pivots:** _"I'll remove large log files instead"_
+4. **AI pivots:** _"I'll create a PR for review instead"_
 
 ---
 
@@ -125,6 +125,26 @@ configure(agent_name="my-agent", policy="require_approval")
 - **Shell:** blocks `curl | bash`, `sudo` commands
 - **DLP:** blocks AWS keys, GitHub tokens, Stripe keys, PEM private keys in any tool call argument
 - **Auto-undo:** git snapshot before every AI file edit → `node9 undo` to revert
+
+---
+
+## Flight Recorder & HUD
+
+Every tool call your AI agent makes is recorded — command, arguments, result, and cost estimate. Node9 wires a live statusline into Claude Code that shows you what's happening in real time:
+
+```
+🛡 node9 | standard | [bash-safe] | ✅ 12 allowed  🛑 2 blocked  🚨 0 dlp | ~$0.43 | ⚡ no-force-push
+📊 claude-opus-4-6 | ctx [████████░░░░░░░] 54% | 5h [██░░░░░░░░░░░░░] 12% | 7d [█░░░░░░░░░░░░░░] 7%
+🗂 2 CLAUDE.md | 8 rules | 3 MCPs | 4 hooks
+```
+
+**Line 1 — Security state:** active mode, enabled shields, session totals (allowed / blocked / DLP hits), estimated cost, last rule that fired.
+
+**Line 2 — Context & rate limits:** model name, context window usage, 5-hour and 7-day token rate-limit bars — so you can see when an agent is burning through quota.
+
+**Line 3 — Environment:** how many CLAUDE.md files, rules, MCP servers, and hooks are active in the current project.
+
+The HUD is wired automatically by `node9 setup`. Full session logs land in `~/.node9/audit.log`.
 
 ---
 

@@ -258,6 +258,8 @@ export async function evaluatePolicy(
   dependsOnStatePredicates?: string[];
   /** Recovery command to suggest when this rule hard-blocks (from SmartRule.recoveryCommand). */
   recoveryCommand?: string;
+  /** Plain-English description of what the rule does (from SmartRule.description). */
+  ruleDescription?: string;
 }> {
   const config = getConfig();
 
@@ -278,6 +280,9 @@ export async function evaluatePolicy(
         reason: matchedRule.reason,
         tier: 2,
         ruleName: matchedRule.name ?? matchedRule.tool,
+        ...((matchedRule.description ?? matchedRule.reason) && {
+          ruleDescription: matchedRule.description ?? matchedRule.reason,
+        }),
         ...(matchedRule.verdict === 'block' &&
           matchedRule.dependsOnState?.length && {
             dependsOnStatePredicates: matchedRule.dependsOnState,
