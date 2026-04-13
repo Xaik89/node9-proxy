@@ -43,6 +43,7 @@ import { registerMcpGatewayCommand } from './cli/commands/mcp-gateway';
 import { registerMcpServerCommand } from './cli/commands/mcp-server';
 import { registerTrustCommand } from './cli/commands/trust';
 import { registerMcpPinCommand } from './cli/commands/mcp-pin';
+import { registerSkillPinCommand } from './cli/commands/skill-pin';
 
 const { version } = JSON.parse(
   fs.readFileSync(path.join(__dirname, '../package.json'), 'utf-8')
@@ -400,6 +401,7 @@ registerWatchCommand(program);
 registerMcpGatewayCommand(program);
 registerMcpServerCommand(program);
 registerMcpPinCommand(program);
+registerSkillPinCommand(program);
 
 // 7. CHECK (PreToolUse hook) + LOG (PostToolUse hook)
 registerCheckCommand(program);

@@ -85,6 +85,7 @@ export interface Config {
       threshold: number;
       windowSeconds: number;
     };
+    skillRoots: string[];
   };
   environments: Record<string, EnvironmentConfig>;
 }
@@ -310,6 +311,7 @@ export const DEFAULT_CONFIG: Config = {
     ],
     dlp: { enabled: true, scanIgnoredTools: true },
     loopDetection: { enabled: true, threshold: 5, windowSeconds: 120 },
+    skillRoots: [],
   },
   environments: {},
 };
@@ -524,6 +526,7 @@ export function getConfig(cwd?: string): Config {
     },
     dlp: { ...DEFAULT_CONFIG.policy.dlp },
     loopDetection: { ...DEFAULT_CONFIG.policy.loopDetection },
+    skillRoots: [...DEFAULT_CONFIG.policy.skillRoots],
   };
   const mergedEnvironments: Record<string, EnvironmentConfig> = { ...DEFAULT_CONFIG.environments };
 
@@ -580,6 +583,11 @@ export function getConfig(cwd?: string): Config {
       if (ld.threshold !== undefined) mergedPolicy.loopDetection.threshold = ld.threshold;
       if (ld.windowSeconds !== undefined)
         mergedPolicy.loopDetection.windowSeconds = ld.windowSeconds;
+    }
+    if (Array.isArray(p.skillRoots)) {
+      for (const r of p.skillRoots) {
+        if (typeof r === 'string' && r.length > 0) mergedPolicy.skillRoots.push(r);
+      }
     }
 
     const envs = (source.environments || {}) as Record<string, unknown>;
@@ -639,6 +647,7 @@ export function getConfig(cwd?: string): Config {
   mergedPolicy.sandboxPaths = [...new Set(mergedPolicy.sandboxPaths)];
   mergedPolicy.dangerousWords = [...new Set(mergedPolicy.dangerousWords)];
   mergedPolicy.ignoredTools = [...new Set(mergedPolicy.ignoredTools)];
+  mergedPolicy.skillRoots = [...new Set(mergedPolicy.skillRoots)];
   mergedPolicy.snapshot.tools = [...new Set(mergedPolicy.snapshot.tools)];
   mergedPolicy.snapshot.onlyPaths = [...new Set(mergedPolicy.snapshot.onlyPaths)];
   mergedPolicy.snapshot.ignorePaths = [...new Set(mergedPolicy.snapshot.ignorePaths)];

@@ -126,6 +126,7 @@ export const ConfigFileSchema = z
             windowSeconds: z.number().min(10).optional(),
           })
           .optional(),
+        skillRoots: z.array(z.string()).optional(),
       })
       .optional(),
     environments: z.record(z.object({ requireApproval: z.boolean().optional() })).optional(),
