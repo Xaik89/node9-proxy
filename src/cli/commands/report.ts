@@ -296,6 +296,9 @@ export function registerReportCommand(program: Command): void {
       const COL = Math.floor(INNER / 2) - 1;
       const LABEL = 24;
       const BAR = Math.max(6, Math.min(14, COL - LABEL - 8));
+      // Fixed-width count columns so numbers right-align regardless of magnitude
+      const TOOL_COUNT_W = Math.max(...topTools.map(([, v]) => num(v.calls).length), 1);
+      const BLOCK_COUNT_W = Math.max(...topBlocks.map(([, v]) => num(v).length), 1);
 
       const line = chalk.dim('─'.repeat(W - 2));
 
@@ -339,37 +342,40 @@ export function registerReportCommand(program: Command): void {
       console.log('');
 
       // ── Top Tools | Top Blocks ──
-      const toolHeader = chalk.bold('Top Tools');
-      const blockHeader = chalk.bold('Top Blocks');
-      // Fixed-width column headers (no chalk on the spacer)
-      console.log('  ' + toolHeader.padEnd(COL + 10) + '  ' + blockHeader);
+      const toolHeaderRaw = 'Top Tools';
+      const blockHeaderRaw = 'Top Blocks';
+      console.log(
+        '  ' +
+          chalk.bold(toolHeaderRaw) +
+          ' '.repeat(COL - toolHeaderRaw.length) +
+          '  ' +
+          chalk.bold(blockHeaderRaw)
+      );
       console.log('  ' + chalk.dim('─'.repeat(COL)) + '  ' + chalk.dim('─'.repeat(COL)));
 
       const rows = Math.max(topTools.length, topBlocks.length, 1);
       for (let i = 0; i < rows; i++) {
-        // Left: tool
-        let leftRaw = ' '.repeat(COL);
+        // Left: tool — fixed layout: LABEL + BAR + space + right-aligned count
         let leftStyled = ' '.repeat(COL);
         if (i < topTools.length) {
-          const [tool, { calls, blocked: tb }] = topTools[i];
+          const [tool, { calls }] = topTools[i];
           const label = tool.length > LABEL - 1 ? tool.slice(0, LABEL - 2) + '…' : tool;
+          const countStr = num(calls).padStart(TOOL_COUNT_W);
           const b = colorBar(calls, maxTool, BAR);
-          const count = chalk.white(num(calls));
-          const note = tb > 0 ? chalk.red(` ${tb}✗`) : '';
-          leftRaw = label.padEnd(LABEL) + barStr(calls, maxTool, BAR) + ' ' + num(calls);
-          leftStyled = chalk.white(label.padEnd(LABEL)) + b + ' ' + count + note;
-          // Pad to column width using raw length
-          const pad = Math.max(0, COL - leftRaw.length);
-          leftStyled += ' '.repeat(pad);
+          const rawLen = LABEL + BAR + 1 + TOOL_COUNT_W;
+          const pad = Math.max(0, COL - rawLen);
+          leftStyled =
+            chalk.white(label.padEnd(LABEL)) + b + ' ' + chalk.white(countStr) + ' '.repeat(pad);
         }
 
-        // Right: block reason
+        // Right: block reason — fixed layout: LABEL + BAR + space + right-aligned count
         let rightStyled = '';
         if (i < topBlocks.length) {
           const [reason, count] = topBlocks[i];
           const label = reason.length > LABEL - 1 ? reason.slice(0, LABEL - 2) + '…' : reason;
+          const countStr = num(count).padStart(BLOCK_COUNT_W);
           const b = colorBar(count, maxBlock, BAR);
-          rightStyled = chalk.white(label.padEnd(LABEL)) + b + ' ' + chalk.red(num(count));
+          rightStyled = chalk.white(label.padEnd(LABEL)) + b + ' ' + chalk.red(countStr);
         }
 
         console.log('  ' + leftStyled + '  ' + rightStyled);
