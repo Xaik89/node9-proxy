@@ -10,15 +10,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
-- **Skills Pinning:** Extends MCP tool pinning to agent skill files — `~/.claude/skills/`, `~/.claude/CLAUDE.md`, `~/.claude/rules/`, project `.claude/CLAUDE.md`, `.claude/CLAUDE.local.md`, `.claude/rules/`, `.cursor/rules/`, `AGENTS.md`, `CLAUDE.md`. On the first tool call of a session Node9 records a SHA-256 hash of every skill file; on subsequent sessions hashes are re-checked and any difference **quarantines** the session, blocking every tool call until a human reviews via `node9 skill pin update <rootKey>`. Covers:
-  - **AST 02 Supply Chain Compromise** — malicious skill-registry overwrites
-  - **AST 07 Update Drift** — auto-updated skills carrying backdoors
+- **Skills Pinning:** Extends MCP tool pinning to agent skill files. Off by default (`policy.skillPinning.enabled: false`); opt-in for users who want drift detection on `~/.claude/skills/`, `~/.claude/CLAUDE.md`, `.cursor/rules/`, `AGENTS.md`, project `CLAUDE.md`, etc. Two modes:
+  - **`mode: 'warn'` (default)** — shows a `/dev/tty` notification on drift, tool call allowed (exit 0)
+  - **`mode: 'block'`** — hard quarantine on drift, tool call blocked until reviewed (for installed/registry skills where changes are suspicious)
 
-  Per-session verification is memoised in `~/.node9/skill-sessions/<session_id>.json` so hashing runs once per session, not once per tool call.
+  Covers **AST 02 Supply Chain Compromise** and **AST 07 Update Drift**. Per-session memoisation in `~/.node9/skill-sessions/` so hashing runs once per session.
 
-- **`node9 skill pin` CLI** — `list` / `update <rootKey>` / `reset`, mirroring `node9 mcp pin`. `update` removes the named pin so the next session re-pins with current state; `reset` clears all pins and wipes session flags.
+- **`node9 skill pin` CLI** — `list` / `update <rootKey>` / `reset`, mirroring `node9 mcp pin`.
 
-- **`policy.skillRoots` config field** — user-extensible list of extra skill paths (absolute, `~/`-prefixed, or cwd-relative).
+- **`policy.skillPinning` config** — `{ enabled, mode, roots }`. `roots` extends the built-in list with custom paths.
 
 ### Security properties
 

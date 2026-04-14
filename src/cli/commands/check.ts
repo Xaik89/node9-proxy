@@ -226,18 +226,15 @@ export function registerCheckCommand(program: Command): void {
           const meta = { agent, mcpServer };
 
           // ── Skill pinning — supply chain & update drift defense (AST 02 + AST 07) ──
-          // First tool call of a session hashes all known skill roots and
-          // pins them. Every subsequent session re-hashes and compares; any
-          // drift quarantines the session and blocks further tool calls until
-          // a human reviews via `node9 skill pin update`.
-          //
-          // Per-session verification is memoised in ~/.node9/skill-sessions/
-          // so we only pay the hashing cost once per Claude/Gemini session id.
+          // Off by default; opt-in via config.policy.skillPinning.enabled.
+          // mode 'warn': /dev/tty notification on drift, tool call allowed (exit 0).
+          // mode 'block': hard quarantine on drift, tool call blocked (exit 2).
+          // Per-session memoisation in ~/.node9/skill-sessions/ so hashing
+          // runs at most once per Claude/Gemini session id.
+          const skillPinCfg = config.policy.skillPinning;
           const rawSessionId = typeof payload.session_id === 'string' ? payload.session_id : '';
-          // Path-safety: filesystem name, limited charset + length, to defeat
-          // traversal via a malicious session_id.
           const safeSessionId = /^[A-Za-z0-9_\-]{1,128}$/.test(rawSessionId) ? rawSessionId : '';
-          if (safeSessionId) {
+          if (skillPinCfg.enabled && safeSessionId) {
             try {
               const sessionsDir = path.join(os.homedir(), '.node9', 'skill-sessions');
               const flagPath = path.join(sessionsDir, `${safeSessionId}.json`);
@@ -257,11 +254,35 @@ export function registerCheckCommand(program: Command): void {
                     { mode: 0o600 }
                   );
                 } catch {
-                  /* best effort — a failed flag write is not worth crashing the hook */
+                  /* best effort */
                 }
               };
 
-              if (flag && flag.state === 'quarantined') {
+              // /dev/tty notification — non-blocking (warn mode only).
+              const sendSkillWarn = (detail: string, recoveryCmd?: string) => {
+                let ttyFd: number | null = null;
+                try {
+                  ttyFd = fs.openSync('/dev/tty', 'w');
+                  const w = (line: string) => fs.writeSync(ttyFd!, line + '\n');
+                  w(chalk.yellow(`\n⚠️  Node9: skill drift detected`));
+                  w(chalk.gray(`   ${detail}`));
+                  if (recoveryCmd) w(chalk.green(`   💡 Run:  ${recoveryCmd}`));
+                  w('');
+                } catch {
+                  /* /dev/tty unavailable in CI — skip */
+                } finally {
+                  if (ttyFd !== null)
+                    try {
+                      fs.closeSync(ttyFd);
+                    } catch {
+                      /* ignore */
+                    }
+                }
+              };
+
+              // Memoised states: 'verified' / 'warned' → skip.
+              // 'quarantined' → only block in block mode; in warn mode, re-verify.
+              if (flag && flag.state === 'quarantined' && skillPinCfg.mode === 'block') {
                 sendBlock(
                   `Node9: session quarantined due to skill drift — ${flag.detail ?? 'review required'}`,
                   {
@@ -272,63 +293,54 @@ export function registerCheckCommand(program: Command): void {
                 return;
               }
 
-              if (!flag || flag.state !== 'verified') {
+              if (!flag || (flag.state !== 'verified' && flag.state !== 'warned')) {
                 const absoluteCwd =
                   typeof payload.cwd === 'string' && path.isAbsolute(payload.cwd)
                     ? payload.cwd
                     : undefined;
-                const extraRoots = Array.isArray(config.policy.skillRoots)
-                  ? config.policy.skillRoots
-                  : [];
+                const extraRoots = skillPinCfg.roots;
                 const resolvedExtra = extraRoots
                   .map((r) => resolveUserSkillRoot(r, absoluteCwd))
                   .filter((r): r is string => typeof r === 'string');
                 const roots = [...defaultSkillRoots(absoluteCwd), ...resolvedExtra];
 
                 const result = verifyAndPinRoots(roots);
-                if (result.kind === 'corrupt') {
-                  writeFlag({
-                    state: 'quarantined',
-                    detail: `pin file corrupt: ${result.detail}`,
-                  });
-                  sendBlock('Node9: skill pin file is corrupt — fail-closed.', {
-                    blockedByLabel: 'Skill Pin Quarantine',
-                    recoveryCommand: 'node9 skill pin reset',
-                  });
-                  return;
-                }
-                if (result.kind === 'drift') {
-                  writeFlag({ state: 'quarantined', detail: result.summary });
-                  sendBlock(`Node9: skill drift detected — ${result.summary}`, {
-                    blockedByLabel: 'Skill Pin Quarantine',
-                    recoveryCommand: `node9 skill pin update ${result.changedRootKey}`,
-                  });
-                  return;
-                }
-                writeFlag({ state: 'verified' });
 
-                // Best-effort GC of session flags older than 7 days so the
-                // directory doesn't grow without bound across machine lifetime.
-                try {
-                  const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
-                  for (const name of fs.readdirSync(sessionsDir)) {
-                    const p = path.join(sessionsDir, name);
-                    try {
-                      const st = fs.statSync(p);
-                      if (st.mtimeMs < cutoff) fs.unlinkSync(p);
-                    } catch {
-                      /* ignore */
-                    }
+                if (result.kind === 'corrupt') {
+                  if (skillPinCfg.mode === 'block') {
+                    writeFlag({
+                      state: 'quarantined',
+                      detail: `pin file corrupt: ${result.detail}`,
+                    });
+                    sendBlock('Node9: skill pin file is corrupt — fail-closed.', {
+                      blockedByLabel: 'Skill Pin Quarantine',
+                      recoveryCommand: 'node9 skill pin reset',
+                    });
+                    return;
                   }
-                } catch {
-                  /* ignore */
+                  // warn mode: notify, allow
+                  writeFlag({ state: 'warned', detail: `pin file corrupt: ${result.detail}` });
+                  sendSkillWarn(
+                    `Skill pin file is corrupt: ${result.detail}`,
+                    'node9 skill pin reset'
+                  );
+                } else if (result.kind === 'drift') {
+                  if (skillPinCfg.mode === 'block') {
+                    writeFlag({ state: 'quarantined', detail: result.summary });
+                    sendBlock(`Node9: skill drift detected — ${result.summary}`, {
+                      blockedByLabel: 'Skill Pin Quarantine',
+                      recoveryCommand: `node9 skill pin update ${result.changedRootKey}`,
+                    });
+                    return;
+                  }
+                  // warn mode: notify, allow
+                  writeFlag({ state: 'warned', detail: result.summary });
+                  sendSkillWarn(result.summary, `node9 skill pin update ${result.changedRootKey}`);
+                } else {
+                  writeFlag({ state: 'verified' });
                 }
               }
             } catch (err) {
-              // Unexpected error (not a corrupt pin file — that's handled above)
-              // → log for debugging, but fail open so a bug in the skill-pin
-              // path never bricks Claude Code. The same philosophy check.ts
-              // already follows for its top-level catch.
               if (process.env.NODE9_DEBUG === '1') {
                 try {
                   const dbg = path.join(os.homedir(), '.node9', 'hook-debug.log');

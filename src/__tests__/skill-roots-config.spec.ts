@@ -1,18 +1,18 @@
 // src/__tests__/skill-roots-config.spec.ts
-// Unit tests for policy.skillRoots config field — accepted, merged, deduped.
+// Unit tests for policy.skillPinning config field — enabled, mode, roots.
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { getConfig, _resetConfigCache } from '../config';
 
-describe('policy.skillRoots config field', () => {
+describe('policy.skillPinning config field', () => {
   let tmpHome: string;
   let origHome: string | undefined;
   let origUserprofile: string | undefined;
 
   beforeEach(() => {
-    tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'node9-skillroots-cfg-'));
+    tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'node9-skillpin-cfg-'));
     origHome = process.env.HOME;
     origUserprofile = process.env.USERPROFILE;
     process.env.HOME = tmpHome;
@@ -30,37 +30,44 @@ describe('policy.skillRoots config field', () => {
     _resetConfigCache();
   });
 
-  it('defaults to an empty array when no config is set', () => {
-    const config = getConfig();
-    expect(config.policy.skillRoots).toEqual([]);
+  it('defaults to enabled=false, mode=warn, roots=[]', () => {
+    const sp = getConfig().policy.skillPinning;
+    expect(sp.enabled).toBe(false);
+    expect(sp.mode).toBe('warn');
+    expect(sp.roots).toEqual([]);
   });
 
-  it('merges user-supplied skillRoots from config.json', () => {
+  it('merges user-supplied skillPinning from config.json', () => {
     fs.writeFileSync(
       path.join(tmpHome, '.node9', 'config.json'),
-      JSON.stringify({ policy: { skillRoots: ['~/my-skills', '/abs/path/AGENTS.md'] } })
+      JSON.stringify({
+        policy: {
+          skillPinning: { enabled: true, mode: 'block', roots: ['~/my-skills'] },
+        },
+      })
     );
-    const config = getConfig();
-    expect(config.policy.skillRoots).toEqual(['~/my-skills', '/abs/path/AGENTS.md']);
+    const sp = getConfig().policy.skillPinning;
+    expect(sp.enabled).toBe(true);
+    expect(sp.mode).toBe('block');
+    expect(sp.roots).toEqual(['~/my-skills']);
   });
 
-  it('de-duplicates entries', () => {
+  it('de-duplicates roots', () => {
     fs.writeFileSync(
       path.join(tmpHome, '.node9', 'config.json'),
-      JSON.stringify({ policy: { skillRoots: ['~/a', '~/a', '~/b'] } })
+      JSON.stringify({ policy: { skillPinning: { enabled: true, roots: ['~/a', '~/a', '~/b'] } } })
     );
-    const config = getConfig();
-    expect(config.policy.skillRoots).toEqual(['~/a', '~/b']);
+    expect(getConfig().policy.skillPinning.roots).toEqual(['~/a', '~/b']);
   });
 
-  it('ignores non-string entries defensively', () => {
-    // Schema rejects non-string arrays at validation time, but merge must also
-    // self-protect in case validation is ever relaxed or the schema evolves.
+  it('partial config only overrides specified fields', () => {
     fs.writeFileSync(
       path.join(tmpHome, '.node9', 'config.json'),
-      JSON.stringify({ policy: { skillRoots: ['~/ok'] } })
+      JSON.stringify({ policy: { skillPinning: { enabled: true } } })
     );
-    const config = getConfig();
-    expect(config.policy.skillRoots).toEqual(['~/ok']);
+    const sp = getConfig().policy.skillPinning;
+    expect(sp.enabled).toBe(true);
+    expect(sp.mode).toBe('warn'); // default preserved
+    expect(sp.roots).toEqual([]); // default preserved
   });
 });

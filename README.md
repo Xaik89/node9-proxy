@@ -104,7 +104,7 @@ This is automatic — no configuration needed. The gateway pins on first `tools/
 
 ### Skills Pinning — same defense, extended to agent skill files
 
-Same idea as MCP pinning, at the skills layer: `~/.claude/skills/`, `~/.claude/CLAUDE.md`, `.cursor/rules/`, `AGENTS.md`, project `CLAUDE.md`. First session hashes them; any later-session change quarantines the session until you re-pin. Covers **AST 02 (supply chain)** and **AST 07 (update drift)**. Manage with `node9 skill pin list | update <rootKey> | reset`. Zero-config; extend via `policy.skillRoots`.
+Same idea as MCP pinning, at the skills layer: `~/.claude/skills/`, `~/.claude/CLAUDE.md`, `.cursor/rules/`, `AGENTS.md`, project `CLAUDE.md`. First session hashes them; any later-session change triggers a warning (or hard block in `mode: 'block'`). Opt-in via `policy.skillPinning.enabled: true`; covers **AST 02 (supply chain)** and **AST 07 (update drift)**. Manage with `node9 skill pin list | update <rootKey> | reset`.
 
 ---
 

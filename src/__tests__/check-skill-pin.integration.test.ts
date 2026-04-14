@@ -1,7 +1,11 @@
 /**
  * Integration tests for skill-pin enforcement inside `node9 check` (PreToolUse).
- * Spawns the real built CLI with an isolated HOME + an isolated cwd holding
- * a CLAUDE.md the hook will pin. Requires `npm run build` first.
+ * Spawns the real built CLI with an isolated HOME + cwd. Requires `npm run build`.
+ *
+ * Tests cover three config states:
+ *   - enabled: false (default) → skip everything
+ *   - enabled: true, mode: 'warn' → /dev/tty warning, exit 0, session flag 'warned'
+ *   - enabled: true, mode: 'block' → quarantine, exit 2, JSON block payload
  */
 
 import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
@@ -32,12 +36,15 @@ function runCheck(payload: object, env: Record<string, string>, cwd: string) {
   return { status: r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
 }
 
-function makeTempHome(): string {
+function makeTempHome(skillPinning: { enabled: boolean; mode?: string }): string {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'node9-skhook-home-'));
   fs.mkdirSync(path.join(home, '.node9'), { recursive: true });
   fs.writeFileSync(
     path.join(home, '.node9', 'config.json'),
-    JSON.stringify({ settings: { mode: 'standard', autoStartDaemon: false } })
+    JSON.stringify({
+      settings: { mode: 'standard', autoStartDaemon: false },
+      policy: { skillPinning },
+    })
   );
   return home;
 }
@@ -48,17 +55,27 @@ function makeTempProject(): string {
   return dir;
 }
 
+const payload = (sessionId: string, cwd: string) => ({
+  tool_name: 'glob',
+  tool_input: { pattern: '**' },
+  session_id: sessionId,
+  cwd,
+  hook_event_name: 'PreToolUse',
+});
+
 beforeAll(() => {
   if (!fs.existsSync(CLI)) {
     throw new Error(`dist/cli.js not found at ${CLI} — run \`npm run build\` first.`);
   }
 });
 
-describe('skill-pin enforcement in `node9 check`', () => {
+// ── enabled: false (default) ────────────────────────────────────────────────
+
+describe('skillPinning disabled (default)', () => {
   let tmpHome: string;
   let tmpProject: string;
   beforeEach(() => {
-    tmpHome = makeTempHome();
+    tmpHome = makeTempHome({ enabled: false });
     tmpProject = makeTempProject();
   });
   afterEach(() => {
@@ -66,98 +83,97 @@ describe('skill-pin enforcement in `node9 check`', () => {
     fs.rmSync(tmpProject, { recursive: true, force: true });
   });
 
-  it('first call of a session pins skill roots and allows the tool', () => {
-    const r = runCheck(
-      {
-        tool_name: 'glob',
-        tool_input: { pattern: '**' },
-        session_id: 'sess-1',
-        cwd: tmpProject,
-        hook_event_name: 'PreToolUse',
-      },
-      { HOME: tmpHome },
-      tmpProject
-    );
+  it('skips skill check entirely — no pin file, no session flag', () => {
+    const r = runCheck(payload('s1', tmpProject), { HOME: tmpHome }, tmpProject);
     expect(r.status).toBe(0);
-    const pins = JSON.parse(
-      fs.readFileSync(path.join(tmpHome, '.node9', 'skill-pins.json'), 'utf-8')
-    );
-    const pinnedPaths = Object.values<{ rootPath: string }>(pins.roots).map((e) => e.rootPath);
-    expect(pinnedPaths).toContain(path.join(tmpProject, 'CLAUDE.md'));
+    expect(fs.existsSync(path.join(tmpHome, '.node9', 'skill-pins.json'))).toBe(false);
+  });
+});
+
+// ── mode: 'warn' ────────────────────────────────────────────────────────────
+
+describe('skillPinning mode=warn', () => {
+  let tmpHome: string;
+  let tmpProject: string;
+  beforeEach(() => {
+    tmpHome = makeTempHome({ enabled: true, mode: 'warn' });
+    tmpProject = makeTempProject();
+  });
+  afterEach(() => {
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpProject, { recursive: true, force: true });
+  });
+
+  it('first call pins and allows', () => {
+    const r = runCheck(payload('w1', tmpProject), { HOME: tmpHome }, tmpProject);
+    expect(r.status).toBe(0);
+    expect(fs.existsSync(path.join(tmpHome, '.node9', 'skill-pins.json'))).toBe(true);
     const flag = JSON.parse(
-      fs.readFileSync(path.join(tmpHome, '.node9', 'skill-sessions', 'sess-1.json'), 'utf-8')
+      fs.readFileSync(path.join(tmpHome, '.node9', 'skill-sessions', 'w1.json'), 'utf-8')
     );
     expect(flag.state).toBe('verified');
   });
 
-  it('new session after skill tamper BLOCKS and quarantines the session', () => {
-    // Prime a first session.
-    runCheck(
-      {
-        tool_name: 'glob',
-        tool_input: { pattern: '**' },
-        session_id: 'prime',
-        cwd: tmpProject,
-        hook_event_name: 'PreToolUse',
-      },
-      { HOME: tmpHome },
-      tmpProject
-    );
-    // Tamper between sessions (simulates a supply-chain swap).
+  it('drift exits 0 (allowed) with session flag "warned" — not quarantined', () => {
+    // Prime
+    runCheck(payload('prime', tmpProject), { HOME: tmpHome }, tmpProject);
+    // Tamper
     fs.writeFileSync(path.join(tmpProject, 'CLAUDE.md'), 'MALICIOUS');
-    const r = runCheck(
-      {
-        tool_name: 'glob',
-        tool_input: { pattern: '**' },
-        session_id: 'drift',
-        cwd: tmpProject,
-        hook_event_name: 'PreToolUse',
-      },
-      { HOME: tmpHome },
-      tmpProject
+    const r = runCheck(payload('w2', tmpProject), { HOME: tmpHome }, tmpProject);
+    expect(r.status).toBe(0); // NOT 2 — warn, don't block
+    // No JSON block payload on stdout
+    expect(r.stdout.trim()).toBe('');
+    // Session flag is 'warned', not 'quarantined'
+    const flag = JSON.parse(
+      fs.readFileSync(path.join(tmpHome, '.node9', 'skill-sessions', 'w2.json'), 'utf-8')
     );
+    expect(flag.state).toBe('warned');
+    expect(flag.detail).toMatch(/changed/i);
+  });
+
+  it('subsequent call after warn skips re-hash (memoised)', () => {
+    runCheck(payload('prime', tmpProject), { HOME: tmpHome }, tmpProject);
+    fs.writeFileSync(path.join(tmpProject, 'CLAUDE.md'), 'TAMPERED');
+    runCheck(payload('w3', tmpProject), { HOME: tmpHome }, tmpProject);
+    // Second call in same warned session — still exit 0, no re-hash
+    const r = runCheck(payload('w3', tmpProject), { HOME: tmpHome }, tmpProject);
+    expect(r.status).toBe(0);
+  });
+});
+
+// ── mode: 'block' ───────────────────────────────────────────────────────────
+
+describe('skillPinning mode=block', () => {
+  let tmpHome: string;
+  let tmpProject: string;
+  beforeEach(() => {
+    tmpHome = makeTempHome({ enabled: true, mode: 'block' });
+    tmpProject = makeTempProject();
+  });
+  afterEach(() => {
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpProject, { recursive: true, force: true });
+  });
+
+  it('drift exits 2 with JSON block and quarantines the session', () => {
+    runCheck(payload('prime', tmpProject), { HOME: tmpHome }, tmpProject);
+    fs.writeFileSync(path.join(tmpProject, 'CLAUDE.md'), 'MALICIOUS');
+    const r = runCheck(payload('b1', tmpProject), { HOME: tmpHome }, tmpProject);
     expect(r.status).toBe(2);
     const out = JSON.parse(r.stdout.trim().split('\n').pop()!);
     expect(out.decision).toBe('block');
     expect(out.reason).toMatch(/skill/i);
-    expect(out.reason).toMatch(/pin update/);
     const flag = JSON.parse(
-      fs.readFileSync(path.join(tmpHome, '.node9', 'skill-sessions', 'drift.json'), 'utf-8')
+      fs.readFileSync(path.join(tmpHome, '.node9', 'skill-sessions', 'b1.json'), 'utf-8')
     );
     expect(flag.state).toBe('quarantined');
   });
 
-  it('corrupt skill-pins.json fails closed (blocks)', () => {
+  it('corrupt pin file exits 2 (fail-closed)', () => {
     fs.writeFileSync(path.join(tmpHome, '.node9', 'skill-pins.json'), 'not json');
-    const r = runCheck(
-      {
-        tool_name: 'glob',
-        tool_input: { pattern: '**' },
-        session_id: 'corrupt',
-        cwd: tmpProject,
-        hook_event_name: 'PreToolUse',
-      },
-      { HOME: tmpHome },
-      tmpProject
-    );
+    const r = runCheck(payload('b2', tmpProject), { HOME: tmpHome }, tmpProject);
     expect(r.status).toBe(2);
     const out = JSON.parse(r.stdout.trim().split('\n').pop()!);
     expect(out.decision).toBe('block');
-    expect(out.reason).toMatch(/corrupt|skill/i);
-  });
-
-  it('missing session_id skips the skill check entirely (allows, no pin file)', () => {
-    const r = runCheck(
-      {
-        tool_name: 'glob',
-        tool_input: { pattern: '**' },
-        cwd: tmpProject,
-        hook_event_name: 'PreToolUse',
-      },
-      { HOME: tmpHome },
-      tmpProject
-    );
-    expect(r.status).toBe(0);
-    expect(fs.existsSync(path.join(tmpHome, '.node9', 'skill-pins.json'))).toBe(false);
   });
 });
