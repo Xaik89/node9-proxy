@@ -17,10 +17,52 @@ type Period = 'today' | '7d' | '30d' | 'month';
 interface AuditEntry {
   ts: string;
   tool: string;
+  args?: Record<string, unknown>;
   decision: string;
   checkedBy?: string;
   agent?: string;
+  mcpServer?: string;
   source?: string;
+  testRun?: boolean;
+  testResult?: 'pass' | 'fail';
+}
+
+const TEST_COMMAND_RE =
+  /(?:^|\s)(npm\s+(?:run\s+)?test|npx\s+(?:vitest|jest|mocha)|yarn\s+(?:run\s+)?test|pnpm\s+(?:run\s+)?test|vitest|jest|mocha|pytest|py\.test|cargo\s+test|go\s+test|bundle\s+exec\s+rspec|rspec|phpunit|dotnet\s+test)\b/i;
+
+/** Build a set of timestamps (ms) for Bash test commands from PostToolUse entries.
+ * PreToolUse entries store argsHash (not plaintext args) by default, so we
+ * identify test commands from the PostToolUse counterpart which always stores
+ * full args, then match by time proximity. */
+function buildTestTimestamps(allEntries: AuditEntry[]): Set<number> {
+  const testTs = new Set<number>();
+  for (const e of allEntries) {
+    if (e.source !== 'post-hook') continue;
+    if (e.tool !== 'Bash' && e.tool !== 'bash') continue;
+    const cmd = e.args?.command;
+    if (typeof cmd === 'string' && TEST_COMMAND_RE.test(cmd)) {
+      testTs.add(new Date(e.ts).getTime());
+    }
+  }
+  return testTs;
+}
+
+/** Returns true if this PreToolUse Bash entry is a test runner call.
+ * New entries: tagged testRun:true at write time (reliable).
+ * Old entries: fall back to time-join with PostToolUse (approximate). */
+function isTestEntry(entry: AuditEntry, testTs: Set<number>): boolean {
+  if (entry.tool !== 'Bash' && entry.tool !== 'bash') return false;
+  // Tagged at write time — exact
+  if (entry.testRun === true) return true;
+  // Plain args available (auditHashArgs disabled) — exact
+  const cmd = entry.args?.command;
+  if (typeof cmd === 'string') return TEST_COMMAND_RE.test(cmd);
+  // Fall back: match by PostToolUse timestamp proximity — approximate
+  const t = new Date(entry.ts).getTime();
+  for (const ts of testTs) {
+    if (Math.abs(ts - t) <= 3000) return true;
+  }
+  return false;
 }
 
 interface JournalEntry {
@@ -142,17 +184,19 @@ function claudeModelPrice(model: string): { i: number; o: number; cw: number; cr
   return null;
 }
 
-function loadClaudeCost(start: Date, end: Date): number {
+function loadClaudeCost(start: Date, end: Date): { total: number; byDay: Map<string, number> } {
   const projectsDir = path.join(os.homedir(), '.claude', 'projects');
-  if (!fs.existsSync(projectsDir)) return 0;
+  if (!fs.existsSync(projectsDir)) return { total: 0, byDay: new Map() };
 
-  let total = 0;
   let dirs: string[];
   try {
     dirs = fs.readdirSync(projectsDir);
   } catch {
-    return 0;
+    return { total: 0, byDay: new Map() };
   }
+
+  let total = 0;
+  const byDay = new Map<string, number>();
 
   for (const proj of dirs) {
     const projPath = path.join(projectsDir, proj);
@@ -190,11 +234,15 @@ function loadClaudeCost(start: Date, end: Date): number {
           const p = claudeModelPrice(model);
           if (!p) continue;
 
-          total +=
+          const cost =
             (usage.input_tokens ?? 0) * p.i +
             (usage.output_tokens ?? 0) * p.o +
             (usage.cache_creation_input_tokens ?? 0) * p.cw +
             (usage.cache_read_input_tokens ?? 0) * p.cr;
+
+          total += cost;
+          const dateKey = entry.timestamp.slice(0, 10);
+          byDay.set(dateKey, (byDay.get(dateKey) ?? 0) + cost);
         }
       } catch {
         continue;
@@ -202,7 +250,7 @@ function loadClaudeCost(start: Date, end: Date): number {
     }
   }
 
-  return total;
+  return { total, byDay };
 }
 
 // ---------------------------------------------------------------------------
@@ -214,7 +262,8 @@ export function registerReportCommand(program: Command): void {
     .command('report')
     .description('Activity and security report — what Claude did, what was blocked')
     .option('--period <period>', 'today | 7d | 30d | month', '7d')
-    .action((options: { period: string }) => {
+    .option('--no-tests', 'exclude test runner calls (npm test, vitest, pytest…) from stats')
+    .action((options: { period: string; tests: boolean }) => {
       const period: Period = (['today', '7d', '30d', 'month'] as const).includes(
         options.period as Period
       )
@@ -233,13 +282,33 @@ export function registerReportCommand(program: Command): void {
 
       const { start, end } = getDateRange(period);
 
-      const costUSD = loadClaudeCost(start, end);
+      const { total: costUSD, byDay: costByDay } = loadClaudeCost(start, end);
+
+      // Prior period for block trend (same duration, immediately before start)
+      const periodMs = end.getTime() - start.getTime();
+      const priorEnd = new Date(start.getTime() - 1);
+      const priorStart = new Date(start.getTime() - periodMs);
+      const priorEntries = allEntries.filter((e) => {
+        if (e.source === 'post-hook') return false;
+        const ts = new Date(e.ts);
+        return ts >= priorStart && ts <= priorEnd;
+      });
+      const priorBlocked = priorEntries.filter((e) => !isAllow(e.decision)).length;
+      const priorBlockRate = priorEntries.length > 0 ? priorBlocked / priorEntries.length : null;
 
       // Only count PreToolUse entries (skip PostToolUse source: post-hook duplicates)
+      const excludeTests = options.tests === false;
+      const testTs = excludeTests ? buildTestTimestamps(allEntries) : new Set<number>();
+      let filteredTestCount = 0;
       const entries = allEntries.filter((e) => {
         if (e.source === 'post-hook') return false;
         const ts = new Date(e.ts);
-        return ts >= start && ts <= end;
+        if (ts < start || ts > end) return false;
+        if (excludeTests && isTestEntry(e, testTs)) {
+          filteredTestCount++;
+          return false;
+        }
+        return true;
       });
 
       if (entries.length === 0) {
@@ -251,18 +320,24 @@ export function registerReportCommand(program: Command): void {
       let allowed = 0;
       let blocked = 0;
       let dlpHits = 0;
+      let loopHits = 0;
+      let testPasses = 0;
+      let testFails = 0;
       const toolMap = new Map<string, { calls: number; blocked: number }>();
       const blockMap = new Map<string, number>();
       const agentMap = new Map<string, number>();
+      const mcpMap = new Map<string, number>();
       const dailyMap = new Map<string, { calls: number; blocked: number }>();
+      const hourMap = new Map<number, number>(); // 0–23
 
       for (const e of entries) {
         const allow = isAllow(e.decision);
-        const dateKey = e.ts.slice(0, 10); // YYYY-MM-DD
+        const dateKey = e.ts.slice(0, 10);
 
         if (allow) allowed++;
         else blocked++;
         if (isDlp(e.checkedBy)) dlpHits++;
+        if (e.checkedBy === 'loop-detected') loopHits++;
 
         const t = toolMap.get(e.tool) ?? { calls: 0, blocked: 0 };
         t.calls++;
@@ -274,11 +349,24 @@ export function registerReportCommand(program: Command): void {
         }
 
         if (e.agent) agentMap.set(e.agent, (agentMap.get(e.agent) ?? 0) + 1);
+        if (e.mcpServer) mcpMap.set(e.mcpServer, (mcpMap.get(e.mcpServer) ?? 0) + 1);
+
+        const hour = new Date(e.ts).getHours();
+        hourMap.set(hour, (hourMap.get(hour) ?? 0) + 1);
 
         const d = dailyMap.get(dateKey) ?? { calls: 0, blocked: 0 };
         d.calls++;
         if (!allow) d.blocked++;
         dailyMap.set(dateKey, d);
+      }
+
+      // Test results come from separate 'test-result' source entries in allEntries
+      for (const e of allEntries) {
+        if (e.source !== 'test-result') continue;
+        const ts = new Date(e.ts);
+        if (ts < start || ts > end) continue;
+        if (e.testResult === 'pass') testPasses++;
+        else if (e.testResult === 'fail') testFails++;
       }
 
       const total = entries.length;
@@ -316,7 +404,8 @@ export function registerReportCommand(program: Command): void {
           chalk.dim('  ·  ') +
           chalk.white(periodLabel[period]) +
           chalk.dim(`  ${fmtDate(start)} – ${fmtDate(end)}`) +
-          chalk.dim(`  ${num(total)} events`)
+          chalk.dim(`  ${num(total)} events`) +
+          (excludeTests ? chalk.dim(`  –tests (–${filteredTestCount})`) : '')
       );
       console.log('  ' + line);
 
@@ -326,7 +415,31 @@ export function registerReportCommand(program: Command): void {
         blocked > 0 ? chalk.red(`🛑 ${num(blocked)} blocked`) : chalk.dim('🛑 0 blocked');
       const dlpLabel =
         dlpHits > 0 ? chalk.yellow(`🚨 ${dlpHits} DLP hits`) : chalk.dim('🚨 0 DLP hits');
+      const loopLabel =
+        loopHits > 0 ? chalk.yellow(`🔄 ${loopHits} loops`) : chalk.dim('🔄 0 loops');
       const costLabel = costUSD > 0 ? chalk.magenta(`💰 ${fmtCost(costUSD)}`) : chalk.dim('💰 –');
+      const currentRate = total > 0 ? blocked / total : 0;
+      const trendLabel = (() => {
+        if (priorBlockRate === null) return chalk.dim(`${pct(blocked, total)} block rate`);
+        const delta = Math.round((currentRate - priorBlockRate) * 100);
+        const arrow =
+          delta > 0
+            ? chalk.red(`▲${delta}%`)
+            : delta < 0
+              ? chalk.green(`▼${Math.abs(delta)}%`)
+              : chalk.dim('–');
+        return chalk.dim(`${pct(blocked, total)} block rate `) + arrow + chalk.dim(' vs prior');
+      })();
+      const reads = toolMap.get('Read')?.calls ?? 0;
+      const edits = (toolMap.get('Edit')?.calls ?? 0) + (toolMap.get('Write')?.calls ?? 0);
+      const ratioLabel =
+        reads > 0 ? chalk.dim(`edit/read ${(edits / reads).toFixed(1)}`) : chalk.dim('edit/read –');
+      const testLabel =
+        testPasses + testFails > 0
+          ? chalk.dim('tests ') +
+            chalk.green(`${testPasses}✓`) +
+            (testFails > 0 ? ' ' + chalk.red(`${testFails}✗`) : '')
+          : chalk.dim('tests –');
       console.log(
         '  ' +
           chalk.green(`✅ ${num(allowed)} allowed`) +
@@ -335,10 +448,13 @@ export function registerReportCommand(program: Command): void {
           '   ' +
           dlpLabel +
           '   ' +
-          chalk.dim(`${pct(blocked, total)} block rate`) +
+          loopLabel +
+          '   ' +
+          trendLabel +
           '   ' +
           costLabel
       );
+      console.log('  ' + ratioLabel + '   ' + testLabel);
       console.log('');
 
       // ── Top Tools | Top Blocks ──
@@ -400,17 +516,55 @@ export function registerReportCommand(program: Command): void {
         }
       }
 
+      // ── MCP Servers ──
+      if (mcpMap.size > 0) {
+        console.log('');
+        console.log('  ' + chalk.bold('MCP Servers'));
+        console.log('  ' + chalk.dim('─'.repeat(Math.min(50, W - 4))));
+        const maxMcp = Math.max(...mcpMap.values(), 1);
+        for (const [server, count] of [...mcpMap.entries()].sort((a, b) => b[1] - a[1])) {
+          const label = server.slice(0, LABEL - 1).padEnd(LABEL);
+          const b = colorBar(count, maxMcp, BAR);
+          console.log('  ' + chalk.white(label) + b + ' ' + chalk.white(num(count)));
+        }
+      }
+
+      // ── Hour of Day ──
+      if (hourMap.size > 0) {
+        const BLOCKS = ' ▁▂▃▄▅▆▇█';
+        const maxHour = Math.max(...hourMap.values(), 1);
+        const bar = Array.from({ length: 24 }, (_, h) => {
+          const v = hourMap.get(h) ?? 0;
+          return BLOCKS[Math.round((v / maxHour) * 8)];
+        }).join('');
+        console.log('');
+        console.log('  ' + chalk.bold('Hour of Day') + chalk.dim('  (local, 0h – 23h)'));
+        console.log('  ' + chalk.cyan(bar));
+        console.log('  ' + chalk.dim('0h' + ' '.repeat(10) + '12h' + ' '.repeat(7) + '23h'));
+      }
+
       // ── Daily Activity ──
       if (dailyList.length > 1) {
         console.log('');
         console.log('  ' + chalk.bold('Daily Activity'));
         console.log('  ' + chalk.dim('─'.repeat(W - 2)));
-        const DAY_BAR = Math.max(8, Math.min(30, W - 30));
+        const DAY_BAR = Math.max(8, Math.min(30, W - 36));
         for (const [dateKey, { calls, blocked: db }] of dailyList) {
           const label = fmtDate(dateKey).padEnd(10);
           const b = colorBar(calls, maxDaily, DAY_BAR);
-          const note = db > 0 ? chalk.red(`  ${db} blocked`) : '';
-          console.log('  ' + chalk.dim(label) + '  ' + b + '  ' + chalk.white(num(calls)) + note);
+          const dayCost = costByDay.get(dateKey);
+          const costNote = dayCost ? chalk.magenta(`  ${fmtCost(dayCost)}`) : '';
+          const blockNote = db > 0 ? chalk.red(`  ${db} blocked`) : '';
+          console.log(
+            '  ' +
+              chalk.dim(label) +
+              '  ' +
+              b +
+              '  ' +
+              chalk.white(num(calls)) +
+              blockNote +
+              costNote
+          );
         }
       }
 
@@ -420,7 +574,7 @@ export function registerReportCommand(program: Command): void {
         '  ' +
           chalk.dim('node9 audit --deny') +
           chalk.dim('  ·  ') +
-          chalk.dim('node9 report --period today|7d|30d|month')
+          chalk.dim('node9 report --period today|7d|30d|month  --no-tests')
       );
       console.log('');
     });
