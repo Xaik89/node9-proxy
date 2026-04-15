@@ -102,6 +102,10 @@ node9 mcp pin reset               # clear all pins (re-pin on next connection)
 
 This is automatic — no configuration needed. The gateway pins on first `tools/list` and enforces on every subsequent session.
 
+### Skills Pinning — installed-skill drift detection
+
+Installed skills in `~/.claude/skills/` come from registries or shared repos, not from your workspace — so `git status` never sees them. Like MCP tools, they can be silently swapped by a compromised package or auto-update. Node9 hashes the directory on first session and warns on drift. Opt-in via `policy.skillPinning.enabled: true`; use `mode: 'block'` for strict enforcement. User-edited files (`CLAUDE.md`, `.cursor/rules/`) are **not** in the default scope — put those in git and use normal diff review. Extend scope explicitly via `policy.skillPinning.roots`.
+
 ---
 
 ## Python SDK — govern any Python agent
@@ -125,6 +129,7 @@ configure(agent_name="my-agent", policy="require_approval")
 - **Shell:** blocks `curl | bash`, `sudo` commands
 - **DLP:** blocks AWS keys, GitHub tokens, Stripe keys, PEM private keys in any tool call argument
 - **Auto-undo:** git snapshot before every AI file edit → `node9 undo` to revert
+- **Skills Pinning:** SHA-256 verification of agent skill files between sessions; quarantines on drift (AST 02 + AST 07 — supply chain & update drift)
 
 ---
 

@@ -6,6 +6,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## v1.10.0 — Installed Skill Pinning (AST 02 + AST 07)
+
+### Added
+
+- **Installed Skill Pinning:** Drift detection for `~/.claude/skills/` — the one location typically populated by third-party skills installed from registries or shared repos. These files live outside any git repo, so `git status` can't see when they change. Off by default (`policy.skillPinning.enabled: false`); opt-in for users who install skills from external sources. Two modes:
+  - **`mode: 'warn'` (default)** — `/dev/tty` notification on drift, tool call allowed (exit 0)
+  - **`mode: 'block'`** — quarantine the session until the user reviews
+
+  **Intentionally narrow default scope:** user-edited files (`CLAUDE.md`, `.cursor/rules/`, `AGENTS.md`) are **not** in the default set. Those change constantly in normal workflow, and if they're in a git repo `git status`/`git diff` is the better tool. Users who want to pin additional paths can add them via `policy.skillPinning.roots`.
+
+  Covers **AST 02 Supply Chain Compromise** and **AST 07 Update Drift** at the installed-skill layer. Per-session memoisation in `~/.node9/skill-sessions/` so hashing runs once per session.
+
+- **`node9 skill pin` CLI** — `list` / `update <rootKey>` / `reset`, mirroring `node9 mcp pin`.
+
+- **`policy.skillPinning` config** — `{ enabled, mode, roots }`. `roots` extends the default (`~/.claude/skills/`) with user-specified paths.
+
+### Security properties
+
+- Fail-closed on corrupt `skill-pins.json` (recovery: `node9 skill pin reset`)
+- Symlink-safe; size-bounded (5000 files / 50 MB per root)
+- Path-traversal-safe session IDs (`[A-Za-z0-9_-]{1,128}`)
+- Atomic writes, mode 0o600
+
+---
+
 ## v1.7.0 — Steerable Redirect Recovery Menu
 
 ### Added
