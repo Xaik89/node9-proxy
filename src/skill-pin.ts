@@ -270,24 +270,23 @@ export function verifyAndPinRoots(roots: string[]): VerifyResult {
 // Root resolution (used by the check hook)
 // ---------------------------------------------------------------------------
 
-/** Built-in skill roots. Project-scoped roots are only included when cwd is absolute. */
-export function defaultSkillRoots(cwd: string | undefined): string[] {
-  const home = os.homedir();
-  const global = [
-    path.join(home, '.claude', 'skills'),
-    path.join(home, '.claude', 'CLAUDE.md'),
-    path.join(home, '.claude', 'rules'),
-  ];
-  if (!cwd || !path.isAbsolute(cwd)) return global;
-  return [
-    ...global,
-    path.join(cwd, '.claude', 'CLAUDE.md'),
-    path.join(cwd, '.claude', 'CLAUDE.local.md'),
-    path.join(cwd, '.claude', 'rules'),
-    path.join(cwd, '.cursor', 'rules'),
-    path.join(cwd, 'AGENTS.md'),
-    path.join(cwd, 'CLAUDE.md'),
-  ];
+/**
+ * Built-in skill roots — intentionally narrow.
+ *
+ * Only `~/.claude/skills/` is pinned by default because it's the one location
+ * typically populated by third-party/installed skills that live OUTSIDE any
+ * git repo. User-edited files like `CLAUDE.md` and `.cursor/rules/` are
+ * deliberately excluded — they change constantly as part of normal workflow,
+ * and if they're in a git repo, `git status` already surfaces diffs better.
+ *
+ * Users who want to pin additional paths can add them via
+ * `config.policy.skillPinning.roots` (absolute, `~/`-prefixed, or cwd-relative).
+ *
+ * The `cwd` param is retained for `resolveUserSkillRoot` callers; this
+ * function itself only returns user-scope installed-skill locations.
+ */
+export function defaultSkillRoots(_cwd: string | undefined): string[] {
+  return [path.join(os.homedir(), '.claude', 'skills')];
 }
 
 /** Resolve a user-supplied entry: absolute, `~/`-prefixed, or cwd-relative. */
